@@ -7,7 +7,16 @@ use egui::{Color32, RichText};
 use std::path::{Path, PathBuf};
 use vpb::trace::TraceConfig;
 
-const T_DECK: &str = include_str!("../../../boards/t-deck-plus.toml");
+/// Boards compiled into the binary, so a fresh install has something to pick
+/// without hunting for files. Dropping a `.toml` adds to this at runtime.
+const BUILTIN_BOARDS: &[(&str, &str)] = &[
+    ("t-deck-plus", include_str!("../../../boards/t-deck-plus.toml")),
+    ("cyd-esp32-2432s028r", include_str!("../../../boards/cyd-esp32-2432s028r.toml")),
+    ("cyd-s024c", include_str!("../../../boards/cyd-s024c.toml")),
+    ("cyd-s028r", include_str!("../../../boards/cyd-s028r.toml")),
+    ("generic-esp32s3", include_str!("../../../boards/generic-esp32s3.toml")),
+];
+
 const GENERIC: &str = include_str!("../../../boards/generic-esp32s3.toml");
 
 /// A message shown in the status log.
@@ -36,7 +45,7 @@ impl App {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
         let mut boards = Vec::new();
-        for (name, src) in [("t-deck-plus", T_DECK), ("generic-esp32s3", GENERIC)] {
+        for &(name, src) in BUILTIN_BOARDS {
             match Board::from_toml(src) {
                 Ok(b) => boards.push(b),
                 // A built-in board failing to parse is a bug in our own data,

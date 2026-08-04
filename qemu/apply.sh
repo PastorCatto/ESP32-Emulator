@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# Graft our device models into a vendored Espressif QEMU source tree.
+#
+# New files are copied in wholesale. Edits to QEMU's own files are made by
+# anchored insertion rather than line-based patches, so a version bump that
+# shifts line numbers still applies cleanly -- and if an anchor genuinely
+# disappears, this fails loudly instead of producing a subtly broken tree.
+#
+# Safe to run repeatedly: every edit checks whether it is already present.
+#
+# Usage: qemu/apply.sh [path-to-qemu-source]
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC="${1:-$(cd "$HERE/.." && pwd)/vendor/src}"
+
+if [ ! -f "$SRC/hw/xtensa/esp32s3.c" ]; then
+  echo "error: $SRC does not look like an Espressif QEMU tree" >&2
+  echo "       (expected hw/xtensa/esp32s3.c)" >&2
+  exit 1
+fi
+
+echo "Applying to $SRC"
+
+# --- new files -------------------------------------------------------------
+
+copied=0
+while IFS= read -r -d '' file; do
+  rel="${file#"$HERE/devices/"}"
+  mkdir -p "$SRC/$(dirname "$rel")"
+  cp "$file" "$SRC/$rel"
+  echo "  + $rel"
+  copied=$((copied + 1))
+done < <(find "$HERE/devices" -type f -print0)
+echo "  $copied file(s) copied"
+
+# --- anchored edits --------------------------------------------------------
+
+# insert_after <file> <anchor-substring> <text-to-insert> <already-present-marker>
+insert_after() {
+  local file="$1" anchor="$2" text="$3" marker="$4"
+  local path="$SRC/$file"
+
+  if grep -qF -- "$marker" "$path"; then
+    echo "  = $file already has $marker"
+    return 0
+  fi
+
+  local hits
+  hits=$(grep -cF -- "$anchor" "$path" || true)
+  if [ "$hits" -ne 1 ]; then
+    echo "error: anchor in $file matched $hits times, expected exactly 1" >&2
+    echo "       anchor: $anchor" >&2
+    echo "       the upstream file has changed; update qemu/apply.sh" >&2
+    exit 1
+  fi
+
+  # awk rather than sed: the inserted text contains slashes and quotes, and
+  # escaping those for sed is a reliable source of silent corruption.
+  awk -v anchor="$anchor" -v ins="$text" '
+    { print }
+    index($0, anchor) { print ins }
+  ' "$path" > "$path.tmp"
+  mv "$path.tmp" "$path"
+  echo "  ~ $file += $marker"
+}
+
+insert_after "hw/misc/meson.build" \
+  "'esp32s3_rtc_cntl.c'," \
+  "  'esp32s3_sens.c'," \
+  "esp32s3_sens.c"
+
+insert_after "hw/xtensa/esp32s3.c" \
+  '#include "hw/misc/esp32s3_rtc_cntl.h"' \
+  '#include "hw/misc/esp32s3_sens.h"' \
+  'esp32s3_sens.h'
+
+insert_after "hw/xtensa/esp32s3.c" \
+  "    Esp32s3RtcCntlState rtc_cntl;" \
+  "    Esp32s3SensState sens;" \
+  "Esp32s3SensState sens;"
+
+insert_after "hw/xtensa/esp32s3.c" \
+  '    object_initialize_child(obj, "rtc_cntl", &s->rtc_cntl, TYPE_ESP32S3_RTC_CNTL);' \
+  '    object_initialize_child(obj, "sens", &s->sens, TYPE_ESP32S3_SENS);' \
+  'TYPE_ESP32S3_SENS);'
+
+insert_after "hw/xtensa/esp32s3.c" \
+  "    esp32s3_soc_add_periph_device(sys_mem, &s->rtc_cntl, DR_REG_RTCCNTL_BASE);" \
+  "
+    sysbus_realize(SYS_BUS_DEVICE(&s->sens), &error_fatal);
+    esp32s3_soc_add_periph_device(sys_mem, &s->sens, DR_REG_SENS_BASE);" \
+  "DR_REG_SENS_BASE);"
+
+# --- Windows build fix -----------------------------------------------------
+#
+# QEMU's install-tree step uses os.symlink, which Windows refuses without
+# Developer Mode or elevation, and the failure aborts configure entirely.
+# Falling back to a copy avoids demanding a machine-wide setting change just
+# to build.
+SYMLINK_SCRIPT="$SRC/scripts/symlink-install-tree.py"
+if [ -f "$SYMLINK_SCRIPT" ] && ! grep -q "import shutil" "$SYMLINK_SCRIPT"; then
+  python_fix=$(cat <<'PYFIX'
+    try:
+        os.symlink(source, bundle_dest)
+    except BaseException as e:
+        if isinstance(e, OSError) and e.errno == errno.EEXIST:
+            pass
+        elif os.name == 'nt':
+            try:
+                if os.path.isdir(source):
+                    shutil.copytree(source, bundle_dest, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(source, bundle_dest)
+            except BaseException as copy_error:
+                print(f'error copying {source} to {bundle_dest}', file=sys.stderr)
+                raise copy_error
+        else:
+            print(f'error making symbolic link {dest}', file=sys.stderr)
+            raise e
+PYFIX
+)
+  awk -v fix="$python_fix" '
+    /^import shlex$/ { print; print "import shutil"; next }
+    /^    try:$/ && !done { intry = 1 }
+    intry && /os\.symlink\(source, bundle_dest\)/ { print fix; skipping = 1; done = 1; next }
+    skipping && /^$/ { skipping = 0; next }
+    skipping { next }
+    { print }
+  ' "$SYMLINK_SCRIPT" > "$SYMLINK_SCRIPT.tmp"
+  mv "$SYMLINK_SCRIPT.tmp" "$SYMLINK_SCRIPT"
+  echo "  ~ scripts/symlink-install-tree.py: copy fallback for Windows"
+fi
+
+echo "Done."

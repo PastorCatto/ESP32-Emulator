@@ -18,9 +18,12 @@
 //! owns, the registry routes transactions accordingly, and nothing else in the
 //! system needs to know which of the three kinds it is.
 
+pub mod input;
 pub mod registry;
 pub mod trace;
 pub mod wire;
+
+pub use input::{PointerPhase, Rotation, TouchPoint, TouchState};
 
 use serde::{Deserialize, Serialize};
 

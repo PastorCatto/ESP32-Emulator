@@ -389,6 +389,9 @@ mod tests {
 
     const T_DECK: &str = include_str!("../../../boards/t-deck-plus.toml");
     const GENERIC: &str = include_str!("../../../boards/generic-esp32s3.toml");
+    const CYD: &str = include_str!("../../../boards/cyd-esp32-2432s028r.toml");
+    const CYD_S024C: &str = include_str!("../../../boards/cyd-s024c.toml");
+    const CYD_S028R: &str = include_str!("../../../boards/cyd-s028r.toml");
 
     #[test]
     fn parses_the_shipped_t_deck_definition() {
@@ -449,6 +452,75 @@ mod tests {
     fn a_board_without_psram_asks_qemu_for_none() {
         let b = Board::from_toml(GENERIC).unwrap();
         assert_eq!(b.qemu_psram(), None);
+    }
+
+    #[test]
+    fn every_shipped_board_file_parses() {
+        // Board files are data, and data with no test is data that rots.
+        for (name, src) in [
+            ("t-deck-plus", T_DECK),
+            ("generic-esp32s3", GENERIC),
+            ("cyd-esp32-2432s028r", CYD),
+            ("cyd-s024c", CYD_S024C),
+            ("cyd-s028r", CYD_S028R),
+        ] {
+            let b = Board::from_toml(src).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(b.id, name, "board id should match its filename");
+        }
+    }
+
+    #[test]
+    fn cyd_puts_touch_on_its_own_bus_not_the_display_bus() {
+        // The hardware wires XPT2046 to its own CLK/MOSI/MISO. Sharing the
+        // display bus is a common misreading, so pin it down.
+        let b = Board::from_toml(CYD).unwrap();
+        let tft = b.bus("tft").expect("display bus");
+        let tspi = b.bus("tspi").expect("touch bus");
+        assert_ne!(tft.controller, tspi.controller);
+        assert_eq!(tspi.pins["sck"], 25);
+        assert_eq!(tspi.pins["mosi"], 32);
+        assert_eq!(tspi.pins["miso"], 39);
+
+        let claims: HashMap<String, Claim> = b.claims().unwrap().into_iter().collect();
+        assert_eq!(claims["ili9341"], Claim::Spi { controller: 2, cs: 15 });
+        assert_eq!(claims["xpt2046"], Claim::Spi { controller: 4, cs: 33 });
+        assert_eq!(claims["sdcard"], Claim::Spi { controller: 3, cs: 5 });
+    }
+
+    #[test]
+    fn cyd_is_a_plain_esp32_with_no_psram() {
+        let b = Board::from_toml(CYD).unwrap();
+        assert_eq!(b.chip, Chip::Esp32);
+        assert_eq!(b.flash_size, FlashSize(4 * 1024 * 1024));
+        assert_eq!(b.qemu_psram(), None);
+    }
+
+    #[test]
+    fn the_capacitive_cyd_uses_i2c_touch_and_a_moved_backlight() {
+        let b = Board::from_toml(CYD_S024C).unwrap();
+        let claims: HashMap<String, Claim> = b.claims().unwrap().into_iter().collect();
+        assert_eq!(
+            claims["cst816s"],
+            Claim::I2c { controller: 0, address: 0x15, alt: None }
+        );
+        // Verified against hardware as 27 rather than the 21 used elsewhere.
+        let lcd = b.peripheral("ili9341").unwrap();
+        assert_eq!(lcd.params.u8("backlight").unwrap(), 27);
+        // No SPI touch bus on this variant at all.
+        assert!(b.bus("tspi").is_none());
+    }
+
+    #[test]
+    fn the_flipped_cyd_differs_only_in_orientation() {
+        let base = Board::from_toml(CYD).unwrap();
+        let flipped = Board::from_toml(CYD_S028R).unwrap();
+        assert_eq!(base.chip, flipped.chip);
+
+        let a = base.peripheral("ili9341").unwrap();
+        let b = flipped.peripheral("ili9341").unwrap();
+        assert_eq!(a.params.u8("cs").unwrap(), b.params.u8("cs").unwrap());
+        assert_eq!(a.params.u16_or("rotation", 0).unwrap(), 0);
+        assert_eq!(b.params.u16_or("rotation", 0).unwrap(), 180);
     }
 
     #[test]
