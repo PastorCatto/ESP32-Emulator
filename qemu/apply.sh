@@ -38,6 +38,11 @@ echo "  $copied file(s) copied"
 # --- anchored edits --------------------------------------------------------
 
 # insert_after <file> <anchor-substring> <text-to-insert> <already-present-marker>
+#
+# The marker must be unique to *this* insertion, not merely present somewhere
+# in the inserted text. Reusing a marker that an earlier insertion already
+# added makes this silently skip, and the omission only shows up much later as
+# a device that does not work.
 insert_after() {
   local file="$1" anchor="$2" text="$3" marker="$4"
   local path="$SRC/$file"
@@ -92,6 +97,55 @@ insert_after "hw/xtensa/esp32s3.c" \
     sysbus_realize(SYS_BUS_DEVICE(&s->sens), &error_fatal);
     esp32s3_soc_add_periph_device(sys_mem, &s->sens, DR_REG_SENS_BASE);" \
   "DR_REG_SENS_BASE);"
+
+# --- general-purpose SPI (GP-SPI2 / GP-SPI3) --------------------------------
+
+insert_after "hw/ssi/meson.build" \
+  "system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('esp32s3_spi.c'))" \
+  "system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('esp32s3_gpspi.c'))" \
+  "esp32s3_gpspi.c"
+
+insert_after "hw/xtensa/esp32s3.c" \
+  '#include "hw/misc/esp32s3_sens.h"' \
+  '#include "hw/ssi/esp32s3_gpspi.h"' \
+  'esp32s3_gpspi.h'
+
+insert_after "hw/xtensa/esp32s3.c" \
+  "    Esp32s3SensState sens;" \
+  "    Esp32s3GpspiState gpspi2;
+    Esp32s3GpspiState gpspi3;" \
+  "Esp32s3GpspiState gpspi2;"
+
+insert_after "hw/xtensa/esp32s3.c" \
+  '    object_initialize_child(obj, "sens", &s->sens, TYPE_ESP32S3_SENS);' \
+  '    object_initialize_child(obj, "gpspi2", &s->gpspi2, TYPE_ESP32S3_GPSPI);
+    object_initialize_child(obj, "gpspi3", &s->gpspi3, TYPE_ESP32S3_GPSPI);' \
+  'TYPE_ESP32S3_GPSPI);'
+
+# Realize and map, keyed on its own marker. Sharing the SENS insertion would
+# make this silently skip once SENS is already applied.
+insert_after "hw/xtensa/esp32s3.c" \
+  "    esp32s3_soc_add_periph_device(sys_mem, &s->sens, DR_REG_SENS_BASE);" \
+  "
+    sysbus_realize(SYS_BUS_DEVICE(&s->gpspi2), &error_fatal);
+    esp32s3_soc_add_periph_device(sys_mem, &s->gpspi2, DR_REG_SPI2_BASE);
+    sysbus_realize(SYS_BUS_DEVICE(&s->gpspi3), &error_fatal);
+    esp32s3_soc_add_periph_device(sys_mem, &s->gpspi3, DR_REG_SPI3_BASE);" \
+  "DR_REG_SPI2_BASE);"
+
+# The async spi_master path waits on an interrupt, so without these the driver
+# completes nothing and reports ESP_ERR_TIMEOUT forever.
+insert_after "hw/xtensa/esp32s3.c" \
+  "    esp32s3_soc_add_periph_device(sys_mem, &s->gpspi2, DR_REG_SPI2_BASE);" \
+  "    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpspi2), 0,
+                       qdev_get_gpio_in(intmatrix_dev, ETS_SPI2_INTR_SOURCE));" \
+  "ETS_SPI2_INTR_SOURCE"
+
+insert_after "hw/xtensa/esp32s3.c" \
+  "    esp32s3_soc_add_periph_device(sys_mem, &s->gpspi3, DR_REG_SPI3_BASE);" \
+  "    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpspi3), 0,
+                       qdev_get_gpio_in(intmatrix_dev, ETS_SPI3_INTR_SOURCE));" \
+  "ETS_SPI3_INTR_SOURCE"
 
 # --- make --disable-slirp actually disable slirp ----------------------------
 #

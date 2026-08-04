@@ -1,0 +1,102 @@
+/*
+ * ESP32-S3 general-purpose SPI controller (GP-SPI2 / GP-SPI3).
+ *
+ * Espressif's QEMU models SPI_MEM, the controller behind flash and PSRAM, and
+ * instantiates it as spi1. GP-SPI2 and GP-SPI3 are a *different peripheral
+ * with a different register map*, and no model for them exists in the tree for
+ * any chip -- so anything on a board's general-purpose SPI bus is invisible.
+ *
+ * On a T-Deck that is the display, the SD card and the LoRa radio. Firmware
+ * starts a transfer and then spins in spi_hal_usr_is_done() forever, because
+ * SPI_DMA_INT_RAW.trans_done never sets on an unmapped peripheral.
+ *
+ * Register offsets and bit positions here come from ESP-IDF v5.3.5,
+ * components/soc/esp32s3/include/soc/spi_reg.h.
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+#pragma once
+
+#include "hw/hw.h"
+#include "hw/sysbus.h"
+#include "hw/registerfields.h"
+#include "hw/ssi/ssi.h"
+
+#define TYPE_ESP32S3_GPSPI "ssi.esp32s3.gpspi"
+#define ESP32S3_GPSPI(obj) OBJECT_CHECK(Esp32s3GpspiState, (obj), TYPE_ESP32S3_GPSPI)
+
+/* Registers run to SPI_DATE at 0xF0; round up to a page. */
+#define ESP32S3_GPSPI_MEM_SIZE   0x100
+#define ESP32S3_GPSPI_REG_COUNT  (ESP32S3_GPSPI_MEM_SIZE / sizeof(uint32_t))
+
+/* W0..W15 hold the data payload: 16 words, so 64 bytes per transaction. */
+#define ESP32S3_GPSPI_BUF_WORDS  16
+#define ESP32S3_GPSPI_BUF_BYTES  (ESP32S3_GPSPI_BUF_WORDS * 4)
+
+/* CS0..CS5. */
+#define ESP32S3_GPSPI_CS_COUNT   6
+
+REG32(GPSPI_CMD, 0x000)
+    FIELD(GPSPI_CMD, UPDATE, 23, 1)
+    FIELD(GPSPI_CMD, USR, 24, 1)
+
+REG32(GPSPI_ADDR,     0x004)
+REG32(GPSPI_CTRL,     0x008)
+REG32(GPSPI_CLOCK,    0x00c)
+
+REG32(GPSPI_USER, 0x010)
+    FIELD(GPSPI_USER, DOUTDIN,        0, 1)
+    FIELD(GPSPI_USER, MISO_HIGHPART, 24, 1)
+    FIELD(GPSPI_USER, MOSI_HIGHPART, 25, 1)
+    FIELD(GPSPI_USER, USR_MOSI,      27, 1)
+    FIELD(GPSPI_USER, USR_MISO,      28, 1)
+    FIELD(GPSPI_USER, USR_DUMMY,     29, 1)
+    FIELD(GPSPI_USER, USR_ADDR,      30, 1)
+    FIELD(GPSPI_USER, USR_COMMAND,   31, 1)
+
+REG32(GPSPI_USER1, 0x014)
+    FIELD(GPSPI_USER1, USR_DUMMY_CYCLELEN,  0, 8)
+    FIELD(GPSPI_USER1, USR_ADDR_BITLEN,    27, 5)
+
+REG32(GPSPI_USER2, 0x018)
+    FIELD(GPSPI_USER2, USR_COMMAND_VALUE,   0, 16)
+    FIELD(GPSPI_USER2, USR_COMMAND_BITLEN, 28, 4)
+
+REG32(GPSPI_MS_DLEN, 0x01c)
+    /* Holds bit count minus one. */
+    FIELD(GPSPI_MS_DLEN, MS_DATA_BITLEN, 0, 18)
+
+REG32(GPSPI_MISC, 0x020)
+    /* One bit per chip select; 1 disables the line, so the active CS is a
+     * zero. All ones means no device is selected. */
+    FIELD(GPSPI_MISC, CS_DIS, 0, 6)
+
+REG32(GPSPI_DMA_CONF,    0x030)
+REG32(GPSPI_DMA_INT_ENA, 0x034)
+REG32(GPSPI_DMA_INT_CLR, 0x038)
+REG32(GPSPI_DMA_INT_RAW, 0x03c)
+REG32(GPSPI_DMA_INT_ST,  0x040)
+REG32(GPSPI_DMA_INT_SET, 0x044)
+
+/*
+ * Bit 12 of the interrupt registers. This is the one firmware polls through
+ * spi_hal_usr_is_done(), and the reason an unmodelled controller hangs a boot.
+ */
+#define GPSPI_TRANS_DONE_INT     (1u << 12)
+
+REG32(GPSPI_W0,       0x098)
+REG32(GPSPI_W15,      0x0d4)
+REG32(GPSPI_SLAVE,    0x0e0)
+REG32(GPSPI_CLK_GATE, 0x0e8)
+REG32(GPSPI_DATE,     0x0f0)
+
+typedef struct Esp32s3GpspiState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    SSIBus *spi;
+    qemu_irq cs_gpio[ESP32S3_GPSPI_CS_COUNT];
+    qemu_irq irq;
+
+    uint32_t regs[ESP32S3_GPSPI_REG_COUNT];
+} Esp32s3GpspiState;
