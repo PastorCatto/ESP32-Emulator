@@ -90,6 +90,16 @@ REG32(GPSPI_SLAVE,    0x0e0)
 REG32(GPSPI_CLK_GATE, 0x0e8)
 REG32(GPSPI_DATE,     0x0f0)
 
+/*
+ * Floor on how long a transfer appears to take.
+ *
+ * Completion must not be visible before the guest's store to SPI_CMD has
+ * retired and the driver has finished its post-start bookkeeping. Real
+ * hardware always takes microseconds; finishing in zero guest time lets the
+ * ISR re-enter a driver that assumes it cannot be interrupted there.
+ */
+#define ESP32S3_GPSPI_MIN_XFER_NS  2000
+
 typedef struct Esp32s3GpspiState {
     SysBusDevice parent_obj;
 
@@ -97,6 +107,10 @@ typedef struct Esp32s3GpspiState {
     SSIBus *spi;
     qemu_irq cs_gpio[ESP32S3_GPSPI_CS_COUNT];
     qemu_irq irq;
+
+    /* Raises trans_done once the modelled transfer duration has elapsed. */
+    QEMUTimer *done_timer;
+    bool busy;
 
     uint32_t regs[ESP32S3_GPSPI_REG_COUNT];
 } Esp32s3GpspiState;

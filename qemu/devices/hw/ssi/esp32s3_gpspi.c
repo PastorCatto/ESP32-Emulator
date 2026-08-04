@@ -1,11 +1,11 @@
 /*
  * ESP32-S3 general-purpose SPI controller (GP-SPI2 / GP-SPI3).
  *
- * Transfers complete synchronously inside the register write that starts
- * them. Real hardware clocks bits out over many microseconds and raises an
- * interrupt at the end, but firmware observes completion only through
- * SPI_DMA_INT_RAW.trans_done, so finishing immediately is indistinguishable
- * from finishing fast.
+ * The bytes move synchronously when the guest starts a transfer, but
+ * completion is reported on a timer. Finishing inside the guest's store to
+ * SPI_CMD lets the ISR re-enter the driver before it has finished the
+ * bookkeeping that follows starting a transaction -- a race that cannot
+ * happen on hardware, where a transfer always takes microseconds.
  *
  * DMA is not modelled. Drivers fall back to the W0..W15 buffer for transfers
  * up to 64 bytes, which covers control traffic; a DMA-only path is logged
@@ -16,12 +16,16 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "hw/hw.h"
 #include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "hw/ssi/esp32s3_gpspi.h"
+
+static uint64_t esp32s3_gpspi_duration_ns(Esp32s3GpspiState *s, unsigned bytes);
+static void esp32s3_gpspi_done(void *opaque);
 
 /*
  * Recompute masked status and drive the interrupt line.
@@ -89,6 +93,7 @@ static void esp32s3_gpspi_transfer(Esp32s3GpspiState *s)
 {
     const uint32_t user = s->regs[R_GPSPI_USER];
     const int cs = esp32s3_gpspi_active_cs(s);
+    unsigned total_bytes = 0;
 
     /*
      * ssi_transfer works even with no peripheral attached, so ask the bus
@@ -109,6 +114,7 @@ static void esp32s3_gpspi_transfer(Esp32s3GpspiState *s)
                                    USR_COMMAND_BITLEN) + 1;
         for (int shift = ((bits + 7) / 8) * 8 - 8; shift >= 0; shift -= 8) {
             esp32s3_gpspi_xfer_byte(s, (value >> shift) & 0xff, attached);
+            total_bytes++;
         }
     }
 
@@ -119,6 +125,7 @@ static void esp32s3_gpspi_transfer(Esp32s3GpspiState *s)
                                    USR_ADDR_BITLEN) + 1;
         for (int shift = ((bits + 7) / 8) * 8 - 8; shift >= 0; shift -= 8) {
             esp32s3_gpspi_xfer_byte(s, (addr >> shift) & 0xff, attached);
+            total_bytes++;
         }
     }
 
@@ -128,6 +135,7 @@ static void esp32s3_gpspi_transfer(Esp32s3GpspiState *s)
                                      USR_DUMMY_CYCLELEN) + 1;
         for (unsigned i = 0; i < cycles / 8; i++) {
             esp32s3_gpspi_xfer_byte(s, 0xff, attached);
+            total_bytes++;
         }
     }
 
@@ -159,13 +167,45 @@ static void esp32s3_gpspi_transfer(Esp32s3GpspiState *s)
                 esp32s3_gpspi_buf_write(s, i, in);
             }
         }
+        total_bytes += bytes;
     }
 
     if (cs >= 0) {
         qemu_set_irq(s->cs_gpio[cs], 1);
     }
 
-    /* Completion is the whole point: this is what the poll loop waits on. */
+    /*
+     * The bytes have moved, but completion is deferred. Reporting it here
+     * would make the transfer finish inside the guest's store to SPI_CMD,
+     * so the ISR could run before the driver had finished the bookkeeping
+     * that follows starting a transaction. Real hardware always takes some
+     * microseconds; taking zero is its own kind of wrong.
+     */
+    uint64_t ns = esp32s3_gpspi_duration_ns(s, total_bytes);
+    s->busy = true;
+    timer_mod_ns(s->done_timer,
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns);
+}
+
+/* Estimate how long `bytes` would take at the configured clock. */
+static uint64_t esp32s3_gpspi_duration_ns(Esp32s3GpspiState *s, unsigned bytes)
+{
+    /*
+     * SPI_CLOCK encodes a divider off the 80MHz APB clock. Deriving the exact
+     * rate is more precision than anything here needs: the point is a delay
+     * that is small but non-zero, so the floor usually wins.
+     */
+    uint64_t ns = ((uint64_t)bytes * 8 * 1000ULL) / 80; /* 80 MHz, ns */
+
+    return ns < ESP32S3_GPSPI_MIN_XFER_NS ? ESP32S3_GPSPI_MIN_XFER_NS : ns;
+}
+
+/* Transfer finished: raise completion and let the driver's ISR run. */
+static void esp32s3_gpspi_done(void *opaque)
+{
+    Esp32s3GpspiState *s = ESP32S3_GPSPI(opaque);
+
+    s->busy = false;
     s->regs[R_GPSPI_DMA_INT_RAW] |= GPSPI_TRANS_DONE_INT;
     esp32s3_gpspi_update_irq(s);
 }
@@ -262,6 +302,9 @@ static void esp32s3_gpspi_reset_hold(Object *obj, ResetType type)
 {
     Esp32s3GpspiState *s = ESP32S3_GPSPI(obj);
 
+    timer_del(s->done_timer);
+    s->busy = false;
+
     memset(s->regs, 0, sizeof(s->regs));
     /* Every chip select released. */
     s->regs[R_GPSPI_MISC] = R_GPSPI_MISC_CS_DIS_MASK;
@@ -284,6 +327,8 @@ static void esp32s3_gpspi_init(Object *obj)
     s->spi = ssi_create_bus(DEVICE(s), "spi");
     qdev_init_gpio_out_named(DEVICE(s), &s->cs_gpio[0], SSI_GPIO_CS,
                              ESP32S3_GPSPI_CS_COUNT);
+
+    s->done_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, esp32s3_gpspi_done, s);
 }
 
 static const VMStateDescription vmstate_esp32s3_gpspi = {
