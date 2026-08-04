@@ -11,6 +11,11 @@
  * up to 64 bytes, which covers control traffic; a DMA-only path is logged
  * rather than silently doing nothing.
  *
+ * Several behaviours here are measured against a real T-Deck Plus rather than
+ * inferred from the TRM, via the PURR OS hardware probe: the clock gate, the
+ * 16x register mirroring, SPI_DMA_CONF's stuck low bits, SPI_DATE's constant,
+ * and MISO reading zero. Each is marked at its use.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -74,19 +79,17 @@ static void esp32s3_gpspi_buf_write(Esp32s3GpspiState *s, unsigned index,
     *word = (*word & ~(0xffu << shift)) | ((uint32_t)value << shift);
 }
 
-/*
- * Clock one byte out and one byte in.
- *
- * With nothing attached to the bus, ssi_transfer returns zero. Real MISO
- * floats high, and drivers probing for a device read 0xFF as "absent" but
- * 0x00 as a device answering with zeros -- so an empty bus reporting zeros
- * would look like phantom hardware.
- */
+/* Clock one byte out and one byte in. */
 static uint8_t esp32s3_gpspi_xfer_byte(Esp32s3GpspiState *s, uint8_t out,
                                        bool anything_attached)
 {
     uint32_t in = ssi_transfer(s->spi, out);
-    return anything_attached ? (uint8_t)in : 0xff;
+    /*
+     * Measured on a T-Deck Plus: MISO reads 0x00 with the panel selected. The
+     * ST7789 shares MISO (GPIO38) with SD and LoRa and does not drive it, so
+     * zeros are the correct value here rather than a failed read.
+     */
+    return anything_attached ? (uint8_t)in : 0x00;
 }
 
 static void esp32s3_gpspi_transfer(Esp32s3GpspiState *s)
@@ -210,25 +213,54 @@ static void esp32s3_gpspi_done(void *opaque)
     esp32s3_gpspi_update_irq(s);
 }
 
+/*
+ * Is the peripheral's master clock running?
+ *
+ * IDF sets SPI_CLK_GATE when a *device* is added to the bus, not when the bus
+ * is initialised. Measured on hardware: with the gate clear the whole register
+ * file reads as zero -- including SPI_DATE, a hardwired constant -- and
+ * CMD.USR latches high and never clears. Firmware that configures SPI2
+ * correctly in every other respect still hangs forever if this is not
+ * modelled.
+ */
+static bool esp32s3_gpspi_clocked(Esp32s3GpspiState *s)
+{
+    return (s->regs[R_GPSPI_CLK_GATE] & ESP32S3_GPSPI_CLK_EN) != 0;
+}
+
 static uint64_t esp32s3_gpspi_read(void *opaque, hwaddr addr, unsigned int size)
 {
     Esp32s3GpspiState *s = ESP32S3_GPSPI(opaque);
-    hwaddr index = addr / sizeof(uint32_t);
+    /* The register file is mirrored every 0x100 across the 4 KiB window. */
+    hwaddr reg = addr & ESP32S3_GPSPI_ADDR_MASK;
+    hwaddr index = reg / sizeof(uint32_t);
 
-    if (index >= ESP32S3_GPSPI_REG_COUNT) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "%s: read past the register block at 0x%" HWADDR_PRIx "\n",
-                      __func__, addr);
+    /*
+     * An unclocked peripheral reads as all-zeros on silicon. It does not
+     * stall, and it does not return reset values.
+     */
+    if (!esp32s3_gpspi_clocked(s) && reg != A_GPSPI_CLK_GATE) {
         return 0;
     }
-    return s->regs[index];
+
+    switch (reg) {
+    case A_GPSPI_DATE:
+        return ESP32S3_GPSPI_DATE_VALUE;
+
+    case A_GPSPI_DMA_CONF:
+        return s->regs[index] | ESP32S3_GPSPI_DMA_CONF_SET;
+
+    default:
+        return s->regs[index];
+    }
 }
 
 static void esp32s3_gpspi_write(void *opaque, hwaddr addr, uint64_t value,
                                 unsigned int size)
 {
     Esp32s3GpspiState *s = ESP32S3_GPSPI(opaque);
-    hwaddr index = addr / sizeof(uint32_t);
+    hwaddr reg = addr & ESP32S3_GPSPI_ADDR_MASK;
+    hwaddr index = reg / sizeof(uint32_t);
 
     /*
      * Register-level trace, off unless `-d unimp` is passed. Bringing up a
@@ -237,16 +269,17 @@ static void esp32s3_gpspi_write(void *opaque, hwaddr addr, uint64_t value,
      * looking.
      */
     qemu_log_mask(LOG_UNIMP, "gpspi: W %03" HWADDR_PRIx " = %08x\n",
-                  addr, (uint32_t)value);
+                  reg, (uint32_t)value);
 
-    if (index >= ESP32S3_GPSPI_REG_COUNT) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "%s: write past the register block at 0x%" HWADDR_PRIx "\n",
-                      __func__, addr);
+    /*
+     * Writes to an unclocked peripheral go nowhere, except to the gate itself
+     * -- otherwise there would be no way to turn it on.
+     */
+    if (!esp32s3_gpspi_clocked(s) && reg != A_GPSPI_CLK_GATE) {
         return;
     }
 
-    switch (addr) {
+    switch (reg) {
     case A_GPSPI_CMD: {
         /*
          * SPI_UPDATE latches configuration and is not a transfer. Storing it
@@ -320,7 +353,7 @@ static void esp32s3_gpspi_init(Object *obj)
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
     memory_region_init_io(&s->iomem, obj, &esp32s3_gpspi_ops, s,
-                          TYPE_ESP32S3_GPSPI, ESP32S3_GPSPI_MEM_SIZE);
+                          TYPE_ESP32S3_GPSPI, ESP32S3_GPSPI_WINDOW_SIZE);
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
 

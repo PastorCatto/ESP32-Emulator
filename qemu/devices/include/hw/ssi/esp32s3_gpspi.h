@@ -25,9 +25,34 @@
 #define TYPE_ESP32S3_GPSPI "ssi.esp32s3.gpspi"
 #define ESP32S3_GPSPI(obj) OBJECT_CHECK(Esp32s3GpspiState, (obj), TYPE_ESP32S3_GPSPI)
 
-/* Registers run to SPI_DATE at 0xF0; round up to a page. */
+/*
+ * The register file is 0x100 bytes, mirrored 16x across a 4 KiB window.
+ *
+ * Measured on a real T-Deck Plus: every offset in 0x000..0xFFF equals the
+ * offset at `offset & 0xFF`. An emulator that decodes the full 12 bits returns
+ * zero where hardware returns a live value, so the window is the full 4 KiB
+ * and addresses are masked.
+ */
+#define ESP32S3_GPSPI_WINDOW_SIZE 0x1000
 #define ESP32S3_GPSPI_MEM_SIZE   0x100
+#define ESP32S3_GPSPI_ADDR_MASK  (ESP32S3_GPSPI_MEM_SIZE - 1)
 #define ESP32S3_GPSPI_REG_COUNT  (ESP32S3_GPSPI_MEM_SIZE / sizeof(uint32_t))
+
+/*
+ * Hardwired constant in SPI_DATE, measured as 0x02101190. Firmware can probe
+ * for a peripheral by reading this, and zero means "absent".
+ */
+#define ESP32S3_GPSPI_DATE_VALUE 0x02101190u
+
+/*
+ * SPI_DMA_CONF does not read back what is written: bits 0 and 1 are reset
+ * controls that re-assert. Measured -- write 0x00000000, read 0x00000003;
+ * write 0x18180000, read 0x18180003.
+ */
+#define ESP32S3_GPSPI_DMA_CONF_SET 0x00000003u
+
+/* SPI_CLK_GATE bits: CLK_EN, MST_CLK_ACTIVE, MST_CLK_SEL. */
+#define ESP32S3_GPSPI_CLK_EN       (1u << 0)
 
 /* W0..W15 hold the data payload: 16 words, so 64 bytes per transaction. */
 #define ESP32S3_GPSPI_BUF_WORDS  16
