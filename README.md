@@ -7,8 +7,10 @@ environment, without the hardware.
 The first target is the LilyGO T-Deck Plus (ESP32-S3). Boards are data, so
 supporting another one is a config file rather than a patch.
 
-> **Status: early.** The foundations below are built and tested. Booting to a
-> display is not yet working — see [Where this actually is](#where-this-actually-is).
+> **Status: early, but it boots.** Real LilyGO T-Deck Plus firmware runs
+> through the ROM, the bootloader, PSRAM init, and into application code, with
+> a working serial console. There is no display yet — see
+> [Where this actually is](#where-this-actually-is).
 
 ## How it works
 
@@ -83,22 +85,43 @@ vendor/           fetched QEMU binaries (gitignored).
 
 ## Where this actually is
 
-Built and tested (34 tests, clippy clean):
+Working, with 78 tests and clippy clean:
 
-- Firmware identification: merged flash images, bare app images, bootloaders,
-  ELFs. Extracts chip, flash size, project name, version, and IDF version.
-- Flash assembly into a bootable image, with partition-table validation
-  (overlap and out-of-bounds are refused, not silently accepted).
-- The peripheral contract, address routing, and conflict detection.
-- The external-driver wire protocol.
-- The bus tracer.
+- **Real firmware boots.** A PURR OS T-Deck Plus build gets through the ROM,
+  the second-stage bootloader, our partition table, all seven segment loads,
+  octal PSRAM detection, and into `app_init`.
+- Firmware identification: merged images, bare app images, bootloaders, ELFs.
+  Extracts chip, flash size, project name, version, and IDF version.
+- Flash assembly, with partition tables validated rather than trusted.
+- Launching and controlling QEMU: serial, QMP reset, clean shutdown.
+- The application: drag-and-drop, board picker, serial console, and a detached
+  serial terminal in its own window.
+- The peripheral contract, address routing, external-driver protocol, tracer.
+
+Try it:
+
+```sh
+scripts/fetch-qemu.sh
+cargo run -p shell            # then drop a firmware .bin on the window
+```
 
 Not yet built:
 
-- The egui shell, so there is nothing to run yet.
-- The QEMU fork with SPI/I²C controllers — the gate on everything visual.
-- Every actual device driver.
+- **GP SPI and I²C controllers in QEMU.** This is the gate on everything
+  visual. Boot currently stops right after eFuse init, where the firmware
+  first talks to the display.
+- Every device driver: display, touch, keyboard, SD card, LoRa, GPS.
 - Wi-Fi.
+
+### What the QEMU work actually involves
+
+Espressif's fork already models `SPI_MEM`, the memory-SPI controller that
+drives flash and PSRAM, and instantiates it as `spi1`. But the S3's
+general-purpose SPI2/SPI3 are a *different peripheral with a different register
+map*, and no GP-SPI model exists in the tree for any chip. So SPI2 has to be
+written against the TRM. The existing models still help: they supply the QEMU
+plumbing — SSI bus integration, chip-select GPIO wiring, MMIO registration —
+which is the fiddly part.
 
 ### On Wi-Fi
 
