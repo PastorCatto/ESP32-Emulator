@@ -5,6 +5,7 @@ members = [
     "crates/vpb",
     "crates/boards",
     "crates/qemuctl",
+    "crates/shell",
 ]
 
 [workspace.package]

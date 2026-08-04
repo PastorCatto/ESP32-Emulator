@@ -1,0 +1,28 @@
+[package]
+name = "shell"
+description = "The emulator application: drag in firmware, watch it run."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "esp32-emulator"
+path = "src/main.rs"
+
+[dependencies]
+flashimg = { path = "../flashimg" }
+boards = { path = "../boards" }
+qemuctl = { path = "../qemuctl" }
+vpb = { path = "../vpb" }
+eframe = { version = "0.35", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui = "0.35"
+
+[lints]
+workspace = true
