@@ -52,7 +52,8 @@ if [ ! -f "$BUILD/build.ninja" ]; then
       --disable-curses \
       --disable-spice \
       --disable-opengl \
-      --disable-capstone)
+      --disable-capstone \
+      --disable-slirp)
 fi
 
 echo "Building"

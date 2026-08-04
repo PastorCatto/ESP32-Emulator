@@ -29,6 +29,13 @@ impl Instance {
     /// also means the reader thread must keep draining, or QEMU will block on
     /// a full pipe once firmware becomes chatty.
     pub fn spawn(qemu: &Qemu, config: &LaunchConfig) -> Result<Self, QemuError> {
+        // A locally built QEMU cannot find its ROM images without -L, so fill
+        // the directory in from wherever the binary was located. Left to the
+        // caller, this is a step everyone forgets exactly once.
+        let mut config = config.clone();
+        if config.data_dir.is_none() {
+            config.data_dir = qemu.data_dir.clone();
+        }
         let args = config.to_args()?;
 
         let mut child = Command::new(&qemu.binary)

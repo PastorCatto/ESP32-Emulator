@@ -93,6 +93,49 @@ insert_after "hw/xtensa/esp32s3.c" \
     esp32s3_soc_add_periph_device(sys_mem, &s->sens, DR_REG_SENS_BASE);" \
   "DR_REG_SENS_BASE);"
 
+# --- make --disable-slirp actually disable slirp ----------------------------
+#
+# Two bugs in this fork's meson.build conspire here.
+#
+# It asks for slirp with `static: true` hardcoded. MSYS2 ships libslirp as a
+# static library only, so meson then resolves *its* glib dependency with
+# `pkg-config --static` and pulls in libglib-2.0.a -- while QEMU has already
+# found glib as a DLL import library. Linking both yields hundreds of
+# "multiple definition of g_main_context_ref" errors.
+#
+# The obvious escape, --disable-slirp, does not work either: the block calls
+# declare_dependency() unconditionally, with no `if slirp_dep.found()` guard,
+# so `slirp` stays truthy and net/slirp.c is still compiled -- and then fails
+# on a missing libslirp.h.
+#
+# Gating the whole block on .allowed() fixes both: disabled means the block is
+# skipped and `slirp` keeps its `not_found` value.
+MESON_BUILD="$SRC/meson.build"
+SLIRP_OLD="if not get_option('slirp').auto() or have_system"
+SLIRP_NEW="if get_option('slirp').allowed() and (not get_option('slirp').auto() or have_system)"
+
+if grep -qF -- "$SLIRP_NEW" "$MESON_BUILD"; then
+  echo "  = meson.build slirp guard already present"
+elif grep -qF -- "$SLIRP_OLD" "$MESON_BUILD"; then
+  # Literal replacement via index/substr. awk's sub() takes a *regex*, and
+  # this anchor is full of parentheses and dots, so sub() silently matches
+  # nothing while still appearing to succeed.
+  awk -v old="$SLIRP_OLD" -v new="$SLIRP_NEW" '
+    !done {
+      p = index($0, old)
+      if (p > 0) {
+        $0 = substr($0, 1, p - 1) new substr($0, p + length(old))
+        done = 1
+      }
+    }
+    { print }
+  ' "$MESON_BUILD" > "$MESON_BUILD.tmp"
+  mv "$MESON_BUILD.tmp" "$MESON_BUILD"
+  echo "  ~ meson.build: --disable-slirp now actually disables slirp"
+else
+  echo "warning: slirp guard anchor not found in meson.build; skipping" >&2
+fi
+
 # --- Windows build fix -----------------------------------------------------
 #
 # QEMU's install-tree step uses os.symlink, which Windows refuses without

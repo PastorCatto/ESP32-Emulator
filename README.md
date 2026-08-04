@@ -4,8 +4,9 @@ A cross-platform emulator for ESP32-family boards. Drag a firmware image onto
 the window and run it — serial console, display, SD card, and a simulated Wi-Fi
 environment, without the hardware.
 
-The first target is the LilyGO T-Deck Plus (ESP32-S3). Boards are data, so
-supporting another one is a config file rather than a patch.
+The first target is the LilyGO T-Deck Plus (ESP32-S3), with the Sunton CYD
+family (ESP32) alongside it. Boards are data, so supporting another one is a
+config file rather than a patch.
 
 > **Status: early, but it boots.** Real LilyGO T-Deck Plus firmware runs
 > through the ROM, the bootloader, PSRAM init, and into application code, with
@@ -41,6 +42,15 @@ here in Rust, where they can be iterated on without a C rebuild.
 
 That split is also what makes custom hardware cheap: a device is whatever
 answers for a bus address, whether it lives in this repo or in your own process.
+
+## Documentation
+
+| | |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | How it fits together, and why each decision was made |
+| [docs/board-files.md](docs/board-files.md) | The board TOML format, field by field |
+| [docs/custom-hardware.md](docs/custom-hardware.md) | Three ways to add a device, including a working driver in Python |
+| [qemu/README.md](qemu/README.md) | The device models we add to QEMU, and how to build it |
 
 ## Modularity
 

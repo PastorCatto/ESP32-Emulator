@@ -75,6 +75,14 @@ impl From<std::io::Error> for QemuError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Qemu {
     pub binary: PathBuf,
+    /// Directory holding the ESP ROM images, when we can find it.
+    ///
+    /// Espressif's release tarballs put these in `../share/qemu` next to the
+    /// binary and find them without help. A locally built QEMU bakes in its
+    /// install prefix instead, and without `-L` fails with "ROM code binary
+    /// not found" — so we locate it ourselves rather than making every caller
+    /// remember.
+    pub data_dir: Option<PathBuf>,
 }
 
 impl Qemu {
@@ -99,7 +107,7 @@ impl Qemu {
             // Accept either the binary itself or the directory holding it.
             for cand in [p.clone(), p.join(&exe), p.join("bin").join(&exe)] {
                 if cand.is_file() {
-                    return Ok(Qemu { binary: cand });
+                    return Ok(Qemu::from_binary(cand));
                 }
                 searched.push(cand);
             }
@@ -113,14 +121,14 @@ impl Qemu {
                 root.join("qemu").join("qemu").join("bin").join(&exe),
             ] {
                 if cand.is_file() {
-                    return Ok(Qemu { binary: cand });
+                    return Ok(Qemu::from_binary(cand));
                 }
                 searched.push(cand);
             }
         }
 
         if let Some(found) = Self::search_path(&exe) {
-            return Ok(Qemu { binary: found });
+            return Ok(Qemu::from_binary(found));
         }
         searched.push(PathBuf::from(format!("$PATH/{exe}")));
 
@@ -155,7 +163,32 @@ impl Qemu {
 
     /// Use a specific binary, skipping the search.
     pub fn at(binary: impl Into<PathBuf>) -> Self {
-        Qemu { binary: binary.into() }
+        Qemu::from_binary(binary.into())
+    }
+
+    /// Wrap a known binary, looking for the ROM images alongside it.
+    fn from_binary(binary: PathBuf) -> Self {
+        let data_dir = Self::find_data_dir(&binary);
+        Qemu { binary, data_dir }
+    }
+
+    /// Find the directory holding `esp32s3_rev0_rom.bin` and friends.
+    ///
+    /// A release tarball puts them in `../share/qemu`; a source build leaves
+    /// them in the tree's `pc-bios`. Presence of an actual ROM is the test,
+    /// rather than the directory merely existing, so a stale empty directory
+    /// does not shadow a good one.
+    fn find_data_dir(binary: &Path) -> Option<PathBuf> {
+        let bin_dir = binary.parent()?;
+        let candidates = [
+            bin_dir.join("..").join("share").join("qemu"),
+            bin_dir.join("share").join("qemu"),
+            bin_dir.join("pc-bios"),
+            bin_dir.join("..").join("pc-bios"),
+        ];
+        candidates
+            .into_iter()
+            .find(|d| d.join("esp32s3_rev0_rom.bin").is_file() || d.join("esp32-v3-rom.bin").is_file())
     }
 
     pub fn version(&self) -> Result<String, QemuError> {
@@ -200,6 +233,8 @@ pub struct LaunchConfig {
     pub flash_image: PathBuf,
     /// External PSRAM, if the board has any.
     pub psram: Option<Psram>,
+    /// Passed as `-L`. Filled in from the located QEMU when left unset.
+    pub data_dir: Option<PathBuf>,
     /// Enable QEMU's own framebuffer window. Off for us: the SPI display is
     /// rendered by the shell, and a second window would only confuse.
     pub graphics: bool,
@@ -219,6 +254,7 @@ impl LaunchConfig {
             chip,
             flash_image: flash_image.into(),
             psram: None,
+            data_dir: None,
             graphics: false,
             qmp_port: None,
             gdb_port: None,
@@ -238,7 +274,15 @@ impl LaunchConfig {
             .qemu_machine()
             .ok_or(QemuError::UnsupportedChip(self.chip))?;
 
-        let mut args: Vec<String> = vec!["-machine".into()];
+        let mut args: Vec<String> = Vec::new();
+
+        // Must come before anything that loads a ROM.
+        if let Some(dir) = &self.data_dir {
+            args.push("-L".into());
+            args.push(dir.display().to_string());
+        }
+
+        args.push("-machine".into());
         if self.graphics {
             args.push(format!("{machine},graphics=on"));
         } else {
@@ -362,6 +406,24 @@ mod tests {
         let args = cfg().to_args().unwrap();
         assert!(!args.iter().any(|a| a == "-m"));
         assert!(!args.iter().any(|a| a.contains("psram")));
+    }
+
+    #[test]
+    fn data_dir_becomes_a_leading_dash_l() {
+        // A source-built QEMU cannot find its ROM images without this and
+        // fails with "ROM code binary not found".
+        let mut c = cfg();
+        c.data_dir = Some(PathBuf::from("/opt/qemu/share/qemu"));
+        let args = c.to_args().unwrap();
+        assert_eq!(args[0], "-L");
+        assert_eq!(args[1], "/opt/qemu/share/qemu");
+    }
+
+    #[test]
+    fn no_data_dir_means_no_dash_l() {
+        // Release tarballs find their own ROMs; passing an empty -L would
+        // stop them doing so.
+        assert!(!cfg().to_args().unwrap().iter().any(|a| a == "-L"));
     }
 
     #[test]

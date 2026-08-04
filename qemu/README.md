@@ -110,11 +110,37 @@ running from the build directory. So a missing entry is skipped rather than
 raised. Copying and *then* failing on a missing source is a trap worth
 avoiding: it looks like the fix worked right up until it doesn't.
 
-**2. Do not reconfigure incrementally after installing a package.** Meson
-caches how it resolved each dependency. Installing `libgcrypt` mid-build and
-letting ninja re-run configure produced a link line with *both*
-`libglib-2.0.a` and `libglib-2.0.dll.a`, and hundreds of duplicate-symbol
-errors. Use `--clean`.
+**2. slirp drags in a second, static glib — and `--disable-slirp` does not
+work.** This presents as hundreds of `multiple definition of
+'g_main_context_ref'` errors at link time, with both `libglib-2.0.a` and
+`libglib-2.0.dll.a` on the command line.
+
+There are two separate bugs in this fork's `meson.build`, and you have to fix
+the second to escape the first.
+
+The dependency is requested with `static: true` hardcoded:
+
+```meson
+slirp_dep = dependency('slirp', required: get_option('slirp'),
+                       method: 'pkg-config',
+                       static: true)
+```
+
+MSYS2 ships libslirp as a static library only, so meson resolves *its* glib
+dependency with `pkg-config --static` and returns the static archive — while
+QEMU has already found glib as a DLL import library. Both get linked.
+
+The obvious escape is `--disable-slirp`, but the block calls
+`declare_dependency()` unconditionally, with no `if slirp_dep.found()` guard.
+So `slirp` stays truthy even when the dependency was skipped,
+`net/slirp.c` is still compiled, and it fails on a missing `libslirp.h`.
+
+`apply.sh` gates the whole block on `.allowed()`, which fixes both: disabled
+means the block is skipped and `slirp` keeps its `not_found` value.
+
+Reaching for a clean rebuild first is tempting and does not help — the cause
+is dependency resolution, not stale state. (A clean rebuild *is* needed after
+changing installed packages, but that is a different problem.)
 
 **3. A build directory can be locked.** If a shell still has it open,
 `rm -rf build` fails with "Device or resource busy", and the next configure
