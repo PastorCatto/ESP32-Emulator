@@ -38,6 +38,41 @@ impl From<std::io::Error> for QmpError {
     }
 }
 
+/// Pull the string out of `{"return": "...text..."}`, undoing JSON escapes.
+///
+/// Hand-rolled rather than pulling in a JSON parser: this crate needs exactly
+/// one field from one message shape, and the monitor's output is the only
+/// place a string ever appears.
+fn extract_return_string(line: &str) -> Option<String> {
+    let rest = line.split_once("\"return\"")?.1;
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    let body = rest.strip_prefix('"')?;
+
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => {
+                    // Skip the four hex digits; monitor output is ASCII in
+                    // practice, so approximating these is harmless.
+                    for _ in 0..4 {
+                        chars.next()?;
+                    }
+                    out.push('?');
+                }
+                other => out.push(other),
+            },
+            c => out.push(c),
+        }
+    }
+    None
+}
+
 #[derive(Debug)]
 pub struct QmpClient {
     reader: BufReader<TcpStream>,
@@ -104,6 +139,47 @@ impl QmpClient {
         })
     }
 
+    /// Run a QEMU monitor command and return its raw text output.
+    ///
+    /// The monitor exposes diagnostics QMP has no typed equivalent for --
+    /// `info registers` above all, which is how you find out where firmware is
+    /// stuck when it stops producing serial output.
+    pub fn human_monitor(&mut self, command: &str) -> Result<String, QmpError> {
+        // The command travels inside a JSON string, so quotes and backslashes
+        // have to be escaped or the frame is malformed.
+        let escaped: String = command
+            .chars()
+            .flat_map(|c| match c {
+                '"' => vec!['\\', '"'],
+                '\\' => vec!['\\', '\\'],
+                '\n' => vec!['\\', 'n'],
+                c => vec![c],
+            })
+            .collect();
+        writeln!(
+            self.writer,
+            "{{\"execute\":\"human-monitor-command\",\"arguments\":{{\"command-line\":\"{escaped}\"}}}}"
+        )?;
+        self.writer.flush()?;
+
+        for _ in 0..32 {
+            let line = self.read_line()?;
+            if line.contains("\"error\"") {
+                return Err(QmpError::Command {
+                    command: "human-monitor-command",
+                    detail: line.trim().to_string(),
+                });
+            }
+            if let Some(text) = extract_return_string(&line) {
+                return Ok(text);
+            }
+        }
+        Err(QmpError::Command {
+            command: "human-monitor-command",
+            detail: "no result among the first 32 messages".into(),
+        })
+    }
+
     /// Reset the machine, as the physical reset button would.
     pub fn reset(&mut self) -> Result<(), QmpError> {
         self.command("system_reset").map(drop)
@@ -126,5 +202,40 @@ impl QmpClient {
             Err(QmpError::Io(_)) | Err(QmpError::NoGreeting) => Ok(()),
             Err(e) => Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_return_string;
+
+    #[test]
+    fn pulls_monitor_text_out_of_a_reply() {
+        let line = r#"{"return": "PC 0x42001234\r\nAR0 0x00000001\r\n"}"#;
+        assert_eq!(
+            extract_return_string(line).unwrap(),
+            "PC 0x42001234\r\nAR0 0x00000001\r\n"
+        );
+    }
+
+    #[test]
+    fn handles_an_empty_return_and_escaped_quotes() {
+        assert_eq!(extract_return_string(r#"{"return": ""}"#).unwrap(), "");
+        assert_eq!(
+            extract_return_string(r#"{"return": "say \"hi\""}"#).unwrap(),
+            r#"say "hi""#
+        );
+    }
+
+    #[test]
+    fn ignores_messages_that_are_not_returns() {
+        assert_eq!(extract_return_string(r#"{"event": "RESET"}"#), None);
+        // An object-valued return is not monitor text.
+        assert_eq!(extract_return_string(r#"{"return": {}}"#), None);
+    }
+
+    #[test]
+    fn unterminated_string_is_not_treated_as_complete() {
+        assert_eq!(extract_return_string(r#"{"return": "oops"#), None);
     }
 }

@@ -5,12 +5,14 @@
 //! build metadata, and assembles a flash image the emulator can boot.
 
 mod chip;
+mod elf;
 mod error;
 mod image;
 mod layout;
 mod partition;
 
 pub use chip::{Chip, FlashSize, ALL_CHIPS};
+pub use elf::{ElfSymbols, Symbol, SymbolKind, EM_RISCV, EM_XTENSA};
 pub use error::{Error, Result};
 pub use image::{
     AppDescriptor, AppImage, ImageHeader, Segment, SpiMode, APP_DESC_LEN, APP_DESC_MAGIC,
