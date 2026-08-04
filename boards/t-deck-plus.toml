@@ -1,0 +1,128 @@
+# LilyGO T-Deck Plus
+#
+# Pin assignments verified against LilyGO's own `utilities.h`:
+# https://github.com/Xinyuan-LilyGO/T-Deck/blob/master/examples/UnitTest/utilities.h
+#
+# One caveat: `utilities.h` names the trackball lines TBOX_G01..G04 without
+# saying which is which direction, and reuses GPIO0 (the boot strap pin) for
+# the click. The direction mapping below follows Meshtastic's T-Deck port and
+# is the only thing here not confirmed by a primary source.
+
+[board]
+id = "t-deck-plus"
+name = "LilyGO T-Deck Plus"
+chip = "esp32s3"
+flash_size = "16MB"
+
+[board.psram]
+kind = "octal"
+size = "8MB"
+
+# The T-Deck hangs display, SD, and LoRa off one shared SPI bus, distinguished
+# only by chip select. Getting CS routing right is what makes the bus work.
+[[bus]]
+id = "fspi"
+kind = "spi"
+controller = 2          # SPI2 / FSPI
+sck = 40
+mosi = 41
+miso = 38
+
+[[bus]]
+id = "i2c0"
+kind = "i2c"
+controller = 0
+sda = 18
+scl = 8
+
+[[bus]]
+id = "gps_uart"
+kind = "uart"
+controller = 1
+tx = 43
+rx = 44
+
+[[peripheral]]
+kind = "st7789"
+label = "2.8in LCD"
+bus = "fspi"
+cs = 12
+dc = 11
+backlight = 42
+width = 320
+height = 240
+# ST7789 silicon has a 240x320 frame buffer; the T-Deck mounts it sideways.
+rotation = 90
+color_order = "rgb"
+invert = true
+
+[[peripheral]]
+kind = "gt911"
+label = "capacitive touch"
+bus = "i2c0"
+address = 0x5d
+alt_address = 0x14
+irq = 16
+width = 320
+height = 240
+
+[[peripheral]]
+kind = "tdeck-keyboard"
+label = "BlackBerry QWERTY (ESP32-C3 co-processor)"
+bus = "i2c0"
+address = 0x55
+irq = 46
+
+# The trackball is wired as four plain GPIO quadrature lines plus a click,
+# not as a bus device.
+[[peripheral]]
+kind = "trackball"
+label = "trackball"
+up = 3
+down = 15
+left = 1
+right = 2
+click = 0
+
+[[peripheral]]
+kind = "sdcard"
+label = "microSD"
+bus = "fspi"
+cs = 39
+
+[[peripheral]]
+kind = "sx1262"
+label = "LoRa radio"
+bus = "fspi"
+cs = 9
+busy = 13
+reset = 17
+dio1 = 45
+
+[[peripheral]]
+kind = "gnss"
+label = "MIA-M10Q GPS"
+bus = "gps_uart"
+baud = 38400
+
+[[peripheral]]
+kind = "es7210"
+label = "microphone array"
+bus = "i2s"
+mclk = 48
+lrck = 21
+sck = 47
+din = 14
+
+[[peripheral]]
+kind = "power-hold"
+label = "peripheral power rail"
+gpio = 10
+active_high = true
+
+# Emulation status, surfaced in the UI so the state of each device is honest
+# rather than silently missing.
+[support]
+implemented = []
+planned = ["st7789", "gt911", "tdeck-keyboard", "sdcard", "trackball"]
+stubbed = ["sx1262", "gnss", "es7210", "power-hold"]

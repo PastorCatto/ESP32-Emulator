@@ -1,0 +1,21 @@
+# A plain ESP32-S3 devkit: CPU, flash, PSRAM, and the USB-serial console.
+#
+# This is the fallback profile used when a dropped firmware's chip is
+# recognised but its board is not. It should stay peripheral-free so that
+# "unknown board" still boots to a serial console.
+
+[board]
+id = "generic-esp32s3"
+name = "Generic ESP32-S3 devkit"
+chip = "esp32s3"
+flash_size = "4MB"
+default_for_chip = true
+
+[board.psram]
+kind = "none"
+size = "0"
+
+[support]
+implemented = []
+planned = []
+stubbed = []

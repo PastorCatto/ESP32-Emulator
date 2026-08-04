@@ -1,0 +1,12 @@
+# Normalise to LF in the repository. This project is built on Windows, macOS,
+# and Linux, and mixed line endings would otherwise show up as whole-file diffs
+# depending on who committed last.
+* text=auto eol=lf
+
+# Firmware and disk images must never be line-ending converted.
+*.bin binary
+*.img binary
+*.vhd binary
+*.vhdx binary
+*.elf binary
+*.tar.xz binary
