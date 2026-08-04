@@ -179,12 +179,27 @@ impl Qemu {
     }
 }
 
+/// External PSRAM attached to the SoC.
+///
+/// Boards like the T-Deck put their framebuffer and heap in PSRAM, and their
+/// firmware calls `abort()` during startup when it is missing — so getting this
+/// wrong is not a degraded experience, it is a boot loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Psram {
+    pub size_mb: u32,
+    /// Octal (OPI) rather than quad. The S3 checks the line mode during
+    /// detection, so a quad model answering an octal probe fails outright.
+    pub octal: bool,
+}
+
 /// How to start the machine.
 #[derive(Debug, Clone)]
 pub struct LaunchConfig {
     pub chip: Chip,
     /// Full flash image, written as the MTD backing store.
     pub flash_image: PathBuf,
+    /// External PSRAM, if the board has any.
+    pub psram: Option<Psram>,
     /// Enable QEMU's own framebuffer window. Off for us: the SPI display is
     /// rendered by the shell, and a second window would only confuse.
     pub graphics: bool,
@@ -203,6 +218,7 @@ impl LaunchConfig {
         LaunchConfig {
             chip,
             flash_image: flash_image.into(),
+            psram: None,
             graphics: false,
             qmp_port: None,
             gdb_port: None,
@@ -237,6 +253,19 @@ impl LaunchConfig {
             "file={},if=mtd,format=raw",
             self.flash_image.display()
         ));
+
+        // PSRAM needs two separate settings, and supplying only one silently
+        // does nothing: `-m` sets how much RAM actually exists, while the
+        // global switches the modelled chip to octal. The S3 verifies the line
+        // mode during detection, so both must agree.
+        if let Some(psram) = self.psram {
+            args.push("-m".into());
+            args.push(format!("{}M", psram.size_mb));
+            if psram.octal {
+                args.push("-global".into());
+                args.push("driver=ssi_psram,property=is_octal,value=true".into());
+            }
+        }
 
         if let Some(port) = self.qmp_port {
             args.push("-qmp".into());
@@ -303,6 +332,36 @@ mod tests {
             args.windows(2).find(|w| w[0] == "-monitor").map(|w| &w[1]),
             Some(&"none".to_string())
         );
+    }
+
+    #[test]
+    fn octal_psram_emits_both_required_flags() {
+        // Verified by hand against the vendored QEMU: this exact pair is what
+        // gets real T-Deck firmware past `Failed to init external RAM`.
+        // Supplying only one of them silently does nothing.
+        let mut c = cfg();
+        c.psram = Some(Psram { size_mb: 8, octal: true });
+        let args = c.to_args().unwrap();
+        assert!(args.windows(2).any(|w| w[0] == "-m" && w[1] == "8M"));
+        assert!(args.contains(&"driver=ssi_psram,property=is_octal,value=true".to_string()));
+    }
+
+    #[test]
+    fn quad_psram_sets_size_without_the_octal_global() {
+        let mut c = cfg();
+        c.psram = Some(Psram { size_mb: 4, octal: false });
+        let args = c.to_args().unwrap();
+        assert!(args.windows(2).any(|w| w[0] == "-m" && w[1] == "4M"));
+        assert!(!args.iter().any(|a| a.contains("is_octal")));
+    }
+
+    #[test]
+    fn no_psram_means_no_memory_flag_at_all() {
+        // The S3 machine has no PSRAM by default, and passing -m 0M would be
+        // a different thing entirely.
+        let args = cfg().to_args().unwrap();
+        assert!(!args.iter().any(|a| a == "-m"));
+        assert!(!args.iter().any(|a| a.contains("psram")));
     }
 
     #[test]

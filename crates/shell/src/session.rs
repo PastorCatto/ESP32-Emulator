@@ -201,7 +201,8 @@ impl Session {
         self.serial.clear();
 
         let qemu = Qemu::locate(chip)?;
-        let config = LaunchConfig::new(chip, &flash);
+        let mut config = LaunchConfig::new(chip, &flash);
+        config.psram = self.board.qemu_psram();
         self.instance = Some(Instance::spawn(&qemu, &config)?);
         Ok(())
     }

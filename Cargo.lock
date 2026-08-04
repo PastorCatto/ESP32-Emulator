@@ -149,6 +149,7 @@ name = "boards"
 version = "0.1.0"
 dependencies = [
  "flashimg",
+ "qemuctl",
  "serde",
  "toml",
  "vpb",

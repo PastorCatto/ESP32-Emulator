@@ -348,6 +348,21 @@ impl Board {
             .collect();
     }
 
+    /// This board's PSRAM as QEMU needs it described.
+    ///
+    /// `None` when the board has no PSRAM, which is different from zero: the
+    /// S3 machine has none by default and passing a size of zero is not the
+    /// same as passing nothing.
+    pub fn qemu_psram(&self) -> Option<qemuctl::Psram> {
+        if self.psram.kind == PsramKind::None || self.psram.size == 0 {
+            return None;
+        }
+        Some(qemuctl::Psram {
+            size_mb: (self.psram.size / (1024 * 1024)).max(1),
+            octal: self.psram.kind == PsramKind::Octal,
+        })
+    }
+
     pub fn bus(&self, id: &str) -> Option<&Bus> {
         self.buses.iter().find(|b| b.id == id)
     }
@@ -417,6 +432,23 @@ mod tests {
         assert_eq!(lcd.params.u16("width").unwrap(), 320);
         assert_eq!(lcd.params.u16("height").unwrap(), 240);
         assert_eq!(lcd.params.u8("dc").unwrap(), 11);
+    }
+
+    #[test]
+    fn t_deck_psram_reaches_qemu_as_octal_8mb() {
+        // Real T-Deck firmware aborts during startup without this, so the
+        // board file getting it right is load-bearing, not cosmetic.
+        let b = Board::from_toml(T_DECK).unwrap();
+        assert_eq!(
+            b.qemu_psram(),
+            Some(qemuctl::Psram { size_mb: 8, octal: true })
+        );
+    }
+
+    #[test]
+    fn a_board_without_psram_asks_qemu_for_none() {
+        let b = Board::from_toml(GENERIC).unwrap();
+        assert_eq!(b.qemu_psram(), None);
     }
 
     #[test]

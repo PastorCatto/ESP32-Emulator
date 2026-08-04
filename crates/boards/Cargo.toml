@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 flashimg = { path = "../flashimg" }
+qemuctl = { path = "../qemuctl" }
 vpb = { path = "../vpb" }
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1"

@@ -5,7 +5,7 @@
 //! make them meaningful.
 
 use flashimg::{Chip, FlashImage, FlashSize};
-use qemuctl::{Instance, LaunchConfig, Qemu};
+use qemuctl::{Instance, LaunchConfig, Psram, Qemu};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -112,6 +112,55 @@ fn shutdown_stops_the_process() {
     inst.shutdown();
     assert!(!inst.is_running(), "process should be gone after shutdown");
     let _ = std::fs::remove_file(&flash);
+}
+
+/// Boot a real firmware image all the way into application code.
+///
+/// Opt in by pointing `ESP32_EMULATOR_TEST_FIRMWARE` at a merged flash image
+/// for an ESP32-S3 board with 8MB octal PSRAM, e.g. a T-Deck build. Real
+/// firmware is not in the repo, so this cannot run by default.
+#[test]
+fn boots_real_firmware_into_application_code() {
+    let Some(qemu) = qemu_or_skip() else { return };
+    let Some(src) = std::env::var_os("ESP32_EMULATOR_TEST_FIRMWARE") else {
+        eprintln!("skipping: set ESP32_EMULATOR_TEST_FIRMWARE to a merged flash image");
+        return;
+    };
+    let src = PathBuf::from(src);
+
+    // Pad to the full device size; a merged image is usually shorter than the
+    // flash it targets.
+    let mut bytes = std::fs::read(&src).expect("read firmware");
+    let full = FlashSize::MB16.bytes() as usize;
+    assert!(bytes.len() <= full, "image is larger than 16MB");
+    bytes.resize(full, 0xff);
+
+    let flash = std::env::temp_dir().join(format!("esp32emu-real-{}.bin", std::process::id()));
+    std::fs::write(&flash, &bytes).expect("write flash");
+
+    let mut config = LaunchConfig::new(Chip::Esp32S3, &flash);
+    config.psram = Some(Psram { size_mb: 8, octal: true });
+    let mut inst = Instance::spawn(&qemu, &config).expect("spawn qemu");
+
+    let out = wait_for_serial(&mut inst, "app_init: Project name", Duration::from_secs(60));
+    inst.shutdown();
+    let _ = std::fs::remove_file(&flash);
+
+    // Reaching app_init means the ROM, the second-stage bootloader, our
+    // partition table, PSRAM, and every segment load all worked.
+    assert!(
+        out.contains("Found 8MB PSRAM device"),
+        "octal PSRAM was not detected, got:\n{out}"
+    );
+    assert!(
+        out.contains("app_init: Project name"),
+        "never reached application startup, got:\n{out}"
+    );
+    // A boot loop would show this instead of progressing.
+    assert!(
+        !out.contains("Failed to init external RAM"),
+        "PSRAM init failed, got:\n{out}"
+    );
 }
 
 #[test]
