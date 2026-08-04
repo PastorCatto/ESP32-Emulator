@@ -103,6 +103,46 @@ impl fmt::Display for Chip {
     }
 }
 
+/// Every chip target, for enumerating in UI and error messages.
+pub const ALL_CHIPS: &[Chip] = &[
+    Chip::Esp32,
+    Chip::Esp32S2,
+    Chip::Esp32S3,
+    Chip::Esp32C2,
+    Chip::Esp32C3,
+    Chip::Esp32C5,
+    Chip::Esp32C6,
+    Chip::Esp32H2,
+    Chip::Esp32P4,
+];
+
+impl std::str::FromStr for Chip {
+    type Err = ();
+
+    /// Accepts the spellings people actually write: `esp32s3`, `esp32-s3`,
+    /// `ESP32_S3`, `s3`.
+    fn from_str(s: &str) -> std::result::Result<Self, ()> {
+        let norm: String = s
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        let norm = norm.strip_prefix("esp32").unwrap_or(&norm);
+        Ok(match norm {
+            "" => Chip::Esp32,
+            "s2" => Chip::Esp32S2,
+            "s3" => Chip::Esp32S3,
+            "c2" => Chip::Esp32C2,
+            "c3" => Chip::Esp32C3,
+            "c5" => Chip::Esp32C5,
+            "c6" => Chip::Esp32C6,
+            "h2" => Chip::Esp32H2,
+            "p4" => Chip::Esp32P4,
+            _ => return Err(()),
+        })
+    }
+}
+
 /// The `spi_size` nibble of the image header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlashSize(pub u32);
@@ -137,5 +177,30 @@ impl FlashSize {
 impl fmt::Display for FlashSize {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}MB", self.megabytes())
+    }
+}
+
+impl std::str::FromStr for FlashSize {
+    type Err = ();
+
+    /// Accepts `16MB`, `16M`, `16 MiB`, `8mb`, or a raw byte count.
+    fn from_str(s: &str) -> std::result::Result<Self, ()> {
+        let s = s.trim().to_ascii_lowercase();
+        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return Err(());
+        }
+        let n: u32 = digits.parse().map_err(|_| ())?;
+        let unit: String = s[digits.len()..].chars().filter(|c| !c.is_whitespace()).collect();
+        let bytes = match unit.as_str() {
+            "" => n,
+            "k" | "kb" | "kib" => n.checked_mul(1024).ok_or(())?,
+            "m" | "mb" | "mib" => n.checked_mul(1024 * 1024).ok_or(())?,
+            _ => return Err(()),
+        };
+        if bytes == 0 {
+            return Err(());
+        }
+        Ok(FlashSize(bytes))
     }
 }
