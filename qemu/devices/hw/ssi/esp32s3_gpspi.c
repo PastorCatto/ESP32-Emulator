@@ -31,6 +31,7 @@
 
 static uint64_t esp32s3_gpspi_duration_ns(Esp32s3GpspiState *s, unsigned bytes);
 static void esp32s3_gpspi_done(void *opaque);
+static void esp32s3_gpspi_deassert(void *opaque);
 
 /*
  * Recompute masked status and drive the interrupt line.
@@ -44,10 +45,48 @@ static void esp32s3_gpspi_done(void *opaque);
  */
 static void esp32s3_gpspi_update_irq(Esp32s3GpspiState *s)
 {
+    /* Rule 1: combinational, recomputed on every write to either register. */
     s->regs[R_GPSPI_DMA_INT_ST] =
         s->regs[R_GPSPI_DMA_INT_RAW] & s->regs[R_GPSPI_DMA_INT_ENA];
 
-    qemu_set_irq(s->irq, s->regs[R_GPSPI_DMA_INT_ST] != 0);
+    bool want = s->regs[R_GPSPI_DMA_INT_ST] != 0;
+
+    if (want) {
+        /*
+         * Rule 4: assert whenever ST is non-zero, level-style rather than on
+         * the transition. This is what makes arming ENA on an already-set RAW
+         * work, instead of losing the wakeup.
+         */
+        timer_del(s->deassert_timer);
+        if (!s->line_high) {
+            s->line_high = true;
+            qemu_irq_raise(s->irq);
+        }
+        return;
+    }
+
+    /*
+     * Rule 5: hold the line briefly rather than dropping it here, so the CPU
+     * takes the interrupt once more. Dropping it synchronously gives one ISR
+     * entry where hardware gives two.
+     */
+    if (s->line_high && !timer_pending(s->deassert_timer)) {
+        timer_mod_ns(s->deassert_timer,
+                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                         ESP32S3_GPSPI_IRQ_HOLD_NS);
+    }
+}
+
+/* The held-off deassert from rule 5 finally landing. */
+static void esp32s3_gpspi_deassert(void *opaque)
+{
+    Esp32s3GpspiState *s = ESP32S3_GPSPI(opaque);
+
+    /* Re-check: the condition may have come back during the hold window. */
+    if (s->regs[R_GPSPI_DMA_INT_ST] == 0 && s->line_high) {
+        s->line_high = false;
+        qemu_irq_lower(s->irq);
+    }
 }
 
 /* Which chip select is asserted, or -1 when the driver has selected none. */
@@ -337,6 +376,8 @@ static void esp32s3_gpspi_reset_hold(Object *obj, ResetType type)
 
     timer_del(s->done_timer);
     s->busy = false;
+    timer_del(s->deassert_timer);
+    s->line_high = false;
 
     memset(s->regs, 0, sizeof(s->regs));
     /* Every chip select released. */
@@ -362,6 +403,8 @@ static void esp32s3_gpspi_init(Object *obj)
                              ESP32S3_GPSPI_CS_COUNT);
 
     s->done_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, esp32s3_gpspi_done, s);
+    s->deassert_timer =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, esp32s3_gpspi_deassert, s);
 }
 
 static const VMStateDescription vmstate_esp32s3_gpspi = {
