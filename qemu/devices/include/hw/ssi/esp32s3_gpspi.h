@@ -21,6 +21,7 @@
 #include "hw/sysbus.h"
 #include "hw/registerfields.h"
 #include "hw/ssi/ssi.h"
+#include "hw/dma/esp_gdma.h"
 
 #define TYPE_ESP32S3_GPSPI "ssi.esp32s3.gpspi"
 #define ESP32S3_GPSPI(obj) OBJECT_CHECK(Esp32s3GpspiState, (obj), TYPE_ESP32S3_GPSPI)
@@ -61,6 +62,13 @@
 /* CS0..CS5. */
 #define ESP32S3_GPSPI_CS_COUNT   6
 
+/*
+ * Largest single DMA transfer we stage in one go. SPI_MS_DLEN is 18 bits, so
+ * the hardware maximum is 32 KiB; a driver asking for more than this is
+ * clamped and told, rather than overrunning the buffer.
+ */
+#define ESP32S3_GPSPI_DMA_MAX    (32 * 1024)
+
 REG32(GPSPI_CMD, 0x000)
     FIELD(GPSPI_CMD, UPDATE, 23, 1)
     FIELD(GPSPI_CMD, USR, 24, 1)
@@ -97,6 +105,11 @@ REG32(GPSPI_MISC, 0x020)
     FIELD(GPSPI_MISC, CS_DIS, 0, 6)
 
 REG32(GPSPI_DMA_CONF,    0x030)
+    /* Bit 21. Set for full-duplex DMA. */
+    FIELD(GPSPI_DMA_CONF, RX_EOF_EN, 21, 1)
+    /* Bit 27: memory <- peripheral. Bit 28: memory -> peripheral. */
+    FIELD(GPSPI_DMA_CONF, DMA_RX_ENA, 27, 1)
+    FIELD(GPSPI_DMA_CONF, DMA_TX_ENA, 28, 1)
 REG32(GPSPI_DMA_INT_ENA, 0x034)
 REG32(GPSPI_DMA_INT_CLR, 0x038)
 REG32(GPSPI_DMA_INT_RAW, 0x03c)
@@ -144,6 +157,22 @@ typedef struct Esp32s3GpspiState {
      */
     QEMUBH *deassert_bh;
     bool line_high;
+
+    /*
+     * The GDMA engine, when the machine wires one up. Transfers longer than
+     * the 64-byte register buffer go through it, which is how a display
+     * driver pushes a framebuffer.
+     */
+    ESPGdmaState *gdma;
+    /* Which peripheral slot to claim on the GDMA: SPI2 or SPI3. */
+    GdmaPeripheral gdma_periph;
+
+    /*
+     * Staging for a DMA transfer. Sized for one descriptor's worth of the
+     * largest transfer a driver is likely to queue; longer transfers are
+     * chunked by the GDMA's own descriptor walk.
+     */
+    uint8_t dma_buf[ESP32S3_GPSPI_DMA_MAX];
 
     uint32_t regs[ESP32S3_GPSPI_REG_COUNT];
 } Esp32s3GpspiState;

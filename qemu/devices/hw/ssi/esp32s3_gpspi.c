@@ -137,6 +137,84 @@ static uint8_t esp32s3_gpspi_xfer_byte(Esp32s3GpspiState *s, uint8_t out,
     return anything_attached ? (uint8_t)in : 0x00;
 }
 
+/* Is either DMA direction armed for this transfer? */
+static bool esp32s3_gpspi_dma_active(Esp32s3GpspiState *s)
+{
+    uint32_t conf = s->regs[R_GPSPI_DMA_CONF];
+
+    return s->gdma != NULL &&
+           (FIELD_EX32(conf, GPSPI_DMA_CONF, DMA_TX_ENA) ||
+            FIELD_EX32(conf, GPSPI_DMA_CONF, DMA_RX_ENA));
+}
+
+/*
+ * Move the data phase through the GDMA engine.
+ *
+ * TX pulls the outgoing bytes out of memory, RX pushes what came back into
+ * it. Full duplex runs both against the same byte count, which is what an
+ * `spi_device_transmit` with both buffers set does.
+ *
+ * Descriptor writeback is deliberately asymmetric, because the hardware is:
+ * measured on a real T-Deck Plus, an RX descriptor comes back with `owner`
+ * cleared, `length` filled in and `suc_eof` set, while the TX descriptor in
+ * the *same* transfer is untouched. Firmware therefore cannot learn a TX
+ * buffer is reusable by polling `owner` -- it has to wait for TRANS_DONE --
+ * and modelling both directions the same way "for symmetry" gets one of them
+ * wrong. The GDMA engine already implements this split, so this only has to
+ * avoid undoing it.
+ */
+static unsigned esp32s3_gpspi_dma_data(Esp32s3GpspiState *s, unsigned bytes,
+                                       bool mosi, bool miso, bool attached)
+{
+    uint32_t conf = s->regs[R_GPSPI_DMA_CONF];
+    bool tx = mosi && FIELD_EX32(conf, GPSPI_DMA_CONF, DMA_TX_ENA);
+    bool rx = miso && FIELD_EX32(conf, GPSPI_DMA_CONF, DMA_RX_ENA);
+    uint32_t chan;
+
+    if (bytes > ESP32S3_GPSPI_DMA_MAX) {
+        qemu_log_mask(LOG_UNIMP,
+                      "%s: %u-byte DMA transfer exceeds the %u-byte staging "
+                      "buffer; truncating\n",
+                      __func__, bytes, ESP32S3_GPSPI_DMA_MAX);
+        bytes = ESP32S3_GPSPI_DMA_MAX;
+    }
+
+    /*
+     * Default to idle-bus bytes so a TX-less transfer still clocks something
+     * sensible out, matching the programmed-I/O path.
+     */
+    memset(s->dma_buf, 0xff, bytes);
+
+    if (tx) {
+        if (!esp_gdma_get_channel_periph(s->gdma, s->gdma_periph,
+                                         ESP_GDMA_OUT_IDX, &chan) ||
+            !esp_gdma_read_channel(s->gdma, chan, s->dma_buf, bytes)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: DMA TX enabled but no usable out channel\n",
+                          __func__);
+            return 0;
+        }
+    }
+
+    /* Clock the bytes over the bus, collecting MISO in place. */
+    for (unsigned i = 0; i < bytes; i++) {
+        uint8_t in = esp32s3_gpspi_xfer_byte(s, s->dma_buf[i], attached);
+        s->dma_buf[i] = in;
+    }
+
+    if (rx) {
+        if (!esp_gdma_get_channel_periph(s->gdma, s->gdma_periph,
+                                         ESP_GDMA_IN_IDX, &chan) ||
+            !esp_gdma_write_channel(s->gdma, chan, s->dma_buf, bytes)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: DMA RX enabled but no usable in channel\n",
+                          __func__);
+        }
+    }
+
+    return bytes;
+}
+
 static void esp32s3_gpspi_transfer(Esp32s3GpspiState *s)
 {
     const uint32_t user = s->regs[R_GPSPI_USER];
@@ -196,26 +274,30 @@ static void esp32s3_gpspi_transfer(Esp32s3GpspiState *s)
                                    MS_DATA_BITLEN) + 1;
         unsigned bytes = (bits + 7) / 8;
 
-        if (bytes > ESP32S3_GPSPI_BUF_BYTES) {
-            /*
-             * Longer than the register buffer means the driver used DMA,
-             * which we do not model. Clamp rather than read past the buffer,
-             * and say so: a truncated display update is confusing on its own.
-             */
-            qemu_log_mask(LOG_UNIMP,
-                          "%s: %u-byte transfer needs DMA (max %u); truncating\n",
-                          __func__, bytes, ESP32S3_GPSPI_BUF_BYTES);
-            bytes = ESP32S3_GPSPI_BUF_BYTES;
-        }
-
-        for (unsigned i = 0; i < bytes; i++) {
-            uint8_t out = mosi ? esp32s3_gpspi_buf_read(s, i) : 0xff;
-            uint8_t in = esp32s3_gpspi_xfer_byte(s, out, attached);
-            if (miso) {
-                esp32s3_gpspi_buf_write(s, i, in);
+        if (esp32s3_gpspi_dma_active(s)) {
+            total_bytes += esp32s3_gpspi_dma_data(s, bytes, mosi, miso, attached);
+        } else {
+            if (bytes > ESP32S3_GPSPI_BUF_BYTES) {
+                /*
+                 * Longer than the register buffer with no DMA enabled: the
+                 * driver has asked for something the hardware could not do
+                 * this way either. Clamp rather than read past the buffer.
+                 */
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "%s: %u-byte programmed transfer exceeds the "
+                              "%u-byte buffer; truncating\n",
+                              __func__, bytes, ESP32S3_GPSPI_BUF_BYTES);
+                bytes = ESP32S3_GPSPI_BUF_BYTES;
             }
+            for (unsigned i = 0; i < bytes; i++) {
+                uint8_t out = mosi ? esp32s3_gpspi_buf_read(s, i) : 0xff;
+                uint8_t in = esp32s3_gpspi_xfer_byte(s, out, attached);
+                if (miso) {
+                    esp32s3_gpspi_buf_write(s, i, in);
+                }
+            }
+            total_bytes += bytes;
         }
-        total_bytes += bytes;
     }
 
     if (cs >= 0) {
@@ -254,6 +336,13 @@ static void esp32s3_gpspi_done(void *opaque)
     Esp32s3GpspiState *s = ESP32S3_GPSPI(opaque);
 
     s->busy = false;
+
+    /*
+     * USR clearing and TRANS_DONE rising are one event, not two. Splitting
+     * them lets a driver polling either one disagree with the other about
+     * whether the transfer finished.
+     */
+    s->regs[R_GPSPI_CMD] &= ~R_GPSPI_CMD_USR_MASK;
     s->regs[R_GPSPI_DMA_INT_RAW] |= GPSPI_TRANS_DONE_INT;
     esp32s3_gpspi_update_irq(s);
 }
@@ -327,13 +416,20 @@ static void esp32s3_gpspi_write(void *opaque, hwaddr addr, uint64_t value,
     switch (reg) {
     case A_GPSPI_CMD: {
         /*
-         * SPI_UPDATE latches configuration and is not a transfer. Storing it
-         * would leave the bit set, and drivers poll it to see the latch
-         * complete, so it must read back as zero.
+         * SPI_UPDATE latches configuration and is not a transfer. Measured as
+         * self-clearing immediately, and drivers poll it to see the latch
+         * complete, so it must read back as zero straight away.
+         *
+         * SPI_USR is the opposite: it stays set for the duration of the
+         * transfer and clears *at the same moment* TRANS_DONE is raised.
+         * Measured on hardware as a one-cycle gap against 1600-2600 cycles of
+         * jitter, which is no gap at all. Clearing it here instead would let
+         * a driver that watches USR conclude the transfer finished while
+         * TRANS_DONE still read zero -- and firmware watching the other one
+         * would then hang.
          */
         bool start = FIELD_EX32((uint32_t)value, GPSPI_CMD, USR);
-        s->regs[index] = (uint32_t)value &
-                         ~(R_GPSPI_CMD_UPDATE_MASK | R_GPSPI_CMD_USR_MASK);
+        s->regs[index] = (uint32_t)value & ~R_GPSPI_CMD_UPDATE_MASK;
         if (start) {
             esp32s3_gpspi_transfer(s);
         }

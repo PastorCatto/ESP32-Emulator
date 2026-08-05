@@ -147,6 +147,17 @@ insert_after "hw/xtensa/esp32s3.c" \
                        qdev_get_gpio_in(intmatrix_dev, ETS_SPI3_INTR_SOURCE));" \
   "ETS_SPI3_INTR_SOURCE"
 
+# Hand the SPI controllers the GDMA engine, so transfers longer than the
+# 64-byte register buffer can go through it. Done alongside the SHA and AES
+# links, which is after the GDMA itself is realized.
+insert_after "hw/xtensa/esp32s3.c" \
+  "        ss->sha.parent.gdma = ESP_GDMA(&ss->gdma);" \
+  "        ss->gpspi2.gdma = ESP_GDMA(&ss->gdma);
+        ss->gpspi2.gdma_periph = GDMA_SPI2;
+        ss->gpspi3.gdma = ESP_GDMA(&ss->gdma);
+        ss->gpspi3.gdma_periph = GDMA_SPI3;" \
+  "gpspi2.gdma = ESP_GDMA"
+
 # replace_once <file> <old-text> <new-text> <already-present-marker>
 #
 # Literal, single-occurrence replacement. Unlike insert_after this changes
