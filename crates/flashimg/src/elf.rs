@@ -159,6 +159,29 @@ impl ElfSymbols {
         self.symbols.iter().find(|s| s.name == name)
     }
 
+    /// Like [`Self::resolve`], but says whether the address was really inside
+    /// the symbol or merely after it.
+    ///
+    /// The distinction matters more than it looks. A nearest-preceding guess
+    /// reads exactly like a real hit, and acting on one sends you debugging a
+    /// function the CPU was never in.
+    pub fn resolve_detailed(&self, addr: u32) -> Option<(&Symbol, u32, bool)> {
+        let idx = self.symbols.partition_point(|s| s.address <= addr);
+        if idx == 0 {
+            return None;
+        }
+        for s in self.symbols[..idx].iter().rev().take(8) {
+            if s.contains(addr) {
+                return Some((s, addr - s.address, true));
+            }
+        }
+        let nearest = self.symbols[..idx]
+            .iter()
+            .rev()
+            .find(|s| s.kind == SymbolKind::Function)?;
+        Some((nearest, addr - nearest.address, false))
+    }
+
     /// Which symbol contains `addr`, and how far into it the address is.
     ///
     /// Prefers a symbol whose declared size covers the address. Failing that,
@@ -301,6 +324,22 @@ mod tests {
         let elf = synth_elf(&[("app_main", 0x4200_1000, 0x40, STT_FUNC)]);
         let s = ElfSymbols::parse(&elf).unwrap();
         assert!(s.resolve(0x4000_0000).is_none());
+    }
+
+    #[test]
+    fn a_fallback_is_reported_as_inexact() {
+        let elf = synth_elf(&[("app_main", 0x4200_1000, 0x10, STT_FUNC)]);
+        let s = ElfSymbols::parse(&elf).unwrap();
+
+        // Inside the declared size: a real hit.
+        let (_, _, exact) = s.resolve_detailed(0x4200_1008).unwrap();
+        assert!(exact);
+
+        // Past the end: the same answer, but it must not claim certainty.
+        let (sym, off, exact) = s.resolve_detailed(0x4200_1100).unwrap();
+        assert_eq!(sym.name, "app_main");
+        assert_eq!(off, 0x100);
+        assert!(!exact, "a nearest-preceding guess must be flagged");
     }
 
     #[test]

@@ -240,10 +240,34 @@ Together these found the ADC stall: `probe` showed both cores parked on one
 instruction, disassembly showed a register poll, the address register named the
 peripheral, and `addr2sym` confirmed the calling function.
 
-**A warning from experience.** Check that the ELF matches the image you are
-running. Comparing the ELF's SHA-256 against the `app_elf_sha256` in the app
-descriptor takes a second, and symbolising against a *different* build of the
-same firmware yields plausible, confidently wrong answers.
+**Two warnings from experience.**
+
+Check that the ELF matches the image you are running. Comparing the ELF's
+SHA-256 against the `app_elf_sha256` in the app descriptor takes a second, and
+symbolising against a *different* build of the same firmware yields plausible,
+confidently wrong answers.
+
+And read the `[GUESS]` marker. When no symbol's declared size covers an
+address, `addr2sym` falls back to the nearest preceding function and says so.
+Without that marker a guess is indistinguishable from a hit, and you go and
+debug a function the CPU was never in. Even an *exact* hit can mislead if a
+symbol's size overruns into an unnamed neighbour — one stall here resolved
+confidently to `esp_cpu_unstall`, and disassembly showed the real code was a
+two-instruction `waiti` parked in the function next door. Disassemble before
+believing a symbol.
+
+### Measuring instead of guessing
+
+The strongest tool is not in this repo. PURR OS ships a **hardware probe**
+firmware exposing peek/poke, GPIO, traced SPI transactions, interrupt
+characterisation and DMA over its USB console, with an allowlist gate that
+makes eFuse unreachable. Pointed at a real T-Deck it supplies the *read* side
+of hardware behaviour — what registers return — which an instrumented driver
+cannot capture and which an emulator has to invent.
+
+Five behaviours in the SPI controller came from it directly, replacing
+guesses, and one of those guesses was wrong in a way no amount of reasoning
+would have caught. Where a measurement exists, it is cited at the code.
 
 The bus tracer is the other half of this, once buses exist. It is off by
 default, has a switch per bus, and lets devices decode their own traffic — so

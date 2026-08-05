@@ -217,6 +217,15 @@ replace_once "hw/xtensa/esp32s3.c" \
         sysbus_realize(SYS_BUS_DEVICE(&ss->jtag), &error_fatal);" \
   'qdev_prop_set_chr(DEVICE(&ss->jtag)'
 
+# Without this the RX interrupt goes nowhere, so firmware blocked on console
+# input never wakes and the port looks dead in one direction only.
+insert_after "hw/xtensa/esp32s3.c" \
+  "        memory_region_add_subregion_overlap(sys_mem, DR_REG_USB_SERIAL_JTAG_BASE, mr, 0);" \
+  "        sysbus_connect_irq(SYS_BUS_DEVICE(&ss->jtag), 0,
+                           qdev_get_gpio_in(DEVICE(&ss->intmatrix),
+                                            ETS_USB_SERIAL_JTAG_INTR_SOURCE));" \
+  "ETS_USB_SERIAL_JTAG_INTR_SOURCE"
+
 # --- make --disable-slirp actually disable slirp ----------------------------
 #
 # Two bugs in this fork's meson.build conspire here.

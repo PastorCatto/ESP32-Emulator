@@ -35,9 +35,25 @@ fn main() -> std::process::ExitCode {
             println!("{arg}: not a hex address");
             continue;
         };
-        match syms.resolve(addr) {
-            Some((sym, 0)) => println!("{addr:#010x}  {}", sym.name),
-            Some((sym, off)) => println!("{addr:#010x}  {}+{off:#x}", sym.name),
+        match syms.resolve_detailed(addr) {
+            Some((sym, off, exact)) => {
+                // Flag guesses loudly. A nearest-preceding match looks
+                // identical to a real one and will send you debugging a
+                // function the CPU was never in.
+                let note = if exact {
+                    String::new()
+                } else {
+                    format!(
+                        "   [GUESS: past end of {} (size {:#x}) — not a containing symbol]",
+                        sym.name, sym.size
+                    )
+                };
+                if off == 0 {
+                    println!("{addr:#010x}  {}{note}", sym.name);
+                } else {
+                    println!("{addr:#010x}  {}+{off:#x}{note}", sym.name);
+                }
+            }
             None => println!("{addr:#010x}  <no symbol>"),
         }
     }

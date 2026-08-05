@@ -108,10 +108,16 @@ fn main() -> std::process::ExitCode {
             // looks like a load and a branch, whereas a parked CPU sits on a
             // single `waiti`.
             if let Some(pc) = seen.first() {
-                println!("\n=== instructions at the stall ===");
-                match qmp.human_monitor(&format!("x/6i 0x{pc}")) {
+                // Disassemble from before the sampled PC. A spin loop branches
+                // backwards, so the instructions that matter are usually the
+                // ones above where the sample landed.
+                let from = u32::from_str_radix(pc, 16)
+                    .map(|v| v.saturating_sub(0x30))
+                    .unwrap_or(0);
+                println!("\n=== instructions around the stall (PC = 0x{pc}) ===");
+                match qmp.human_monitor(&format!("x/28i 0x{from:08x}")) {
                     Ok(text) => {
-                        for line in text.lines().take(8) {
+                        for line in text.lines().take(30) {
                             println!("  {}", line.trim_end());
                         }
                     }

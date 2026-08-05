@@ -56,6 +56,53 @@ would otherwise see a stale completion and read the previous sample.
 The reported counts are properties (`adc1-raw`, `adc2-raw`, default 2048) so a
 board can present a plausible battery level.
 
+### `esp32s3_gpspi` — general-purpose SPI
+
+GP-SPI2 and GP-SPI3, the controllers every non-flash SPI device hangs off. The
+fork models `SPI_MEM` (flash and PSRAM) and instantiates it as `spi1`, but
+GP-SPI is a different peripheral with a different register map and no model
+existed for any chip.
+
+Several behaviours here are **measured on a real T-Deck Plus** via the PURR OS
+hardware probe rather than inferred from the TRM. Each is worth knowing
+because each independently hangs firmware:
+
+- **The clock gate.** `SPI_CLK_GATE` must be non-zero or the entire register
+  file reads as zero — `SPI_DATE` included, and that is a hardwired constant.
+  IDF sets it when a *device* is added to the bus, not when the bus is
+  initialised. Firmware correct in every other respect hangs on this.
+- **16× mirroring.** The file is `0x100` bytes repeated across a 4 KiB window.
+  Decoding the full 12 bits returns zero where hardware returns live values.
+- **`SPI_DMA_CONF` does not read back what you write.** Bits 0–1 re-assert:
+  write `0x00000000`, read `0x00000003`.
+- **MISO reads `0x00`** on this board, not `0xFF`. The ST7789 shares MISO with
+  SD and LoRa and does not drive it. Reasoning from "floating lines read high"
+  gives the wrong answer here, which is the argument for measuring.
+- **Completion is reported on a timer**, not inside the write that starts the
+  transfer, so the ISR cannot re-enter the driver before it finishes its
+  post-start bookkeeping.
+- **The interrupt line lags `ENA` being masked.** Hardware enters the handler
+  exactly twice; a synchronous deassert gives one entry and diverges silently.
+
+### `esp32s3_usb_serial_jtag` — the native USB console
+
+The fork maps this peripheral but implements it as a stub: reads return zero,
+writes are dropped, the state struct has one field. Firmware built with
+`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG` therefore boots **completely silently** —
+which covers any board whose USB-C goes straight to the S3 rather than through
+a bridge chip.
+
+Modelled against the ESP-IDF HAL (`usb_serial_jtag_ll.h`) rather than the
+register reference, since the HAL is the definitive statement of what firmware
+expects. The 64-byte endpoint auto-flushes when full as well as on `WR_DONE`,
+because a driver may write a long string and flush only at the end.
+
+UART0 and UART1 hold `serial_hd(0)` and `(1)`, so this takes the third slot:
+
+```sh
+qemu-system-xtensa ... -serial null -serial null -serial stdio
+```
+
 ## Building
 
 ### Dependencies
