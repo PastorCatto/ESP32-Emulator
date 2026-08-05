@@ -44,17 +44,31 @@ bbci   a9, 16, <loop>      ; spin while bit 16 is clear
 `SENS_MEAS1_DONE_SAR`. The done bit never sets, so the poll never ends. On a
 T-Deck this is the battery sense on GPIO 4.
 
-**Model.** Conversions complete immediately: writing the start bit sets the
-done bit and loads a sample. That is not how the hardware behaves — a real
-conversion takes microseconds — but nothing in firmware can observe the
-difference through this interface, so modelling the delay would add a timer
-and a state machine to buy nothing.
+**Model**, now measured rather than inferred:
 
-Clearing start also clears done, because a driver that re-arms by writing zero
-would otherwise see a stale completion and read the previous sample.
+Conversions complete immediately — confirmed on hardware, where the done bit
+and the sample are both valid by the CPU's first read after starting one.
 
-The reported counts are properties (`adc1-raw`, `adc2-raw`, default 2048) so a
-board can present a plausible battery level.
+**Clearing start does *not* clear done**, and the sample goes stale rather
+than being invalidated:
+
+```
+w 6000880c 0x60000  ->  readback 0x000709ec   (start+force, done, sample)
+w 6000880c 0x0      ->  readback 0x000109ec   (done still set, sample stale)
+```
+
+DATA and DONE are hardware-owned: guest writes do not reach them and they
+survive until the next conversion.
+
+This corrects an earlier version that cleared done on that write, on the
+reasoning that a driver re-arming by writing zero should not see a stale
+completion. That reasoning was sound and the hardware does not honour it —
+which made the emulator **safer than the silicon**. That is the worst
+direction for a divergence to point, because firmware carrying the race
+passes here and is flaky on the board. Prefer a faithful model to a kind one.
+
+The reported counts are properties (`adc1-raw`, `adc2-raw`). The default 2528
+is a live T-Deck battery reading, not a mid-scale placeholder.
 
 ### `esp32s3_gpspi` — general-purpose SPI
 

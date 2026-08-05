@@ -205,19 +205,31 @@ replace it later without disturbing anything above.
 
 ## 7. What actually works today
 
-Real firmware boots. A PURR OS T-Deck Plus build runs through the ROM, the
-second-stage bootloader, our partition table, seven segment loads, octal PSRAM
-detection, and into `app_init`.
+Real firmware boots and runs. A PURR OS T-Deck Plus build gets through the
+ROM, the second-stage bootloader, our partition table, seven segment loads,
+octal PSRAM detection, `app_init`, its flash VFS, and Wi-Fi driver
+initialisation — the real closed blob, which comes up cleanly — into its
+driver phase, where the ST7789 driver starts issuing SPI transfers.
 
-Getting there required one non-obvious fix in each half of the system:
+Four things had to exist for that, each of which hung the boot on its own:
 
-- **PSRAM** needs *two* QEMU settings that each do nothing alone: `-m 8M` for
-  size and a global to switch the modelled chip to octal. Without both, the
-  T-Deck calls `abort()` during startup and boot-loops.
-- **The SAR ADC** did not exist at all, so firmware polling for conversion
-  completion spun forever. See [qemu/README.md](../qemu/README.md).
+- **PSRAM** needs *two* QEMU settings that do nothing alone: `-m 8M` for size,
+  and a global switching the modelled chip to octal. Without both, the T-Deck
+  calls `abort()` during startup and boot-loops.
+- **The SAR ADC** did not exist, so firmware polling for conversion completion
+  spun forever. It reads the battery during startup.
+- **GP SPI2/SPI3** did not exist for any chip. Everything on a board's
+  general-purpose SPI bus was invisible.
+- **The USB Serial/JTAG console** was a register stub, so any firmware using
+  the S3's native USB for its console booted completely silently.
 
-Not built yet: the SPI and I²C controllers, every device driver, and Wi-Fi.
+All four are in [qemu/](../qemu/), applied to an unmodified release tarball.
+
+Still open: the display driver reports `ESP_ERR_TIMEOUT` on its transfers, and
+the cause is not yet found — completion timing and interrupt re-entry were
+both hypothesised, implemented, and turned out not to be it. DMA is not
+modelled and will be needed for framebuffer pushes. I²C, every device driver,
+and Wi-Fi are untouched.
 
 ---
 

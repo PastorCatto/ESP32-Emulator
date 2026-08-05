@@ -1,12 +1,13 @@
 /*
  * ESP32-S3 SENS (SAR ADC) peripheral.
  *
- * Conversions complete immediately. That is not how the hardware behaves --
- * a real SAR conversion takes microseconds -- but nothing in firmware can
- * tell the difference through this interface, because the only way to observe
- * completion is the done bit, and the only way to observe timing is a
- * separate timer. Modelling the delay would add a timer and a state machine
- * to buy nothing.
+ * Conversions complete immediately, which is measured rather than assumed:
+ * on a real T-Deck Plus the done bit and the sample are both already valid by
+ * the CPU's first read after starting one. There is nothing to defer.
+ *
+ * The start/done handshake is likewise measured. See the comment on
+ * esp32s3_sens_write_meas -- clearing START does not clear DONE, which is the
+ * opposite of what seemed sensible when this was first written.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -20,23 +21,43 @@
 #include "hw/misc/esp32s3_sens.h"
 
 /*
- * Apply the start/done handshake to one of the MEASn_CTRL2 registers.
+ * Apply a guest write to one of the MEASn_CTRL2 registers.
  *
- * Firmware sets START, then polls DONE. Clearing START must clear DONE too,
- * or a driver that re-arms by writing zero would see a stale completion and
- * read the previous sample.
+ * DATA and DONE are hardware-owned: guest writes do not reach them, and they
+ * survive until the next conversion overwrites them.
+ *
+ * In particular, clearing START does **not** clear DONE. Measured on a real
+ * T-Deck Plus:
+ *
+ *     w 6000880c 0x60000  ->  readback 0x000709ec   (start+force, done, sample)
+ *     w 6000880c 0x0      ->  readback 0x000109ec   (done still set, stale sample)
+ *
+ * So a driver that re-arms by writing zero and then polls DONE really does see
+ * a stale completion and read the previous sample. Silicon offers no
+ * protection there.
+ *
+ * An earlier version of this cleared DONE on that write, reasoning that it
+ * would be the sane behaviour. It is -- and modelling it made the emulator
+ * *safer* than the hardware, which is the worst direction for a divergence to
+ * point: firmware carrying that race would pass here and be flaky on the
+ * board.
  */
-static void esp32s3_sens_update_meas(Esp32s3SensState *s, hwaddr index,
-                                     uint32_t raw)
+static void esp32s3_sens_write_meas(Esp32s3SensState *s, hwaddr index,
+                                    uint32_t written, uint32_t raw)
 {
-    uint32_t value = s->regs[index];
+    const uint32_t hw_owned = SENS_MEAS_DATA_MASK | SENS_MEAS_DONE_BIT;
 
-    if (value & SENS_MEAS_START_BIT) {
+    /* Guest bits, with the hardware-owned ones carried over untouched. */
+    uint32_t value = (written & ~hw_owned) | (s->regs[index] & hw_owned);
+
+    if (written & SENS_MEAS_START_BIT) {
+        /*
+         * Conversions complete within a single CPU read -- confirmed on
+         * hardware -- so there is nothing to defer here.
+         */
         value &= ~SENS_MEAS_DATA_MASK;
         value |= (raw & SENS_SAR_MAX_RAW) << SENS_MEAS_DATA_SHIFT;
         value |= SENS_MEAS_DONE_BIT;
-    } else {
-        value &= ~SENS_MEAS_DONE_BIT;
     }
 
     s->regs[index] = value;
@@ -69,21 +90,21 @@ static void esp32s3_sens_write(void *opaque, hwaddr addr, uint64_t value,
         return;
     }
 
-    /*
-     * Registers we do not model are still stored, so firmware reads back what
-     * it wrote. Configuration it never re-reads costs nothing to keep, and
-     * doing so avoids surprising drivers that verify their own writes.
-     */
-    s->regs[index] = (uint32_t)value;
-
     switch (addr) {
     case A_SENS_SAR_MEAS1_CTRL2:
-        esp32s3_sens_update_meas(s, index, s->adc1_raw);
+        esp32s3_sens_write_meas(s, index, (uint32_t)value, s->adc1_raw);
         break;
     case A_SENS_SAR_MEAS2_CTRL2:
-        esp32s3_sens_update_meas(s, index, s->adc2_raw);
+        esp32s3_sens_write_meas(s, index, (uint32_t)value, s->adc2_raw);
         break;
     default:
+        /*
+         * Registers we do not model are still stored, so firmware reads back
+         * what it wrote. Configuration it never re-reads costs nothing to
+         * keep, and doing so avoids surprising drivers that verify their own
+         * writes.
+         */
+        s->regs[index] = (uint32_t)value;
         break;
     }
 }
@@ -114,11 +135,13 @@ static void esp32s3_sens_init(Object *obj)
 
 static Property esp32s3_sens_properties[] = {
     /*
-     * Mid-scale by default: a believable reading for either converter without
-     * pretending to model any particular board's divider network.
+     * A live T-Deck Plus battery reads 2525-2533 counts, so 2528 is a real
+     * measurement rather than the mid-scale placeholder this used to be.
+     * Firmware that converts counts to a voltage and decides the battery is
+     * flat gets a plausible answer.
      */
-    DEFINE_PROP_UINT32("adc1-raw", Esp32s3SensState, adc1_raw, 2048),
-    DEFINE_PROP_UINT32("adc2-raw", Esp32s3SensState, adc2_raw, 2048),
+    DEFINE_PROP_UINT32("adc1-raw", Esp32s3SensState, adc1_raw, 2528),
+    DEFINE_PROP_UINT32("adc2-raw", Esp32s3SensState, adc2_raw, 2528),
     DEFINE_PROP_END_OF_LIST(),
 };
 
