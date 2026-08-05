@@ -147,6 +147,76 @@ insert_after "hw/xtensa/esp32s3.c" \
                        qdev_get_gpio_in(intmatrix_dev, ETS_SPI3_INTR_SOURCE));" \
   "ETS_SPI3_INTR_SOURCE"
 
+# replace_once <file> <old-text> <new-text> <already-present-marker>
+#
+# Literal, single-occurrence replacement. Unlike insert_after this changes
+# QEMU's own text, so it is only used where an insertion cannot express the
+# edit.
+replace_once() {
+  local file="$1" old="$2" new="$3" marker="$4"
+  local path="$SRC/$file"
+
+  if grep -qF -- "$marker" "$path"; then
+    echo "  = $file already has $marker"
+    return 0
+  fi
+  if ! grep -qF -- "$old" "$path"; then
+    echo "error: text to replace not found in $file" >&2
+    echo "       looked for: $old" >&2
+    exit 1
+  fi
+
+  # index/substr rather than sub(), which takes a regex and would silently
+  # fail to match anything containing parentheses or dots.
+  awk -v old="$old" -v new="$new" '
+    !done {
+      p = index($0, old)
+      if (p > 0) {
+        $0 = substr($0, 1, p - 1) new substr($0, p + length(old))
+        done = 1
+      }
+    }
+    { print }
+  ' "$path" > "$path.tmp"
+  mv "$path.tmp" "$path"
+  echo "  ~ $file: $marker"
+}
+
+# --- USB Serial/JTAG console ------------------------------------------------
+#
+# The stock device is a stub: reads return zero, writes are dropped. Firmware
+# using CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG boots completely silently. Swap the
+# S3 machine over to a model with a real chardev behind it.
+
+insert_after "hw/char/meson.build" \
+  "system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('esp32_uart.c', 'esp32s3_uart.c'))" \
+  "system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('esp32s3_usb_serial_jtag.c'))" \
+  "esp32s3_usb_serial_jtag.c"
+
+insert_after "hw/xtensa/esp32s3.c" \
+  '#include "hw/misc/esp32c3_jtag.h"' \
+  '#include "hw/char/esp32s3_usb_serial_jtag.h"' \
+  'esp32s3_usb_serial_jtag.h'
+
+replace_once "hw/xtensa/esp32s3.c" \
+  "    ESP32C3UsbJtagState jtag;" \
+  "    Esp32s3UsjState jtag;" \
+  "Esp32s3UsjState jtag;"
+
+replace_once "hw/xtensa/esp32s3.c" \
+  'object_initialize_child(OBJECT(ss), "jtag", &ss->jtag, TYPE_ESP32C3_JTAG);' \
+  'object_initialize_child(OBJECT(ss), "jtag", &ss->jtag, TYPE_ESP32S3_USJ);' \
+  'TYPE_ESP32S3_USJ);'
+
+# UART0 and UART1 already take serial_hd(0) and (1), so the USB console gets
+# the third slot: `-serial null -serial null -serial stdio` reaches it, and
+# existing UART-console invocations are unaffected.
+replace_once "hw/xtensa/esp32s3.c" \
+  "        sysbus_realize(SYS_BUS_DEVICE(&ss->jtag), &error_fatal);" \
+  "        qdev_prop_set_chr(DEVICE(&ss->jtag), \"chardev\", serial_hd(2));
+        sysbus_realize(SYS_BUS_DEVICE(&ss->jtag), &error_fatal);" \
+  'qdev_prop_set_chr(DEVICE(&ss->jtag)'
+
 # --- make --disable-slirp actually disable slirp ----------------------------
 #
 # Two bugs in this fork's meson.build conspire here.
