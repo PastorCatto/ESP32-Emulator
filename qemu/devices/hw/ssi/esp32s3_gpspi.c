@@ -22,6 +22,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
+#include "qemu/main-loop.h"
 #include "hw/hw.h"
 #include "hw/irq.h"
 #include "hw/sysbus.h"
@@ -57,7 +58,6 @@ static void esp32s3_gpspi_update_irq(Esp32s3GpspiState *s)
          * the transition. This is what makes arming ENA on an already-set RAW
          * work, instead of losing the wakeup.
          */
-        timer_del(s->deassert_timer);
         if (!s->line_high) {
             s->line_high = true;
             qemu_irq_raise(s->irq);
@@ -66,14 +66,20 @@ static void esp32s3_gpspi_update_irq(Esp32s3GpspiState *s)
     }
 
     /*
-     * Rule 5: hold the line briefly rather than dropping it here, so the CPU
-     * takes the interrupt once more. Dropping it synchronously gives one ISR
-     * entry where hardware gives two.
+     * Rule 5: hold the line rather than dropping it here, so the CPU takes the
+     * interrupt once more. Dropping it synchronously gives one ISR entry where
+     * hardware gives two.
+     *
+     * A bottom half, not a timer. A virtual-clock delay is unusable for this:
+     * without icount the CPU runs an unbounded number of instructions between
+     * timer checks, so any window long enough to guarantee one re-entry also
+     * admits thousands. Measured with the probe's `intfire`, a 1us hold gave
+     * count=1862 against hardware's 2. A bottom half runs at the next main
+     * loop iteration, which bounds the re-entry to roughly the one that
+     * hardware exhibits.
      */
-    if (s->line_high && !timer_pending(s->deassert_timer)) {
-        timer_mod_ns(s->deassert_timer,
-                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                         ESP32S3_GPSPI_IRQ_HOLD_NS);
+    if (s->line_high) {
+        qemu_bh_schedule(s->deassert_bh);
     }
 }
 
@@ -376,7 +382,6 @@ static void esp32s3_gpspi_reset_hold(Object *obj, ResetType type)
 
     timer_del(s->done_timer);
     s->busy = false;
-    timer_del(s->deassert_timer);
     s->line_high = false;
 
     memset(s->regs, 0, sizeof(s->regs));
@@ -403,8 +408,7 @@ static void esp32s3_gpspi_init(Object *obj)
                              ESP32S3_GPSPI_CS_COUNT);
 
     s->done_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, esp32s3_gpspi_done, s);
-    s->deassert_timer =
-        timer_new_ns(QEMU_CLOCK_VIRTUAL, esp32s3_gpspi_deassert, s);
+    s->deassert_bh = qemu_bh_new(esp32s3_gpspi_deassert, s);
 }
 
 static const VMStateDescription vmstate_esp32s3_gpspi = {

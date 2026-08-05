@@ -125,21 +125,6 @@ REG32(GPSPI_DATE,     0x0f0)
  */
 #define ESP32S3_GPSPI_MIN_XFER_NS  2000
 
-/*
- * How long the interrupt line stays asserted after the condition clearing it.
- *
- * Real hardware enters the handler twice: the handler masks ENA as its first
- * act, but the line has not dropped by the time the CPU takes the interrupt
- * again. A model that deasserts synchronously enters once, and handlers
- * written against silicon -- which are re-entrant by necessity -- then behave
- * differently, showing up as a doubled completion or a transaction dequeued
- * twice.
- *
- * Sized for roughly one dispatch (~440 cycles at 160 MHz is ~2.75us) and kept
- * short so the window cannot fit several.
- */
-#define ESP32S3_GPSPI_IRQ_HOLD_NS  1000
-
 typedef struct Esp32s3GpspiState {
     SysBusDevice parent_obj;
 
@@ -157,7 +142,7 @@ typedef struct Esp32s3GpspiState {
      * Measured: the ISR re-enters exactly twice, because masking ENA does not
      * drop the line before the CPU takes the interrupt again.
      */
-    QEMUTimer *deassert_timer;
+    QEMUBH *deassert_bh;
     bool line_high;
 
     uint32_t regs[ESP32S3_GPSPI_REG_COUNT];
