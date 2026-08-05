@@ -158,6 +158,31 @@ insert_after "hw/xtensa/esp32s3.c" \
         ss->gpspi3.gdma_periph = GDMA_SPI3;" \
   "gpspi2.gdma = ESP_GDMA"
 
+# --- SD over SPI -----------------------------------------------------------
+#
+# The T-Deck's microSD shares the display's SPI bus. Without a card, SD init
+# fails, leaves SPI2 initialised and holds the bus lock -- and the display
+# driver that comes next starves, reporting ESP_ERR_TIMEOUT on transfers that
+# never get scheduled. So an absent card breaks the screen, and the fix is to
+# let one be attached.
+#
+# QEMU already ships ssi-sd, an SSI-to-SD bridge, but it is not selected for
+# Xtensa targets.
+# Both ESP32 and ESP32-S3 need it -- the CYD boards are plain ESP32 -- so this
+# appends to every Xtensa machine rather than using insert_after, which
+# requires a unique anchor.
+KCONFIG="$SRC/hw/xtensa/Kconfig"
+if grep -qF "select SSI_SD" "$KCONFIG"; then
+  echo "  = hw/xtensa/Kconfig already selects SSI_SD"
+else
+  awk '
+    { print }
+    /^    select SSI_M25P80$/ { print "    select SSI_SD" }
+  ' "$KCONFIG" > "$KCONFIG.tmp"
+  mv "$KCONFIG.tmp" "$KCONFIG"
+  echo "  ~ hw/xtensa/Kconfig: select SSI_SD"
+fi
+
 # replace_once <file> <old-text> <new-text> <already-present-marker>
 #
 # Literal, single-occurrence replacement. Unlike insert_after this changes
