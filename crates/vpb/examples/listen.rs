@@ -13,7 +13,7 @@ use std::io::{BufReader, BufWriter, Write};
 use std::net::TcpListener;
 
 use vpb::registry::{EventQueue, Registry};
-use vpb::trace::{TraceConfig, TraceRecord};
+use vpb::trace::TraceConfig;
 use vpb::wire::{self, DeviceMessage, HostMessage};
 use vpb::{Response, Transaction};
 
@@ -39,6 +39,18 @@ fn main() -> std::io::Result<()> {
         }
     }
 
+    // Optional third argument: where to drop the display contents when the
+    // emulator disconnects. There is no window yet, so a file is how you find
+    // out whether the panel is being driven correctly.
+    let snapshot = std::env::args().nth(3);
+    let screen = devices::st7789::Screen::handle(320, 240);
+    registry
+        .register(Box::new(devices::St7789::new(
+            vpb::Claim::Spi { controller: 2, cs: 0 },
+            screen.clone(),
+        )))
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     eprintln!("vpb: listening on 127.0.0.1:{port}");
 
@@ -50,6 +62,21 @@ fn main() -> std::io::Result<()> {
         if let Err(e) = serve(stream, &mut registry) {
             eprintln!("vpb: connection ended: {e}");
         }
+
+        if let Some(path) = &snapshot {
+            let s = screen.lock().expect("screen");
+            let out = devices::png::encode_rgb(s.width.into(), s.height.into(), &s.rgb888());
+            match std::fs::write(path, &out) {
+                Ok(()) => eprintln!(
+                    "vpb: wrote {path} ({}x{}, {} writes, panel {})",
+                    s.width,
+                    s.height,
+                    s.generation,
+                    if s.on { "on" } else { "off" }
+                ),
+                Err(e) => eprintln!("vpb: could not write {path}: {e}"),
+            }
+        }
     }
     Ok(())
 }
@@ -58,11 +85,15 @@ fn serve(stream: std::net::TcpStream, registry: &mut Registry) -> std::io::Resul
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = BufWriter::new(stream);
 
-    // Trace everything: the whole point here is to see the traffic.
-    let cfg = TraceConfig {
+    // Trace everything: the whole point here is to see the traffic. The
+    // registry does the tracing itself, so each line names the device that
+    // actually answered and carries that device's own decode -- "CASET
+    // x=0..319" rather than five hex bytes attributed to whatever was
+    // registered first.
+    registry.set_trace(TraceConfig {
         max_bytes: 24,
         ..TraceConfig::all()
-    };
+    });
 
     let mut count: u64 = 0;
     loop {
@@ -97,16 +128,11 @@ fn serve(stream: std::net::TcpStream, registry: &mut Registry) -> std::io::Resul
             _ => response,
         };
 
-        println!(
-            "{}",
-            TraceRecord::build(
-                &transaction,
-                &response,
-                Some(if registry.is_empty() { "listen" } else { "sdcard" }),
-                None,
-                &cfg
-            )
-        );
+        for event in sink.drain() {
+            if let vpb::Event::Trace(record) = event {
+                println!("{record}");
+            }
+        }
 
         if let Some(id) = id {
             wire::send_device(

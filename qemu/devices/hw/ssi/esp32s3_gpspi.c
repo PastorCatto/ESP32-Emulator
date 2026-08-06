@@ -95,6 +95,20 @@ static void esp32s3_gpspi_update_irq(Esp32s3GpspiState *s)
 }
 
 
+/*
+ * The board's data/command GPIO moved.
+ *
+ * Latched rather than sampled, because by the time a transfer starts the
+ * driver has already set the pin and moved on. A display model reads it out
+ * of the transaction to tell a command byte from pixel data.
+ */
+static void esp32s3_gpspi_dc_changed(void *opaque, int n, int level)
+{
+    Esp32s3GpspiState *s = ESP32S3_GPSPI(opaque);
+
+    s->dc_level = level ? 1 : 0;
+}
+
 /* Which chip select is asserted, or -1 when the driver has selected none. */
 static int esp32s3_gpspi_active_cs(Esp32s3GpspiState *s)
 {
@@ -559,6 +573,7 @@ static void esp32s3_gpspi_init(Object *obj)
 
     /* No data/command pin known until a board wires one. */
     s->dc_level = -1;
+    qdev_init_gpio_in_named(DEVICE(s), esp32s3_gpspi_dc_changed, "dc", 1);
 }
 
 static const VMStateDescription vmstate_esp32s3_gpspi = {
@@ -579,6 +594,8 @@ static Property esp32s3_gpspi_properties[] = {
     DEFINE_PROP_UINT16("vpb-port", Esp32s3GpspiState, vpb.port, 0),
     /* Reported to the device models so they can tell SPI2 from SPI3. */
     DEFINE_PROP_UINT8("vpb-controller", Esp32s3GpspiState, vpb_controller, 2),
+    /* Board wiring: which GPIO the machine should connect to "dc". */
+    DEFINE_PROP_INT32("dc-gpio", Esp32s3GpspiState, dc_gpio, -1),
     DEFINE_PROP_END_OF_LIST(),
 };
 

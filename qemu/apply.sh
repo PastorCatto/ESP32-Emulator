@@ -252,6 +252,253 @@ replace_range() {
   echo "  ~ $file: $marker"
 }
 
+# --- GPIO output levels ------------------------------------------------------
+#
+# The vendored GPIO model is a stub: it answers GPIO_STRAP and drops every
+# write. Nothing on a board can see a pin change, which matters more than it
+# sounds -- an ST7789 tells a command byte from pixel data by the data/command
+# pin and nothing on the SPI bus itself, so without this a display model
+# cannot decode the stream it is being sent.
+#
+# Modelled here: the OUT/OUT1 latches and their W1TS/W1TC aliases, the ENABLE
+# latches, and one qemu_irq per pin so devices can be wired to them.
+#
+# GPIO_IN reads back the output latch for driven pins and 1 for the rest.
+# Undriven is not really 1 -- it depends on the pin's pull, which lives in
+# IO_MUX and is not modelled -- but every input on these boards is an
+# active-low button or interrupt line with a pull-up, so idle-high is both the
+# common case and the safe one. Reading 0 would report every key held down.
+
+replace_once "include/hw/gpio/esp32_gpio.h" \
+  "REG32(GPIO_STRAP, 0x0038)" \
+  "REG32(GPIO_OUT,          0x0004)
+REG32(GPIO_OUT_W1TS,     0x0008)
+REG32(GPIO_OUT_W1TC,     0x000c)
+REG32(GPIO_OUT1,         0x0010)
+REG32(GPIO_OUT1_W1TS,    0x0014)
+REG32(GPIO_OUT1_W1TC,    0x0018)
+REG32(GPIO_ENABLE,       0x0020)
+REG32(GPIO_ENABLE_W1TS,  0x0024)
+REG32(GPIO_ENABLE_W1TC,  0x0028)
+REG32(GPIO_ENABLE1,      0x002c)
+REG32(GPIO_ENABLE1_W1TS, 0x0030)
+REG32(GPIO_ENABLE1_W1TC, 0x0034)
+REG32(GPIO_STRAP, 0x0038)
+REG32(GPIO_IN,           0x003c)
+REG32(GPIO_IN1,          0x0040)
+
+/* Two 32-bit banks. The S3 wires 0..48, the ESP32 0..39. */
+#define ESP32_GPIO_PIN_COUNT 64" \
+  'ESP32_GPIO_PIN_COUNT'
+
+replace_once "include/hw/gpio/esp32_gpio.h" \
+  "    uint32_t strap_mode;" \
+  "    uint32_t strap_mode;
+
+    /* Output latch and direction, both banks in one word. */
+    uint64_t out;
+    uint64_t enable;
+    /* One line per pin, for devices that need to watch one. */
+    qemu_irq out_lines[ESP32_GPIO_PIN_COUNT];" \
+  'qemu_irq out_lines[ESP32_GPIO_PIN_COUNT];'
+
+replace_range "hw/gpio/esp32_gpio.c" \
+  "static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)" \
+  "}" \
+  '/* Drive the lines for every pin whose level actually changed. */
+static void esp32_gpio_set_out(Esp32GpioState *s, uint64_t value)
+{
+    uint64_t changed = value ^ s->out;
+
+    s->out = value;
+    while (changed != 0) {
+        const int pin = ctz64(changed);
+        changed &= changed - 1;
+        qemu_set_irq(s->out_lines[pin], (value >> pin) & 1);
+    }
+}
+
+static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    Esp32GpioState *s = ESP32_GPIO(opaque);
+    /* Driven pins read their own latch; the rest read high, see apply.sh. */
+    const uint64_t in = s->out | ~s->enable;
+    uint64_t r = 0;
+
+    switch (addr) {
+    case A_GPIO_STRAP:
+        r = s->strap_mode;
+        break;
+
+    case A_GPIO_OUT:
+        r = s->out & 0xffffffff;
+        break;
+    case A_GPIO_OUT1:
+        r = s->out >> 32;
+        break;
+    case A_GPIO_ENABLE:
+        r = s->enable & 0xffffffff;
+        break;
+    case A_GPIO_ENABLE1:
+        r = s->enable >> 32;
+        break;
+    case A_GPIO_IN:
+        r = in & 0xffffffff;
+        break;
+    case A_GPIO_IN1:
+        r = in >> 32;
+        break;
+
+    default:
+        break;
+    }
+    return r;
+}' \
+  'esp32_gpio_set_out'
+
+replace_range "hw/gpio/esp32_gpio.c" \
+  "static void esp32_gpio_write(void *opaque, hwaddr addr," \
+  "}" \
+  'static void esp32_gpio_write(void *opaque, hwaddr addr,
+                       uint64_t value, unsigned int size)
+{
+    Esp32GpioState *s = ESP32_GPIO(opaque);
+    const uint64_t low = value & 0xffffffff;
+    const uint64_t high = low << 32;
+
+    switch (addr) {
+    case A_GPIO_OUT:
+        esp32_gpio_set_out(s, (s->out & ~0xffffffffULL) | low);
+        break;
+    case A_GPIO_OUT_W1TS:
+        esp32_gpio_set_out(s, s->out | low);
+        break;
+    case A_GPIO_OUT_W1TC:
+        esp32_gpio_set_out(s, s->out & ~low);
+        break;
+    case A_GPIO_OUT1:
+        esp32_gpio_set_out(s, (s->out & 0xffffffffULL) | high);
+        break;
+    case A_GPIO_OUT1_W1TS:
+        esp32_gpio_set_out(s, s->out | high);
+        break;
+    case A_GPIO_OUT1_W1TC:
+        esp32_gpio_set_out(s, s->out & ~high);
+        break;
+
+    /* Direction only gates what GPIO_IN reports; no line moves. */
+    case A_GPIO_ENABLE:
+        s->enable = (s->enable & ~0xffffffffULL) | low;
+        break;
+    case A_GPIO_ENABLE_W1TS:
+        s->enable |= low;
+        break;
+    case A_GPIO_ENABLE_W1TC:
+        s->enable &= ~low;
+        break;
+    case A_GPIO_ENABLE1:
+        s->enable = (s->enable & 0xffffffffULL) | high;
+        break;
+    case A_GPIO_ENABLE1_W1TS:
+        s->enable |= high;
+        break;
+    case A_GPIO_ENABLE1_W1TC:
+        s->enable &= ~high;
+        break;
+
+    default:
+        break;
+    }
+}' \
+  'esp32_gpio_set_out(s, s->out | low);'
+
+replace_once "hw/gpio/esp32_gpio.c" \
+  "    sysbus_init_irq(sbd, &s->irq);" \
+  "    sysbus_init_irq(sbd, &s->irq);
+    qdev_init_gpio_out(DEVICE(obj), s->out_lines, ESP32_GPIO_PIN_COUNT);" \
+  'qdev_init_gpio_out(DEVICE(obj), s->out_lines, ESP32_GPIO_PIN_COUNT);'
+
+# Connect each SPI controller's data/command input to the GPIO the board says
+# carries it. Done here rather than in the controller because a device cannot
+# reach across to another one from its own realize, and from a property rather
+# than hardcoded because the pin differs per board -- 11 on a T-Deck Plus, 2
+# on a CYD.
+#
+# Both controllers usually end up asking for the same pin, because -global
+# matches on type name and there is no per-instance id to address. A GPIO out
+# line is a single link, so connecting twice silently drops the first
+# connection rather than fanning out -- which looks exactly like the pin never
+# moving. Route through a splitter so every listener gets the level.
+
+replace_once "hw/xtensa/esp32s3.c" \
+  "        memory_region_add_subregion_overlap(sys_mem, DR_REG_GPIO_BASE, mr, 0);" \
+  "        memory_region_add_subregion_overlap(sys_mem, DR_REG_GPIO_BASE, mr, 0);
+
+        Esp32s3GpspiState *const gpspi[] = { &ss->gpspi2, &ss->gpspi3 };
+        for (unsigned i = 0; i < ARRAY_SIZE(gpspi); i++) {
+            const int32_t pin = gpspi[i]->dc_gpio;
+            if (pin < 0 || pin >= ESP32_GPIO_PIN_COUNT) {
+                continue;
+            }
+
+            /* Collect everyone wanting this pin, then wire them at once. */
+            qemu_irq listeners[ARRAY_SIZE(gpspi)];
+            unsigned n = 0;
+            for (unsigned j = i; j < ARRAY_SIZE(gpspi); j++) {
+                if (gpspi[j]->dc_gpio == pin) {
+                    listeners[n++] =
+                        qdev_get_gpio_in_named(DEVICE(gpspi[j]), \"dc\", 0);
+                    /* Claimed; do not wire it again on a later pass. */
+                    gpspi[j]->dc_gpio = -1;
+                }
+            }
+
+            if (n == 1) {
+                qdev_connect_gpio_out(DEVICE(&ss->gpio), pin, listeners[0]);
+            } else {
+                DeviceState *split = qdev_new(TYPE_SPLIT_IRQ);
+                qdev_prop_set_uint32(split, \"num-lines\", n);
+                qdev_realize_and_unref(split, NULL, &error_fatal);
+                for (unsigned k = 0; k < n; k++) {
+                    qdev_connect_gpio_out(split, k, listeners[k]);
+                }
+                qdev_connect_gpio_out(DEVICE(&ss->gpio), pin,
+                                      qdev_get_gpio_in(split, 0));
+            }
+        }" \
+  'gpspi[i]->dc_gpio'
+
+replace_once "hw/xtensa/esp32s3.c" \
+  '#include "hw/misc/esp32c3_jtag.h"' \
+  '#include "hw/misc/esp32c3_jtag.h"
+#include "hw/core/split-irq.h"' \
+  'hw/core/split-irq.h'
+
+# TYPE_SPLIT_IRQ exists in the tree but nothing in the xtensa build selects it,
+# so instantiating one fails at runtime with "unknown type 'split-irq'" rather
+# than at link time.
+#
+# The whole block is rewritten because the ESP32 and ESP32-S3 entries differ by
+# one line, so no single `select` in either is a unique anchor -- and matching
+# the wrong one would quietly configure the other chip.
+replace_range "hw/xtensa/Kconfig" \
+  "config XTENSA_ESP32S3" \
+  "    select ESP_RGB" \
+  'config XTENSA_ESP32S3
+    bool
+    default y
+    depends on XTENSA
+    select SSI
+    select SSI_M25P80
+    select SSI_SD
+    select UNIMP
+    select OPENCORES_ETH
+    select DWC_SDMMC
+    select TMP105
+    select ESP_RGB
+    select SPLIT_IRQ' \
+  'select SPLIT_IRQ'
+
 # --- Interrupt matrix: re-evaluate on mapping changes ------------------------
 #
 # The matrix model forwards a source's level to a CPU interrupt only when the

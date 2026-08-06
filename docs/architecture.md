@@ -212,7 +212,9 @@ segment loads, octal PSRAM detection and `app_init`, then:
 - initialises the SD card over SPI — CMD0 through ACMD51, CRC checking
   enabled, against a raw `.img` served by a Rust device model;
 - brings up the ST7789, which reports `ST7789 ready 320x240`, switches to
-  bulk DMA mode and pushes full 320×240 framebuffers, ten chunks per frame;
+  bulk DMA mode and pushes full 320×240 framebuffers, ten chunks per frame —
+  and those pixels are decoded back into an image, so its boot splash comes
+  out the other end;
 - registers the trackball and the BBQ20 keyboard;
 - loads its static modules and reaches Wi-Fi PHY init.
 
@@ -242,11 +244,29 @@ PSRAM needs *two* QEMU settings that do nothing alone: `-m 8M` for size and a
 global switching the modelled chip to octal. Without both the T-Deck calls
 `abort()` during startup and boot-loops. `scripts/run-emu.sh` sets them.
 
-Still open: nothing renders the framebuffer yet — the pixels reach a device
-model and stop there. A freshly created `.img` has no filesystem on it, so the
-card initialises and then FATFS reports `FR_NO_FILESYSTEM`; a real card image
-mounts. I²C is unmodelled, so the GT911 touch controller is not found. Wi-Fi
-is untouched.
+Still open: the framebuffer is written to a PNG when the emulator exits rather
+than shown in a window, so there is no live screen yet. A freshly created
+`.img` has no filesystem on it, so the card initialises and then FATFS reports
+`FR_NO_FILESYSTEM`; a real card image mounts. I²C is unmodelled, so the GT911
+touch controller is not found. Wi-Fi is untouched.
+
+### The data/command pin
+
+Worth its own note, because it is the thing that makes a display model
+possible at all. An ST7789 tells a command byte from pixel data by a GPIO and
+by nothing on the SPI bus itself, so a decoder that only sees the bus cannot
+tell `RAMWR` from a mid-grey pixel.
+
+The vendored GPIO model was a stub — it answered `GPIO_STRAP` and dropped
+every write — so no pin could be observed at all. It now models the output and
+enable latches and drives a line per pin, and the SPI controller latches the
+board's D/C pin and carries its level on each transaction. Which pin that is
+comes from the board file: 11 on a T-Deck Plus, 2 on a CYD.
+
+The alternative, guessing from transfer length, works right up until a
+single-byte *parameter* arrives — `COLMOD 0x55` is indistinguishable from a
+command that way. `St7789` still has that fallback for a board file with no
+`dc` set, and it is a fallback, not a second supported mode.
 
 ---
 

@@ -49,8 +49,8 @@ CARGO="$(command -v cargo || echo "$HOME/.cargo/bin/cargo.exe")"
 
 VPB_ARGS=()
 if [ -n "$SD_IMG" ]; then
-  "$CARGO" run --quiet -p vpb --example listen --features devices/sdcard \
-    -- "$PORT" "$(win "$SD_IMG")" >"$LOG/vpb.log" 2>&1 &
+  "$CARGO" run --quiet -p vpb --example listen \
+    -- "$PORT" "$(win "$SD_IMG")" "$(win "$LOG/screen.png")" >"$LOG/vpb.log" 2>&1 &
   # The emulator's connect is not retried, so the listener has to be up first.
   for _ in $(seq 50); do
     grep -q "listening" "$LOG/vpb.log" 2>/dev/null && break
@@ -58,7 +58,13 @@ if [ -n "$SD_IMG" ]; then
   done
   # The long form is required: the type name contains dots, so the
   # `-global type.prop=value` shorthand parses the wrong split point.
-  VPB_ARGS=(-global driver=ssi.esp32s3.gpspi,property=vpb-port,value=$PORT)
+  #
+  # DC_GPIO is the board's data/command pin -- 11 on a T-Deck Plus. Without
+  # it the display model cannot tell a command byte from a pixel.
+  VPB_ARGS=(
+    -global driver=ssi.esp32s3.gpspi,property=vpb-port,value=$PORT
+    -global driver=ssi.esp32s3.gpspi,property=dc-gpio,value="${DC_GPIO:-11}"
+  )
 fi
 
 # QEMU_DEBUG is passed straight to -d, e.g. QEMU_DEBUG=unimp,guest_errors to

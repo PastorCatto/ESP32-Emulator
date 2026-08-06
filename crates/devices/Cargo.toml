@@ -12,8 +12,9 @@ vpb = { path = "../vpb" }
 
 [features]
 # Each device is a switch, so a build can carry only what it needs.
-default = ["sdcard"]
+default = ["sdcard", "st7789"]
 sdcard = []
+st7789 = []
 
 [lints]
 workspace = true

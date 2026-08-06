@@ -11,6 +11,147 @@ pub mod sdcard;
 #[cfg(feature = "sdcard")]
 pub use sdcard::SdCard;
 
+#[cfg(feature = "st7789")]
+pub mod st7789;
+
+#[cfg(feature = "st7789")]
+pub use st7789::St7789;
+
+pub mod png;
+
+#[cfg(all(test, feature = "st7789"))]
+mod display_tests {
+    use super::st7789::{Screen, ScreenHandle};
+    use super::St7789;
+    use vpb::registry::EventQueue;
+    use vpb::{Claim, Peripheral, Transaction};
+
+    fn panel() -> (St7789, ScreenHandle) {
+        let screen = Screen::handle(8, 4);
+        (St7789::new(Claim::Spi { controller: 2, cs: 0 }, screen.clone()), screen)
+    }
+
+    /// One transfer with the data/command line at `dc`.
+    fn send(p: &mut St7789, dc: bool, bytes: &[u8]) {
+        let mut ev = EventQueue::default();
+        p.transact(
+            &Transaction::SpiTransfer {
+                controller: 2,
+                cs: 0,
+                dc: Some(dc),
+                mosi: bytes.to_vec(),
+                read_len: 0,
+            },
+            &mut ev,
+        );
+    }
+
+    fn window(p: &mut St7789, x: (u16, u16), y: (u16, u16)) {
+        send(p, false, &[0x2a]);
+        send(p, true, &[(x.0 >> 8) as u8, x.0 as u8, (x.1 >> 8) as u8, x.1 as u8]);
+        send(p, false, &[0x2b]);
+        send(p, true, &[(y.0 >> 8) as u8, y.0 as u8, (y.1 >> 8) as u8, y.1 as u8]);
+    }
+
+    fn rgb(screen: &ScreenHandle) -> Vec<u8> {
+        screen.lock().expect("screen").rgb888()
+    }
+
+    #[test]
+    fn pixels_land_inside_the_address_window() {
+        let (mut p, screen) = panel();
+        window(&mut p, (2, 3), (1, 2));
+        send(&mut p, false, &[0x2c]);
+        // Four pixels fill the 2x2 window row by row.
+        send(&mut p, true, &[0xf8, 0x00, 0x07, 0xe0, 0x00, 0x1f, 0xff, 0xff]);
+
+        let rgb = rgb(&screen);
+        let at = |x: usize, y: usize| {
+            let i = (y * 8 + x) * 3;
+            [rgb[i], rgb[i + 1], rgb[i + 2]]
+        };
+        assert_eq!(at(2, 1), [255, 0, 0], "red");
+        assert_eq!(at(3, 1), [0, 255, 0], "green");
+        assert_eq!(at(2, 2), [0, 0, 255], "blue");
+        assert_eq!(at(3, 2), [255, 255, 255], "white");
+        // Nothing outside the window was touched.
+        assert_eq!(at(0, 0), [0, 0, 0]);
+        assert_eq!(at(4, 1), [0, 0, 0]);
+    }
+
+    #[test]
+    fn a_pixel_split_across_two_transfers_is_reassembled() {
+        // The driver chunks by buffer size, not by pixel count, so the two
+        // halves of a pixel routinely arrive in different transfers.
+        let (mut p, screen) = panel();
+        window(&mut p, (0, 1), (0, 0));
+        send(&mut p, false, &[0x2c]);
+        send(&mut p, true, &[0xf8]);
+        send(&mut p, true, &[0x00, 0x07, 0xe0]);
+
+        let rgb = rgb(&screen);
+        assert_eq!(&rgb[0..3], &[255, 0, 0], "first pixel spans the boundary");
+        assert_eq!(&rgb[3..6], &[0, 255, 0]);
+    }
+
+    #[test]
+    fn writes_wrap_at_the_window_edge_not_the_panel_edge() {
+        let (mut p, screen) = panel();
+        window(&mut p, (5, 6), (0, 1));
+        send(&mut p, false, &[0x2c]);
+        // Three pixels: two fill row 0, the third wraps to row 1 column 5.
+        send(&mut p, true, &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+
+        let rgb = rgb(&screen);
+        let lit = |x: usize, y: usize| rgb[(y * 8 + x) * 3] == 255;
+        assert!(lit(5, 0) && lit(6, 0));
+        assert!(lit(5, 1), "wrapped to the window's first column");
+        assert!(!lit(7, 0), "did not run past the window");
+    }
+
+    #[test]
+    fn madctl_bgr_swaps_the_colour_order() {
+        let (mut p, screen) = panel();
+        send(&mut p, false, &[0x36]);
+        send(&mut p, true, &[0x08]);
+        window(&mut p, (0, 0), (0, 0));
+        send(&mut p, false, &[0x2c]);
+        send(&mut p, true, &[0xf8, 0x00]);
+
+        // The same bits that read as red in RGB order are blue in BGR.
+        assert_eq!(&rgb(&screen)[0..3], &[0, 0, 255]);
+    }
+
+    #[test]
+    fn a_command_byte_is_not_mistaken_for_a_pixel() {
+        // This is the whole reason the data/command line is carried on the
+        // transaction: 0x2c is both RAMWR and a perfectly good pixel byte.
+        let (mut p, screen) = panel();
+        window(&mut p, (0, 1), (0, 0));
+        send(&mut p, false, &[0x2c]);
+        send(&mut p, true, &[0x2c, 0x2c]);
+
+        let before = screen.lock().expect("screen").generation;
+        send(&mut p, false, &[0x2c]);
+        assert_eq!(
+            screen.lock().expect("screen").generation,
+            before,
+            "a command wrote no pixels"
+        );
+    }
+
+    #[test]
+    fn the_panel_reports_whether_the_driver_turned_it_on() {
+        let (mut p, screen) = panel();
+        let on = || screen.lock().expect("screen").on;
+        assert!(!on());
+        send(&mut p, false, &[0x29]);
+        assert!(on());
+        send(&mut p, false, &[0x28]);
+        assert!(!on());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::sdcard::{SdCard, BLOCK_LEN};

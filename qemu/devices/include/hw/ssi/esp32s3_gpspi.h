@@ -193,6 +193,14 @@ typedef struct Esp32s3GpspiState {
     int dc_level;
 
     /*
+     * Which GPIO carries data/command, so the machine knows what to connect
+     * to this controller's "dc" input. Board-specific -- 11 on a T-Deck Plus,
+     * 2 on a CYD -- so it comes from the board file, not from the SoC. -1
+     * leaves the pin unwired and dc_level pinned at -1.
+     */
+    int32_t dc_gpio;
+
+    /*
      * Staging for a DMA transfer. Sized for one descriptor's worth of the
      * largest transfer a driver is likely to queue; longer transfers are
      * chunked by the GDMA's own descriptor walk.
