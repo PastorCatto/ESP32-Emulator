@@ -75,7 +75,9 @@ DEBUG_ARGS=()
   -drive file="$(win "$FLASH")",if=mtd,format=raw \
   -global driver=esp32s3.gpio,property=strap_mode,value=0x04 \
   "${VPB_ARGS[@]}" \
-  -serial null -serial null -serial file:"$(win "$LOG/serial.log")" \
+  -serial file:"$(win "$LOG/uart0.log")" \
+  -serial file:"$(win "$LOG/uart1.log")" \
+  -serial file:"$(win "$LOG/serial.log")" \
   >"$LOG/qemu.log" 2>&1 &
 QEMU_PID=$!
 
@@ -86,7 +88,7 @@ wait "$QEMU_PID" 2>/dev/null || true
 # The logs outlive the run so a failure can be picked apart afterwards
 # instead of being reconstructed from a truncated terminal dump.
 echo "logs: $LOG"
-for f in serial vpb qemu; do
+for f in serial uart0 uart1 vpb qemu; do
   [ -s "$LOG/$f.log" ] && echo "  $f.log  $(wc -l <"$LOG/$f.log") lines"
 done
 exit 0

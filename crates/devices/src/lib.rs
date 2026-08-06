@@ -180,6 +180,47 @@ mod tests {
     }
 
     #[test]
+    fn the_block_crc_matches_what_esp_idf_computes() {
+        // Taken from a real failure booting PURR OS against this model:
+        //   E sdspi_host: data CRC failed, got=0xf49a expected=0x0000
+        //   I sdspi_host: 40 0e 00 32 5b 59 00 00 00 7f 7f 80 0a 40 00 01
+        // Those are the descriptor bytes we sent and the CRC IDF derived from
+        // them, so this pins the polynomial and seed against a second
+        // implementation rather than against itself.
+        //
+        // The two constants below look byte-swapped because they are. IDF's
+        // sdspi_crc16 bswaps its result into "the on-the-wire format", then
+        // compares it against the trailing bytes read back with memcpy on a
+        // little-endian core -- so the value it prints is the wire order read
+        // backwards. Sending the plain CRC big-endian is what lines up.
+        let descriptor = [
+            0x40, 0x0e, 0x00, 0x32, 0x5b, 0x59, 0x00, 0x00,
+            0x00, 0x7f, 0x7f, 0x80, 0x0a, 0x40, 0x00, 0x01,
+        ];
+        assert_eq!(SdCard::crc16(&descriptor), 0x9af4);
+        assert_eq!(SdCard::crc16(&descriptor).to_be_bytes(), [0x9a, 0xf4]);
+    }
+
+    #[test]
+    fn a_descriptor_block_carries_its_crc() {
+        // CRC checking is off until the host sends CMD59, but ESP-IDF sends it
+        // during init and then verifies every block it reads. Zero bytes here
+        // failed the very first one and the card never mounted.
+        let (mut c, path) = card("crc");
+        command(&mut c, 0, 0, 8);
+        command(&mut c, 10, 0, 8);
+        let r = read_data(&mut c, 32);
+
+        let token = r.iter().position(|&b| b == 0xfe).expect("start-block token");
+        let payload = &r[token + 1..token + 17];
+        let sent = u16::from_be_bytes([r[token + 17], r[token + 18]]);
+
+        assert_ne!(sent, 0, "a zero CRC is what the host rejected");
+        assert_eq!(sent, SdCard::crc16(payload));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn commands_are_decoded_for_the_tracer() {
         let (c, path) = card("decode");
         let tx = Transaction::SpiTransfer {

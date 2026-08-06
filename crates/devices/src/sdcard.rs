@@ -156,6 +156,55 @@ impl SdCard {
         }
     }
 
+    /// CRC-16-CCITT over a data block, as the SD spec defines it.
+    ///
+    /// Polynomial 0x1021, seeded zero, no reflection and no final xor. Sent
+    /// big-endian after the payload.
+    ///
+    /// Not optional, despite SPI mode starting with CRC checking off. ESP-IDF
+    /// sends CMD59 with the enable bit during init, and from then on
+    /// `sdspi_host` verifies every data block it reads. Zero bytes there fail
+    /// the very first one -- the CID -- and the card never mounts.
+    pub(crate) fn crc16(data: &[u8]) -> u16 {
+        let mut crc: u16 = 0;
+        for &byte in data {
+            crc ^= (byte as u16) << 8;
+            for _ in 0..8 {
+                crc = if crc & 0x8000 != 0 {
+                    (crc << 1) ^ 0x1021
+                } else {
+                    crc << 1
+                };
+            }
+        }
+        crc
+    }
+
+    /// Append a payload's CRC in the order the card clocks it out.
+    fn push_crc16(out: &mut Vec<u8>, payload: &[u8]) {
+        out.extend_from_slice(&Self::crc16(payload).to_be_bytes());
+    }
+
+    /// A start token, a payload and its CRC: what a read command leaves for
+    /// the host to clock out in the transfer after the response.
+    fn data_block(payload: &[u8]) -> Vec<u8> {
+        let mut block = Vec::with_capacity(payload.len() + 3);
+        block.push(TOKEN_START_BLOCK);
+        block.extend_from_slice(payload);
+        Self::push_crc16(&mut block, payload);
+        block
+    }
+
+    /// SD Configuration Register, read by ACMD51.
+    ///
+    /// SD_SPEC 2 with SD_SPEC3 set describes a 2.00 card, which is what the
+    /// CCS bit in our OCR already claims. Bus widths advertise 1-bit and
+    /// 4-bit; neither matters in SPI mode, but a card that claimed neither
+    /// would be describing hardware that cannot exist.
+    fn scr() -> [u8; 8] {
+        [0x02, 0x35, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00]
+    }
+
     fn read_block(&mut self, block: u32) -> Vec<u8> {
         let mut out = Vec::with_capacity(BLOCK_LEN + 4);
         // A real card takes a variable time to fetch; a single busy byte is
@@ -175,8 +224,7 @@ impl SdCard {
                 .and_then(|_| self.image.read_exact(&mut data));
         }
         out.extend_from_slice(&data);
-        // CRC16, which SPI mode leaves unchecked by default.
-        out.extend_from_slice(&[0, 0]);
+        Self::push_crc16(&mut out, &data);
         out
     }
 
@@ -256,13 +304,40 @@ impl SdCard {
             // SEND_CSD / SEND_CID: a plausible descriptor is enough to get
             // past capacity detection.
             (false, 9) | (false, 10) => {
-                let mut block = vec![TOKEN_START_BLOCK];
-                block.extend_from_slice(&self.csd());
-                block.extend_from_slice(&[0, 0]);
+                let block = Self::data_block(&self.csd());
                 self.reply_then_block(vec![0], block);
             }
 
-            // CRC_ON_OFF and STOP_TRANSMISSION are both no-ops here.
+            // SEND_SCR. ESP-IDF reads this during init and again after any
+            // frequency switch, and treats a failure as fatal -- without it
+            // the mount stops at "send_scr returned 0x107".
+            (true, 51) => {
+                let block = Self::data_block(&Self::scr());
+                self.reply_then_block(vec![0], block);
+            }
+
+            // SD_STATUS: 64 bytes of wear and speed-class detail. Zeros mean
+            // "nothing to report", which the host decodes without complaint.
+            (true, 13) => {
+                let block = Self::data_block(&[0u8; 64]);
+                self.reply_then_block(vec![0], block);
+            }
+
+            // SWITCH_FUNC. A version-0 status block is a valid response that
+            // advertises no switchable functions, so the host concludes the
+            // card has no high-speed mode and stays at the default clock --
+            // rather than us inventing a timing change we do not model.
+            (false, 6) => {
+                let block = Self::data_block(&[0u8; 64]);
+                self.reply_then_block(vec![0], block);
+            }
+
+            // SEND_STATUS. R2 in SPI mode: the R1 byte plus one more, both
+            // clear because nothing has gone wrong.
+            (false, 13) => self.reply(vec![0, 0]),
+
+            // CRC_ON_OFF and STOP_TRANSMISSION are both no-ops here. CRC is
+            // always computed on the way out, so enabling it changes nothing.
             (false, 59) | (false, 12) => self.reply(vec![0]),
 
             _ => self.reply(vec![R1_ILLEGAL_COMMAND]),
@@ -421,14 +496,22 @@ impl Peripheral for SdCard {
         }
         Some(match cmd & 0x3f {
             0 => "CMD0 GO_IDLE_STATE".into(),
+            6 => "CMD6 SWITCH_FUNC".into(),
             8 => "CMD8 SEND_IF_COND".into(),
             9 => "CMD9 SEND_CSD".into(),
+            10 => "CMD10 SEND_CID".into(),
+            12 => "CMD12 STOP_TRANSMISSION".into(),
+            // Also ACMD13 SD_STATUS; which one it is depends on whether CMD55
+            // came first, and a byte on its own does not say.
+            13 => "CMD13 SEND_STATUS".into(),
             16 => "CMD16 SET_BLOCKLEN".into(),
             17 => "CMD17 READ_SINGLE_BLOCK".into(),
             24 => "CMD24 WRITE_BLOCK".into(),
             41 => "ACMD41 SD_SEND_OP_COND".into(),
+            51 => "ACMD51 SEND_SCR".into(),
             55 => "CMD55 APP_CMD".into(),
             58 => "CMD58 READ_OCR".into(),
+            59 => "CMD59 CRC_ON_OFF".into(),
             n => format!("CMD{n}"),
         })
     }

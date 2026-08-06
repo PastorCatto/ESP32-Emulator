@@ -205,31 +205,48 @@ replace it later without disturbing anything above.
 
 ## 7. What actually works today
 
-Real firmware boots and runs. A PURR OS T-Deck Plus build gets through the
-ROM, the second-stage bootloader, our partition table, seven segment loads,
-octal PSRAM detection, `app_init`, its flash VFS, and Wi-Fi driver
-initialisation — the real closed blob, which comes up cleanly — into its
-driver phase, where the ST7789 driver starts issuing SPI transfers.
+Real firmware boots and runs its drivers. A PURR OS T-Deck Plus build gets
+through the ROM, the second-stage bootloader, our partition table, seven
+segment loads, octal PSRAM detection and `app_init`, then:
 
-Four things had to exist for that, each of which hung the boot on its own:
+- initialises the SD card over SPI — CMD0 through ACMD51, CRC checking
+  enabled, against a raw `.img` served by a Rust device model;
+- brings up the ST7789, which reports `ST7789 ready 320x240`, switches to
+  bulk DMA mode and pushes full 320×240 framebuffers, ten chunks per frame;
+- registers the trackball and the BBQ20 keyboard;
+- loads its static modules and reaches Wi-Fi PHY init.
 
-- **PSRAM** needs *two* QEMU settings that do nothing alone: `-m 8M` for size,
-  and a global switching the modelled chip to octal. Without both, the T-Deck
-  calls `abort()` during startup and boot-loops.
-- **The SAR ADC** did not exist, so firmware polling for conversion completion
-  spun forever. It reads the battery during startup.
-- **GP SPI2/SPI3** did not exist for any chip. Everything on a board's
-  general-purpose SPI bus was invisible.
-- **The USB Serial/JTAG console** was a register stub, so any firmware using
-  the S3's native USB for its console booted completely silently.
+It stops at `phy_init`, which is where the unmodelled Wi-Fi hardware begins —
+see [section 6](#6-wi-fi-and-why-it-is-not-emulated).
 
-All four are in [qemu/](../qemu/), applied to an unmodified release tarball.
+Getting there meant writing four device models that did not exist, and fixing
+four bugs that did.
 
-Still open: the display driver reports `ESP_ERR_TIMEOUT` on its transfers, and
-the cause is not yet found — completion timing and interrupt re-entry were
-both hypothesised, implemented, and turned out not to be it. DMA is not
-modelled and will be needed for framebuffer pushes. I²C, every device driver,
-and Wi-Fi are untouched.
+The models, all in [qemu/](../qemu/) and applied to an unmodified release
+tarball: **GP SPI2/SPI3** (absent for every chip, so anything on a board's
+general-purpose SPI bus was invisible), the **SAR ADC** (firmware polling for
+conversion completion spun forever while reading the battery), the **USB
+Serial/JTAG console** (a register stub, so firmware using the S3's native USB
+booted silently), and the **vpb bridge** itself.
+
+The bugs are written up in [qemu/README.md](../qemu/README.md). Three were in
+Espressif's own models and shared a single symptom — SD init hanging, which
+held the SPI bus lock and stopped the display from ever starting: a GDMA
+channel lookup that matched channels nobody had programmed, the same lookup
+reading an RX channel's START bit at the TX offset, and an interrupt matrix
+that ignored mapping changes. The fourth was ours: a deliberate delay before
+dropping the interrupt line, which re-entered ESP-IDF's SPI ISR after it had
+cleared `trans_done` and tripped an assert into a boot loop.
+
+PSRAM needs *two* QEMU settings that do nothing alone: `-m 8M` for size and a
+global switching the modelled chip to octal. Without both the T-Deck calls
+`abort()` during startup and boot-loops. `scripts/run-emu.sh` sets them.
+
+Still open: nothing renders the framebuffer yet — the pixels reach a device
+model and stop there. A freshly created `.img` has no filesystem on it, so the
+card initialises and then FATFS reports `FR_NO_FILESYSTEM`; a real card image
+mounts. I²C is unmodelled, so the GT911 touch controller is not found. Wi-Fi
+is untouched.
 
 ---
 
@@ -241,12 +258,29 @@ When firmware stops producing output, these answer why.
 # What is this file?
 cargo run -p flashimg --example inspect -- firmware.bin
 
-# Where did it stop? Samples the PC, disassembles, checks both cores.
-cargo run -p qemuctl --example probe -- flash.bin 15
+# Boot it, with an SD card attached. Prints where it left the logs.
+scripts/run-emu.sh flash.bin 60 sd.img
+
+# The device models' own traces, into qemu.log.
+QEMU_DEBUG=unimp,guest_errors scripts/run-emu.sh flash.bin 60 sd.img
+
+# Where did it stop? Samples both cores' registers over the QEMU monitor.
+scripts/sample-pc.sh flash.bin 40 8 sd.img
 
 # Turn an address into a function name.
 cargo run -p flashimg --example addr2sym -- build/app.elf 0x42119853
 ```
+
+`run-emu.sh` captures all three serial ports, not just the console. Firmware
+does not always log where you expect: PURR OS prints its boot through UART0
+while the USB Serial/JTAG console carries only the ROM and bootloader, and
+chasing a "hang" that was really output going to a port nobody was reading
+costs an afternoon.
+
+`sample-pc.sh` takes `MON_EXTRA` for one-off monitor commands. Reading an
+interrupt matrix mapping with `xp /1wx 0x600c2054` and comparing it against
+the CPU's `INTENABLE` and `INTERRUPT` is what identified the matrix bug —
+the peripheral was holding its line high and the CPU never saw it.
 
 Together these found the ADC stall: `probe` showed both cores parked on one
 instruction, disassembly showed a register poll, the address register named the
