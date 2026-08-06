@@ -102,8 +102,22 @@ impl SdCard {
         &self.path
     }
 
+    /// Queue a response, preceded by the NCR gap a real card takes.
+    ///
+    /// A card does not answer on the very next clock. The spec allows one to
+    /// eight idle bytes before the response, and hosts rely on it: ESP-IDF
+    /// lays its command frame out as six command bytes, one NCR byte, then
+    /// R1, and its search "for r1 in the buffer after 1 clocks to max 8
+    /// clocks" skips the byte immediately following the command.
+    ///
+    /// Answering instantly is therefore *too fast to be seen* — the reply
+    /// lands in the one position the host never looks at, and every command
+    /// times out while the trace shows a perfectly good response.
     fn reply(&mut self, bytes: Vec<u8>) {
-        self.phase = Phase::Replying(bytes);
+        let mut queued = Vec::with_capacity(bytes.len() + 1);
+        queued.push(IDLE_BYTE);
+        queued.extend(bytes);
+        self.phase = Phase::Replying(queued);
     }
 
     /// Take the next byte the card would drive onto MISO.

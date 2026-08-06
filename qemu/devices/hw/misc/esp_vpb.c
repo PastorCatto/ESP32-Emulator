@@ -235,8 +235,18 @@ bool esp_vpb_spi_transfer(EspVpbClient *c, uint8_t controller, uint8_t cs,
 #endif
     setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
 
+    /*
+     * The guest is stalled for the round trip, and sees that time pass.
+     *
+     * Pausing the virtual clock here was tried and reverted: cpu_disable_ticks
+     * is meant for whole-VM suspend, and calling it from a device read froze
+     * the machine outright. It also was not needed -- firmware tolerates the
+     * latency fine, because a real bus transaction blocks too.
+     */
     uint32_t got = 0;
-    if (!esp_vpb_read_frame(c, miso, read_len, &got)) {
+    bool ok = esp_vpb_read_frame(c, miso, read_len, &got);
+
+    if (!ok) {
         esp_vpb_fail(c, "no reply within the timeout");
         return false;
     }
