@@ -158,12 +158,24 @@ static bool esp32s3_gpspi_via_vpb(Esp32s3GpspiState *s, uint8_t *buf,
                                 buf, want_miso ? bytes : 0);
 }
 
-/* Is either DMA direction armed for this transfer? */
+/*
+ * Should this transfer's data move through DMA rather than the W registers?
+ *
+ * The DMA_CONF enables are not sufficient on their own. ESP-IDF leaves them
+ * set across transfers and chooses per transaction: a programmed-I/O transfer
+ * writes its bytes into W0..W15 first, while a DMA one programs a descriptor
+ * and leaves the registers alone. Going by the enables alone routed one-byte
+ * polling transfers through GDMA, which then chased a descriptor that was
+ * never programmed -- visible as a flood of reads at address zero.
+ *
+ * So the deciding signal is whether the guest filled the register buffer
+ * since the last transfer.
+ */
 static bool esp32s3_gpspi_dma_active(Esp32s3GpspiState *s)
 {
     uint32_t conf = s->regs[R_GPSPI_DMA_CONF];
 
-    return s->gdma != NULL &&
+    return s->gdma != NULL && !s->w_written &&
            (FIELD_EX32(conf, GPSPI_DMA_CONF, DMA_TX_ENA) ||
             FIELD_EX32(conf, GPSPI_DMA_CONF, DMA_RX_ENA));
 }
@@ -207,12 +219,14 @@ static unsigned esp32s3_gpspi_dma_data(Esp32s3GpspiState *s, unsigned bytes,
     memset(s->dma_buf, 0xff, bytes);
 
     if (tx) {
-        if (!esp_gdma_get_channel_periph(s->gdma, s->gdma_periph,
-                                         ESP_GDMA_OUT_IDX, &chan) ||
-            !esp_gdma_read_channel(s->gdma, chan, s->dma_buf, bytes)) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "%s: DMA TX enabled but no usable out channel\n",
-                          __func__);
+        bool found = esp_gdma_get_channel_periph(s->gdma, s->gdma_periph,
+                                                 ESP_GDMA_OUT_IDX, &chan);
+        bool moved = found &&
+                     esp_gdma_read_channel(s->gdma, chan, s->dma_buf, bytes);
+        qemu_log_mask(LOG_UNIMP,
+                      "gpspi: dma tx %u bytes found=%d chan=%u moved=%d\n",
+                      bytes, found, found ? chan : 0, moved);
+        if (!moved) {
             return 0;
         }
     }
@@ -343,6 +357,8 @@ static void esp32s3_gpspi_transfer(Esp32s3GpspiState *s)
      * that follows starting a transaction. Real hardware always takes some
      * microseconds; taking zero is its own kind of wrong.
      */
+    s->w_written = false;
+
     uint64_t ns = esp32s3_gpspi_duration_ns(s, total_bytes);
     s->busy = true;
     timer_mod_ns(s->done_timer,
@@ -491,6 +507,9 @@ static void esp32s3_gpspi_write(void *opaque, hwaddr addr, uint64_t value,
         break;
 
     default:
+        if (reg >= A_GPSPI_W0 && reg <= A_GPSPI_W15) {
+            s->w_written = true;
+        }
         s->regs[index] = (uint32_t)value;
         break;
     }

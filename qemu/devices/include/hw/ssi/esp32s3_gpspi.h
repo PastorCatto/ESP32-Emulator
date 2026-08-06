@@ -178,6 +178,12 @@ typedef struct Esp32s3GpspiState {
     uint8_t vpb_controller;
 
     /*
+     * Set when the guest writes W0..W15, cleared when a transfer consumes
+     * them. Distinguishes a programmed-I/O transfer from a DMA one.
+     */
+    bool w_written;
+
+    /*
      * Level of the data/command GPIO, latched when a transfer begins. An
      * ST7789 distinguishes a command byte from pixel data by this pin and
      * nothing on the bus itself, so a display driver cannot decode the
