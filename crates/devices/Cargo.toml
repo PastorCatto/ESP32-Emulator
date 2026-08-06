@@ -1,0 +1,19 @@
+[package]
+name = "devices"
+description = "Device models that hang off the emulated SoC's buses."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vpb = { path = "../vpb" }
+
+[features]
+# Each device is a switch, so a build can carry only what it needs.
+default = ["sdcard"]
+sdcard = []
+
+[lints]
+workspace = true

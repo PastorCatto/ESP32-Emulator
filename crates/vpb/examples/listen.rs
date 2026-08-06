@@ -12,6 +12,7 @@
 use std::io::{BufReader, BufWriter, Write};
 use std::net::TcpListener;
 
+use vpb::registry::{EventQueue, Registry};
 use vpb::trace::{TraceConfig, TraceRecord};
 use vpb::wire::{self, DeviceMessage, HostMessage};
 use vpb::{Response, Transaction};
@@ -22,6 +23,22 @@ fn main() -> std::io::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(5559);
 
+    // Optional second argument: a raw SD image to attach at the T-Deck's
+    // chip select. Without it the bus is empty and every read answers as
+    // absent hardware.
+    let mut registry = Registry::new();
+    if let Some(img) = std::env::args().nth(2) {
+        match devices::SdCard::open(&img, vpb::Claim::Spi { controller: 2, cs: 5 }) {
+            Ok(card) => {
+                eprintln!("vpb: SD card {img} ({} blocks)", card.capacity_blocks());
+                registry
+                    .register(Box::new(card))
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+            }
+            Err(e) => eprintln!("vpb: could not open {img}: {e}"),
+        }
+    }
+
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     eprintln!("vpb: listening on 127.0.0.1:{port}");
 
@@ -30,14 +47,14 @@ fn main() -> std::io::Result<()> {
         stream.set_nodelay(true)?;
         eprintln!("vpb: emulator connected");
 
-        if let Err(e) = serve(stream) {
+        if let Err(e) = serve(stream, &mut registry) {
             eprintln!("vpb: connection ended: {e}");
         }
     }
     Ok(())
 }
 
-fn serve(stream: std::net::TcpStream) -> std::io::Result<()> {
+fn serve(stream: std::net::TcpStream, registry: &mut Registry) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = BufWriter::new(stream);
 
@@ -69,18 +86,26 @@ fn serve(stream: std::net::TcpStream) -> std::io::Result<()> {
         };
         count += 1;
 
-        // Absent-device behaviour: zeros back, which is what this board's
-        // shared MISO actually reads.
-        let response = match &transaction {
-            Transaction::SpiTransfer { read_len, .. } if *read_len > 0 => {
+        // Route to whichever device claimed the address; anything unclaimed
+        // answers as absent hardware would.
+        let mut sink = EventQueue::default();
+        let response = registry.dispatch(&transaction, &mut sink);
+        let response = match (&response, &transaction) {
+            (Response::None, Transaction::SpiTransfer { read_len, .. }) if *read_len > 0 => {
                 Response::data(vec![0u8; *read_len as usize])
             }
-            _ => Response::None,
+            _ => response,
         };
 
         println!(
             "{}",
-            TraceRecord::build(&transaction, &response, Some("listen"), None, &cfg)
+            TraceRecord::build(
+                &transaction,
+                &response,
+                Some(if registry.is_empty() { "listen" } else { "sdcard" }),
+                None,
+                &cfg
+            )
         );
 
         if let Some(id) = id {

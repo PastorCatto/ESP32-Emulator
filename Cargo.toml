@@ -6,6 +6,7 @@ members = [
     "crates/boards",
     "crates/qemuctl",
     "crates/shell",
+    "crates/devices",
 ]
 
 [workspace.package]

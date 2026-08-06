@@ -218,10 +218,21 @@ bool esp_vpb_spi_transfer(EspVpbClient *c, uint8_t controller, uint8_t cs,
      * forever because a driver crashed.
      */
     qemu_socket_set_block(c->fd);
+    /*
+     * SO_RCVTIMEO takes different things on different platforms: a DWORD of
+     * milliseconds on Windows, a struct timeval everywhere else. Passing a
+     * timeval on Windows silently reads its first four bytes as the
+     * millisecond count -- a 2000 ms timeout becomes 2 ms, and every reply
+     * looks like a dead peer.
+     */
+#ifdef _WIN32
+    DWORD tv = ESP_VPB_TIMEOUT_MS;
+#else
     struct timeval tv = {
         .tv_sec = ESP_VPB_TIMEOUT_MS / 1000,
         .tv_usec = (ESP_VPB_TIMEOUT_MS % 1000) * 1000,
     };
+#endif
     setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
 
     uint32_t got = 0;
