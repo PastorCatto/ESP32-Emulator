@@ -39,6 +39,14 @@ enum Phase {
     Replying(Vec<u8>),
     /// Waiting for a write payload: token, data, CRC.
     AwaitingWrite { block: u32, buf: Vec<u8> },
+    /// R1 has been sent; a data block is ready but not yet offered.
+    ///
+    /// The host reads a data block in a *separate* transfer from the command
+    /// that asked for it, and finds the block by polling for the 0xFE start
+    /// token. Emitting that token inside the command's own transfer puts it
+    /// where the host is not looking: it consumes the token as part of the
+    /// response, then polls for one that never comes again.
+    DataPending(Vec<u8>),
 }
 
 #[derive(Debug)]
@@ -53,6 +61,8 @@ pub struct SdCard {
     app_cmd: bool,
     /// A command frame being clocked in: six bytes of index, argument and CRC.
     pending: Vec<u8>,
+    /// A data block owed to the host, released on the next transfer.
+    deferred: Option<Vec<u8>>,
     phase: Phase,
     /// True once the host has completed initialisation, purely for the UI.
     pub initialised: bool,
@@ -76,6 +86,7 @@ impl SdCard {
             idle: true,
             app_cmd: false,
             pending: Vec::new(),
+            deferred: None,
             phase: Phase::Idle,
             initialised: false,
         })
@@ -120,13 +131,24 @@ impl SdCard {
         self.phase = Phase::Replying(queued);
     }
 
+    /// Queue R1 now and the data block for the following transfer.
+    fn reply_then_block(&mut self, r1: Vec<u8>, block: Vec<u8>) {
+        self.reply(r1);
+        self.deferred = Some(block);
+    }
+
     /// Take the next byte the card would drive onto MISO.
     fn next_byte(&mut self) -> u8 {
         match &mut self.phase {
             Phase::Replying(queue) if !queue.is_empty() => {
                 let b = queue.remove(0);
                 if queue.is_empty() {
-                    self.phase = Phase::Idle;
+                    // A data block owed from this command becomes available
+                    // only once the host starts a new transfer.
+                    self.phase = match self.deferred.take() {
+                        Some(block) => Phase::DataPending(block),
+                        None => Phase::Idle,
+                    };
                 }
                 b
             }
@@ -218,9 +240,8 @@ impl SdCard {
 
             // READ_SINGLE_BLOCK.
             (false, 17) => {
-                let mut r = vec![0];
-                r.extend(self.read_block(arg));
-                self.reply(r);
+                let block = self.read_block(arg);
+                self.reply_then_block(vec![0], block);
             }
 
             // WRITE_BLOCK: acknowledge, then take the payload that follows.
@@ -235,10 +256,10 @@ impl SdCard {
             // SEND_CSD / SEND_CID: a plausible descriptor is enough to get
             // past capacity detection.
             (false, 9) | (false, 10) => {
-                let mut r = vec![0, TOKEN_START_BLOCK];
-                r.extend_from_slice(&self.csd());
-                r.extend_from_slice(&[0, 0]);
-                self.reply(r);
+                let mut block = vec![TOKEN_START_BLOCK];
+                block.extend_from_slice(&self.csd());
+                block.extend_from_slice(&[0, 0]);
+                self.reply_then_block(vec![0], block);
             }
 
             // CRC_ON_OFF and STOP_TRANSMISSION are both no-ops here.
@@ -338,6 +359,42 @@ impl Peripheral for SdCard {
         let Transaction::SpiTransfer { mosi, read_len, .. } = tx else {
             return Response::None;
         };
+
+        /*
+         * Each transfer is one chip-select window, and a host starts a new
+         * command with the chip select freshly asserted. If a previous reply
+         * still has bytes queued -- because the host read less of a data block
+         * than we offered -- those must not swallow the incoming command.
+         *
+         * Without this the card silently eats the next command frame: the
+         * host sends it, receives idle bytes back, and blocks forever waiting
+         * for a response to a command the card never saw. Nothing looks
+         * broken from either side, which makes it very hard to spot.
+         */
+        if matches!(self.phase, Phase::Replying(_)) {
+            if let Some(&first) = mosi.first() {
+                if (first & 0xc0) == 0x40 {
+                    self.phase = Phase::Idle;
+                    self.deferred = None;
+                }
+            }
+        }
+
+        /*
+         * A data block owed from the previous command becomes readable now
+         * that a new transfer has begun. The host polls for the 0xFE token in
+         * this transfer, which is where it is looking for it.
+         */
+        if let Phase::DataPending(block) = &self.phase {
+            let block = block.clone();
+            // A new command takes priority: the host may have given up on the
+            // block, and swallowing its command would hang it.
+            if mosi.first().is_some_and(|&b| (b & 0xc0) == 0x40) {
+                self.phase = Phase::Idle;
+            } else {
+                self.phase = Phase::Replying(block);
+            }
+        }
 
         let mut miso = Vec::with_capacity(mosi.len().max(*read_len as usize));
         for &b in mosi {

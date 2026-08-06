@@ -45,12 +45,23 @@ mod tests {
         }
     }
 
-    /// Send a command frame and return the bytes clocked out while polling.
+    /// Send a command and poll for its response in one transfer.
+    ///
+    /// This mirrors what ESP-IDF actually does, confirmed from a bus trace:
+    /// the six command bytes and the R1 poll share a single chip-select
+    /// window, and any data block is read in a *separate* transfer after it.
     fn command(card: &mut SdCard, cmd: u8, arg: u32, poll: usize) -> Vec<u8> {
         let a = arg.to_be_bytes();
-        let frame = [0x40 | cmd, a[0], a[1], a[2], a[3], 0x95];
-        xfer(card, &frame, 6);
-        xfer(card, &vec![0xff; poll], poll)
+        let mut frame = vec![0x40 | cmd, a[0], a[1], a[2], a[3], 0x95];
+        frame.extend(std::iter::repeat_n(0xff, poll));
+        let out = xfer(card, &frame, frame.len());
+        // Drop the command bytes; the response is in the polling tail.
+        out[6.min(out.len())..].to_vec()
+    }
+
+    /// Read a data block the previous command left waiting.
+    fn read_data(card: &mut SdCard, len: usize) -> Vec<u8> {
+        xfer(card, &vec![0xff; len], len)
     }
 
     /// Strip the idle bytes a host clocks while waiting for a response.
@@ -119,8 +130,10 @@ mod tests {
         // Let the accept token and busy byte drain.
         xfer(&mut c, &[0xff; 4], 4);
 
-        // Read it back.
-        let r = command(&mut c, 17, 3, BLOCK_LEN + 8);
+        // Read it back. The command and its R1 share one transfer; the data
+        // block arrives in the next, which is what the host actually does.
+        command(&mut c, 17, 3, 8);
+        let r = read_data(&mut c, BLOCK_LEN + 8);
         let token = r.iter().position(|&b| b == 0xfe).expect("start-block token");
         assert_eq!(&r[token + 1..token + 1 + BLOCK_LEN], &payload[..]);
 
@@ -151,7 +164,8 @@ mod tests {
         let (mut c, path) = card("oob");
         command(&mut c, 0, 0, 8);
         let blocks = c.capacity_blocks();
-        let r = command(&mut c, 17, blocks + 10, BLOCK_LEN + 8);
+        command(&mut c, 17, blocks + 10, 8);
+        let r = read_data(&mut c, BLOCK_LEN + 8);
         let token = r.iter().position(|&b| b == 0xfe).expect("start-block token");
         assert!(r[token + 1..token + 1 + 16].iter().all(|&b| b == 0));
         let _ = std::fs::remove_file(path);

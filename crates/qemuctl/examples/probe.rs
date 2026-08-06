@@ -30,6 +30,15 @@ fn main() -> std::process::ExitCode {
     config.psram = Some(Psram { size_mb: 8, octal: true });
     config.qmp_port = Some(55_711);
 
+    // Point the SPI controllers at an external peripheral server, so a stall
+    // that only happens with device models attached can be probed too.
+    if let Ok(port) = std::env::var("ESP32_EMULATOR_VPB_PORT") {
+        config.extra_args.push("-global".into());
+        config
+            .extra_args
+            .push(format!("driver=ssi.esp32s3.gpspi,property=vpb-port,value={port}"));
+    }
+
     let mut inst = match Instance::spawn(&qemu, &config) {
         Ok(i) => i,
         Err(e) => {
