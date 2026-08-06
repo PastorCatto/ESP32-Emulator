@@ -22,6 +22,7 @@
 #include "hw/registerfields.h"
 #include "hw/ssi/ssi.h"
 #include "hw/dma/esp_gdma.h"
+#include "hw/misc/esp_vpb.h"
 
 #define TYPE_ESP32S3_GPSPI "ssi.esp32s3.gpspi"
 #define ESP32S3_GPSPI(obj) OBJECT_CHECK(Esp32s3GpspiState, (obj), TYPE_ESP32S3_GPSPI)
@@ -166,6 +167,23 @@ typedef struct Esp32s3GpspiState {
     ESPGdmaState *gdma;
     /* Which peripheral slot to claim on the GDMA: SPI2 or SPI3. */
     GdmaPeripheral gdma_periph;
+
+    /*
+     * Forwards whole transactions to device models running outside QEMU.
+     * When nothing is listening the bus simply looks empty, which is a
+     * legitimate way to run the emulator.
+     */
+    EspVpbClient vpb;
+    /* Controller number reported to device models: 2 for SPI2, 3 for SPI3. */
+    uint8_t vpb_controller;
+
+    /*
+     * Level of the data/command GPIO, latched when a transfer begins. An
+     * ST7789 distinguishes a command byte from pixel data by this pin and
+     * nothing on the bus itself, so a display driver cannot decode the
+     * stream without it. -1 means the board has no such pin.
+     */
+    int dc_level;
 
     /*
      * Staging for a DMA transfer. Sized for one descriptor's worth of the

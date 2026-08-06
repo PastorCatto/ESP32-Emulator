@@ -76,6 +76,11 @@ insert_after "hw/misc/meson.build" \
   "  'esp32s3_sens.c'," \
   "esp32s3_sens.c"
 
+insert_after "hw/misc/meson.build" \
+  "  'esp32s3_sens.c'," \
+  "  'esp_vpb.c'," \
+  "'esp_vpb.c',"
+
 insert_after "hw/xtensa/esp32s3.c" \
   '#include "hw/misc/esp32s3_rtc_cntl.h"' \
   '#include "hw/misc/esp32s3_sens.h"' \

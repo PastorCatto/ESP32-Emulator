@@ -137,6 +137,27 @@ static uint8_t esp32s3_gpspi_xfer_byte(Esp32s3GpspiState *s, uint8_t out,
     return anything_attached ? (uint8_t)in : 0x00;
 }
 
+/*
+ * Hand a whole transaction to the external device models.
+ *
+ * Returns true when it was delivered, in which case `buf` holds whatever was
+ * clocked back. Returns false when nothing is listening, and the caller falls
+ * back to the in-QEMU SSI bus -- so a board can mix the two, and the emulator
+ * still runs with no device process attached.
+ */
+static bool esp32s3_gpspi_via_vpb(Esp32s3GpspiState *s, uint8_t *buf,
+                                  unsigned bytes, bool want_miso)
+{
+    int cs = esp32s3_gpspi_active_cs(s);
+
+    if (cs < 0) {
+        return false;
+    }
+    return esp_vpb_spi_transfer(&s->vpb, s->vpb_controller, (uint8_t)cs,
+                                s->dc_level, buf, bytes,
+                                buf, want_miso ? bytes : 0);
+}
+
 /* Is either DMA direction armed for this transfer? */
 static bool esp32s3_gpspi_dma_active(Esp32s3GpspiState *s)
 {
@@ -197,9 +218,11 @@ static unsigned esp32s3_gpspi_dma_data(Esp32s3GpspiState *s, unsigned bytes,
     }
 
     /* Clock the bytes over the bus, collecting MISO in place. */
-    for (unsigned i = 0; i < bytes; i++) {
-        uint8_t in = esp32s3_gpspi_xfer_byte(s, s->dma_buf[i], attached);
-        s->dma_buf[i] = in;
+    if (!esp32s3_gpspi_via_vpb(s, s->dma_buf, bytes, rx)) {
+        for (unsigned i = 0; i < bytes; i++) {
+            uint8_t in = esp32s3_gpspi_xfer_byte(s, s->dma_buf[i], attached);
+            s->dma_buf[i] = in;
+        }
     }
 
     if (rx) {
@@ -289,11 +312,20 @@ static void esp32s3_gpspi_transfer(Esp32s3GpspiState *s)
                               __func__, bytes, ESP32S3_GPSPI_BUF_BYTES);
                 bytes = ESP32S3_GPSPI_BUF_BYTES;
             }
+            uint8_t staging[ESP32S3_GPSPI_BUF_BYTES];
             for (unsigned i = 0; i < bytes; i++) {
-                uint8_t out = mosi ? esp32s3_gpspi_buf_read(s, i) : 0xff;
-                uint8_t in = esp32s3_gpspi_xfer_byte(s, out, attached);
-                if (miso) {
-                    esp32s3_gpspi_buf_write(s, i, in);
+                staging[i] = mosi ? esp32s3_gpspi_buf_read(s, i) : 0xff;
+            }
+
+            if (!esp32s3_gpspi_via_vpb(s, staging, bytes, miso)) {
+                for (unsigned i = 0; i < bytes; i++) {
+                    staging[i] = esp32s3_gpspi_xfer_byte(s, staging[i], attached);
+                }
+            }
+
+            if (miso) {
+                for (unsigned i = 0; i < bytes; i++) {
+                    esp32s3_gpspi_buf_write(s, i, staging[i]);
                 }
             }
             total_bytes += bytes;
@@ -479,6 +511,7 @@ static void esp32s3_gpspi_reset_hold(Object *obj, ResetType type)
     timer_del(s->done_timer);
     s->busy = false;
     s->line_high = false;
+    esp_vpb_close(&s->vpb);
 
     memset(s->regs, 0, sizeof(s->regs));
     /* Every chip select released. */
@@ -505,6 +538,9 @@ static void esp32s3_gpspi_init(Object *obj)
 
     s->done_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, esp32s3_gpspi_done, s);
     s->deassert_bh = qemu_bh_new(esp32s3_gpspi_deassert, s);
+
+    /* No data/command pin known until a board wires one. */
+    s->dc_level = -1;
 }
 
 static const VMStateDescription vmstate_esp32s3_gpspi = {
@@ -517,6 +553,17 @@ static const VMStateDescription vmstate_esp32s3_gpspi = {
     }
 };
 
+static Property esp32s3_gpspi_properties[] = {
+    /*
+     * TCP port of the external peripheral server. Zero, the default, keeps
+     * everything inside QEMU so the emulator runs standalone.
+     */
+    DEFINE_PROP_UINT16("vpb-port", Esp32s3GpspiState, vpb.port, 0),
+    /* Reported to the device models so they can tell SPI2 from SPI3. */
+    DEFINE_PROP_UINT8("vpb-controller", Esp32s3GpspiState, vpb_controller, 2),
+    DEFINE_PROP_END_OF_LIST(),
+};
+
 static void esp32s3_gpspi_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -524,6 +571,7 @@ static void esp32s3_gpspi_class_init(ObjectClass *klass, void *data)
 
     rc->phases.hold = esp32s3_gpspi_reset_hold;
     dc->vmsd = &vmstate_esp32s3_gpspi;
+    device_class_set_props(dc, esp32s3_gpspi_properties);
 }
 
 static const TypeInfo esp32s3_gpspi_info = {
