@@ -223,6 +223,188 @@ replace_once() {
   echo "  ~ $file: $marker"
 }
 
+# Replace a whole span, from the line containing `start` to the first line
+# that is exactly `end`. For rewriting a function body, where replace_once's
+# single-line matching cannot reach.
+replace_range() {
+  local file="$1" start="$2" end="$3" new="$4" marker="$5"
+  local path="$SRC/$file"
+
+  if grep -qF -- "$marker" "$path"; then
+    echo "  = $file already has $marker"
+    return 0
+  fi
+  if ! grep -qF -- "$start" "$path"; then
+    echo "error: start of range not found in $file" >&2
+    echo "       looked for: $start" >&2
+    exit 1
+  fi
+
+  awk -v start="$start" -v end="$end" -v new="$new" '
+    !done && !inrange && index($0, start) { inrange = 1 }
+    inrange {
+      if ($0 == end) { print new; inrange = 0; done = 1 }
+      next
+    }
+    { print }
+  ' "$path" > "$path.tmp"
+  mv "$path.tmp" "$path"
+  echo "  ~ $file: $marker"
+}
+
+# --- Interrupt matrix: re-evaluate on mapping changes ------------------------
+#
+# The matrix model forwards a source's level to a CPU interrupt only when the
+# *source* toggles. Real hardware is combinational in both inputs: the level
+# and the mapping. Nothing re-drives the CPU line when firmware repoints a
+# source that is already asserted.
+#
+# ESP-IDF depends on exactly that. esp_intr_disable does not mask the CPU
+# interrupt; for a non-shared source it rewrites the matrix entry to
+# INT_MUX_DISABLED_INTNO (6, the same value the matrix resets to). spi_master
+# leans on it deliberately -- from its own header comment: "If SPI is done
+# transmitting/receiving but nothing is in the queue, it will not clear the
+# SPI interrupt but just disable it by esp_intr_disable. This way, when a new
+# thing is sent, pushing the packet into the send queue and re-enabling the
+# interrupt (by esp_intr_enable) will trigger the interrupt again."
+#
+# So the wakeup for a queued SPI transaction is a *mapping* write against a
+# peripheral line that has been held high since the previous transfer. Drop it
+# and the first spi_device_transmit after any polling traffic never starts:
+# the task blocks on its semaphore forever. Observed during SD card init --
+# the peripheral held IRQ high, INTENABLE had the mapped bit set, and the
+# CPU's INTERRUPT register never saw it.
+#
+# Recomputing means a CPU interrupt is now the OR of every source mapped to
+# it, which is also what the hardware does and what shared interrupts need.
+
+replace_once "include/hw/xtensa/esp32s3_intc.h" \
+  "    uint8_t irq_map[ESP32S3_CPU_COUNT][ESP32S3_INT_MATRIX_INPUTS];" \
+  "    uint8_t irq_map[ESP32S3_CPU_COUNT][ESP32S3_INT_MATRIX_INPUTS];
+    /* Last level driven by each source, so a mapping change can re-apply it. */
+    bool source_level[ESP32S3_INT_MATRIX_INPUTS];
+    /* Bitmask of CPU interrupts currently asserted, to skip no-op updates. */
+    uint32_t driven[ESP32S3_CPU_COUNT];" \
+  'bool source_level[ESP32S3_INT_MATRIX_INPUTS];'
+
+replace_range "hw/xtensa/esp32s3_intc.c" \
+  "static void esp32s3_intmatrix_irq_handler(void *opaque, int n, int level)" \
+  "}" \
+  '/*
+ * Drive every CPU interrupt from the current source levels and mappings.
+ *
+ * Recomputed wholesale rather than tracking deltas: a single source can be
+ * remapped, and several sources can share one CPU interrupt, so the only
+ * consistent answer is the OR over all of them.
+ */
+static void esp32s3_intmatrix_refresh(Esp32s3IntMatrixState *s)
+{
+    for (int cpu = 0; cpu < ESP32S3_CPU_COUNT; ++cpu) {
+        if (s->outputs[cpu] == NULL) {
+            continue;
+        }
+
+        uint32_t pending = 0;
+        for (int src = 0; src < ESP32S3_INT_MATRIX_INPUTS; ++src) {
+            if (s->source_level[src]) {
+                pending |= 1u << (IRQ_MAP(cpu, src) & 0x1f);
+            }
+        }
+
+        if (pending == s->driven[cpu]) {
+            continue;
+        }
+
+        const uint32_t changed = pending ^ s->driven[cpu];
+        for (int i = 0; i < s->cpu[cpu]->env.config->nextint; ++i) {
+            const unsigned out = s->cpu[cpu]->env.config->extint[i] & 0x1f;
+            if (changed & (1u << out)) {
+                qemu_set_irq(s->outputs[cpu][i], (pending >> out) & 1);
+            }
+        }
+        s->driven[cpu] = pending;
+    }
+}
+
+static void esp32s3_intmatrix_irq_handler(void *opaque, int n, int level)
+{
+    Esp32s3IntMatrixState *s = ESP32S3_INTMATRIX(opaque);
+
+    if (n < 0 || n >= ESP32S3_INT_MATRIX_INPUTS) {
+        return;
+    }
+    s->source_level[n] = level != 0;
+    esp32s3_intmatrix_refresh(s);
+}' \
+  'esp32s3_intmatrix_refresh'
+
+# The write that makes the above matter: repointing a source must re-drive it.
+replace_once "hw/xtensa/esp32s3_intc.c" \
+  "        *map_entry = value & 0x1f;" \
+  "        const uint8_t previous = *map_entry;
+        *map_entry = value & 0x1f;
+        if (*map_entry != previous) {
+            esp32s3_intmatrix_refresh(s);
+        }" \
+  'if (*map_entry != previous) {'
+
+replace_once "hw/xtensa/esp32s3_intc.c" \
+  "    memset(s->irq_map, INTMATRIX_UNINT_VALUE, sizeof(s->irq_map));" \
+  "    memset(s->irq_map, INTMATRIX_UNINT_VALUE, sizeof(s->irq_map));
+    memset(s->source_level, 0, sizeof(s->source_level));
+    memset(s->driven, 0, sizeof(s->driven));" \
+  'memset(s->source_level, 0, sizeof(s->source_level));'
+
+# --- GDMA channel matching --------------------------------------------------
+#
+# Two bugs in the vendored GDMA model that only bite a peripheral whose trigger
+# id is zero -- which SPI2's is -- and which together hand out a channel that
+# nobody ever programmed.
+#
+# Measured on hardware: an unbound channel's PERI_SEL reads 0x3F, not 0. The
+# model memsets channel state to zero on reset, so every unbound channel claims
+# to be bound to trigger 0, i.e. SPI2.
+#
+# And the lookup asks for "peripheral matches OR started", where its own comment
+# says the channel "must be marked as 'started' too" -- an AND. With OR, the
+# first zeroed channel matches before the real one is ever considered.
+#
+# Together: a confident match on an unprogrammed channel whose descriptor
+# address is zero, so the engine chases a descriptor at address 0. That is the
+# flood of invalid reads at 0x0/0x4/0x8 seen during SD init, two per transfer,
+# while the transfer still reports success.
+
+replace_once "hw/dma/esp_gdma.c" \
+  "            esp_gdma_reset_fifo(config);" \
+  "            esp_gdma_reset_fifo(config);
+            /* Unbound reads as 0x3F on silicon; zero would mean \"SPI2\". */
+            config->peripheral = R_GDMA_PERI_SEL_PERI_SEL_MASK;" \
+  'config->peripheral = R_GDMA_PERI_SEL_PERI_SEL_MASK;'
+
+replace_once "hw/dma/esp_gdma.c" \
+  "GDMA_PERI_SEL, PERI_SEL) == periph ||" \
+  "GDMA_PERI_SEL, PERI_SEL) == periph &&" \
+  'PERI_SEL) == periph &&'
+
+# The same lookup reads the START bit through the OUT_LINK macro whichever
+# direction it was asked about. Its comment says "IN/OUT PERI registers have
+# the same organization, can use any macro" -- true of PERI_SEL, not of LINK:
+#
+#   IN_LINK:   ADDR[19:0] AUTO_RET(20) STOP(21) START(22) RESTART(23) PARK(24)
+#   OUT_LINK:  ADDR[19:0]              STOP(20) START(21) RESTART(22) PARK(23)
+#
+# So on an RX channel it tests bit 21, which is INLINK_STOP. A started RX
+# channel reads 0 there and is skipped; a stopped one matches. Harmless while
+# the condition was an OR -- the peripheral half matched everything anyway --
+# and load-bearing the moment it became an AND.
+
+replace_once "hw/dma/esp_gdma.c" \
+  "             FIELD_EX32(s->ch_conf[dir][i].link, GDMA_OUT_LINK, START)) {" \
+  "             (dir == ESP_GDMA_IN_IDX
+              ? FIELD_EX32(s->ch_conf[dir][i].link, GDMA_IN_LINK, START)
+              : FIELD_EX32(s->ch_conf[dir][i].link, GDMA_OUT_LINK, START))) {" \
+  'GDMA_IN_LINK, START)'
+
 # --- USB Serial/JTAG console ------------------------------------------------
 #
 # The stock device is a stub: reads return zero, writes are dropped. Firmware

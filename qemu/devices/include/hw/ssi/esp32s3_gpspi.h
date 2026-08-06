@@ -152,11 +152,12 @@ typedef struct Esp32s3GpspiState {
     bool busy;
 
     /*
-     * Deasserting the interrupt line lags the register write that causes it.
-     * Measured: the ISR re-enters exactly twice, because masking ENA does not
-     * drop the line before the CPU takes the interrupt again.
+     * Whether the interrupt line is currently asserted. Tracked so the line is
+     * driven on transitions only, and held for as long as a masked status bit
+     * is set: ESP-IDF re-enables a queued SPI transaction by repointing the
+     * interrupt matrix at a line the peripheral has been holding high since
+     * the previous transfer.
      */
-    QEMUBH *deassert_bh;
     bool line_high;
 
     /*

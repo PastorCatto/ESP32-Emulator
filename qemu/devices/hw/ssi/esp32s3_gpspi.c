@@ -7,9 +7,10 @@
  * bookkeeping that follows starting a transaction -- a race that cannot
  * happen on hardware, where a transfer always takes microseconds.
  *
- * DMA is not modelled. Drivers fall back to the W0..W15 buffer for transfers
- * up to 64 bytes, which covers control traffic; a DMA-only path is logged
- * rather than silently doing nothing.
+ * Transfers longer than the 64-byte W0..W15 buffer go through the GDMA engine,
+ * which is how a display driver pushes a framebuffer. Which path a transfer
+ * takes is decided per transaction, not from the DMA_CONF enables alone --
+ * see esp32s3_gpspi_dma_active().
  *
  * Several behaviours here are measured against a real T-Deck Plus rather than
  * inferred from the TRM, via the PURR OS hardware probe: the clock gate, the
@@ -32,7 +33,7 @@
 
 static uint64_t esp32s3_gpspi_duration_ns(Esp32s3GpspiState *s, unsigned bytes);
 static void esp32s3_gpspi_done(void *opaque);
-static void esp32s3_gpspi_deassert(void *opaque);
+
 
 /*
  * Recompute masked status and drive the interrupt line.
@@ -60,40 +61,39 @@ static void esp32s3_gpspi_update_irq(Esp32s3GpspiState *s)
          */
         if (!s->line_high) {
             s->line_high = true;
+            qemu_log_mask(LOG_UNIMP, "gpspi: irq raise raw=%08x ena=%08x\n",
+                          s->regs[R_GPSPI_DMA_INT_RAW],
+                          s->regs[R_GPSPI_DMA_INT_ENA]);
             qemu_irq_raise(s->irq);
         }
         return;
     }
 
     /*
-     * Rule 5: hold the line rather than dropping it here, so the CPU takes the
-     * interrupt once more. Dropping it synchronously gives one ISR entry where
-     * hardware gives two.
+     * Drop synchronously. This used to be held off by a bottom half so the CPU
+     * would take the interrupt one extra time, because the probe's `intfire`
+     * counts two ISR entries on silicon against one here.
      *
-     * A bottom half, not a timer. A virtual-clock delay is unusable for this:
-     * without icount the CPU runs an unbounded number of instructions between
-     * timer checks, so any window long enough to guarantee one re-entry also
-     * admits thousands. Measured with the probe's `intfire`, a 1us hold gave
-     * count=1862 against hardware's 2. A bottom half runs at the next main
-     * loop iteration, which bounds the re-entry to roughly the one that
-     * hardware exhibits.
+     * That hold is wrong, and ESP-IDF says so directly. spi_intr() opens with
+     *
+     *     assert(spi_hal_usr_is_done(&host->hal));
+     *
+     * and its first action on a queued transaction is spi_hal_setup_trans(),
+     * which writes SPI_DMA_INT_CLR to clear trans_done. Holding the line past
+     * that write re-enters the ISR with the bit already clear and trips the
+     * assert -- which is a boot loop, not a subtle timing artefact. Since IDF
+     * ships that assert enabled, hardware cannot be re-entering here either,
+     * so `intfire`'s second entry comes from something specific to how the
+     * probe raises and acknowledges its own interrupt, not from a general
+     * deassert delay. Worth re-measuring against the probe.
      */
     if (s->line_high) {
-        qemu_bh_schedule(s->deassert_bh);
-    }
-}
-
-/* The held-off deassert from rule 5 finally landing. */
-static void esp32s3_gpspi_deassert(void *opaque)
-{
-    Esp32s3GpspiState *s = ESP32S3_GPSPI(opaque);
-
-    /* Re-check: the condition may have come back during the hold window. */
-    if (s->regs[R_GPSPI_DMA_INT_ST] == 0 && s->line_high) {
         s->line_high = false;
+        qemu_log_mask(LOG_UNIMP, "gpspi: irq lower\n");
         qemu_irq_lower(s->irq);
     }
 }
+
 
 /* Which chip select is asserted, or -1 when the driver has selected none. */
 static int esp32s3_gpspi_active_cs(Esp32s3GpspiState *s)
@@ -556,7 +556,6 @@ static void esp32s3_gpspi_init(Object *obj)
                              ESP32S3_GPSPI_CS_COUNT);
 
     s->done_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, esp32s3_gpspi_done, s);
-    s->deassert_bh = qemu_bh_new(esp32s3_gpspi_deassert, s);
 
     /* No data/command pin known until a board wires one. */
     s->dc_level = -1;

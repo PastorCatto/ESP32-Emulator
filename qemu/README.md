@@ -208,6 +208,83 @@ changing installed packages, but that is a different problem.)
 fails confusingly. `build.sh --clean` moves the directory aside instead of
 insisting on deleting it.
 
+## Running a build
+
+```sh
+scripts/run-emu.sh <flash.bin> [seconds] [sd.img]
+```
+
+It starts the vpb peripheral server when given an image, wires the SPI
+controllers to it, and leaves `serial.log`, `vpb.log` and `qemu.log` in a
+temporary directory whose path it prints. `QEMU_DEBUG=unimp,guest_errors`
+passes through to `-d`, which is how the device models' own traces surface.
+
+Four settings are not optional and each one fails in its own way:
+
+| Setting | Why |
+| --- | --- |
+| `-m 8M` | the machine turns `-m` into the size of the PSRAM chip on spi1, not host memory |
+| `-global ssi_psram.is_octal=true` | the S3 machine never sets it, so it defaults to quad; every `-R8` module is octal and IDF's octal driver rejects a quad chip |
+| `strap_mode=0x04` | `ESP32S3_STRAP_MODE_FLASH_BOOT`. The ESP32 value (`0x12`) and the S3 UART value both land in download mode |
+| `-L vendor/qemu/share/qemu` | where `esp32s3_rev0_rom.bin` lives; without it the ROM is "not found" |
+
+`scripts/sample-pc.sh` samples both cores' registers over the QEMU monitor
+after a settle delay, for finding where a hung boot is parked. `MON_EXTRA`
+runs extra monitor commands once — reading interrupt matrix mappings with
+`xp /1wx` is what identified the bug below.
+
+## Bugs fixed in the vendored tree
+
+Three defects in Espressif's own models, all patched through `apply.sh` so
+they survive re-vendoring. They shared a symptom — SD card init hanging, which
+in turn held the SPI bus lock and stopped the display from ever initialising.
+
+**1. `esp_gdma_get_channel_periph` matched channels nobody programmed.** The
+lookup reads `peripheral == periph || started` where its own comment says the
+channel "must be marked as 'started' too". Separately, channel state is
+`memset` to zero on reset, but an unbound `PERI_SEL` reads `0x3F` on silicon,
+not `0`. Zero is SPI2's trigger id, so every unbound channel claimed to be
+bound to SPI2, and the OR handed one back before the real channel was
+considered. The transfer then chased a descriptor at address 0 — a flood of
+rejected reads at `0x0/0x4/0x8`, two per transfer, while reporting success.
+
+**2. The same lookup read the wrong START bit.** `IN_LINK` and `OUT_LINK` do
+not share a layout:
+
+```
+IN_LINK:   ADDR[19:0] AUTO_RET(20) STOP(21) START(22) RESTART(23) PARK(24)
+OUT_LINK:  ADDR[19:0]              STOP(20) START(21) RESTART(22) PARK(23)
+```
+
+It used the `OUT_LINK` macro for both directions, so on an RX channel it
+tested `INLINK_STOP`. Harmless while the condition was an OR; load-bearing the
+moment it became an AND.
+
+**3. The interrupt matrix ignored mapping changes.** It forwarded a source's
+level to a CPU interrupt only when the *source* toggled. Hardware is
+combinational in both inputs, and ESP-IDF depends on that: `esp_intr_disable`
+does not mask the CPU interrupt, it rewrites the matrix entry to
+`INT_MUX_DISABLED_INTNO` (6). From `spi_master.c`'s own header comment:
+
+> If SPI is done transmitting/receiving but nothing is in the queue, it will
+> not clear the SPI interrupt but just disable it by `esp_intr_disable`. This
+> way, when a new thing is sent, pushing the packet into the send queue and
+> re-enabling the interrupt (by `esp_intr_enable`) will trigger the interrupt
+> again.
+
+So the wakeup for a queued transaction is a *mapping* write against a line the
+peripheral has held high since the previous transfer. Dropping it meant the
+first `spi_device_transmit` after any polling traffic never started. This is
+what `sdspi` does to read a CID or a data block, so SD init stopped dead after
+CMD10 with the task blocked on its semaphore forever.
+
+The symptom was unambiguous once measured: the peripheral held IRQ high,
+`INTENABLE` had bit 9 set, the matrix mapped SPI2 to 9 — and the CPU's
+`INTERRUPT` register never saw it.
+
+The fix recomputes each CPU interrupt as the OR of every source mapped to it,
+which is also what shared interrupts need.
+
 ## Adding another device model
 
 1. Write `devices/hw/<subsystem>/<name>.c` and
