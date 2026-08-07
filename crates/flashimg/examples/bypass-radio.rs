@@ -40,7 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Two of the entry points are ten-byte wrappers with no distinctive
         // shape. Dropping them is honest; matching them by guess is not.
         let before = patches.len();
-        patches.retain(|p| flashimg::signatures::find(&p.symbol).is_some());
+        patches.retain(|p| flashimg::signatures::has(&p.symbol));
         if patches.len() != before {
             eprintln!(
                 "note: {} of {before} targets have no usable signature and are left alone",

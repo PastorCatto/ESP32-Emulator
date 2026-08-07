@@ -340,7 +340,7 @@ impl Session {
             None => {
                 // Not every entry point has a signature worth trusting; the
                 // ones that do not are left alone rather than guessed at.
-                patches.retain(|p| flashimg::signatures::find(&p.symbol).is_some());
+                patches.retain(|p| flashimg::signatures::has(&p.symbol));
                 flashimg::patch::Patcher::from_signatures(&flash, APP_OFFSET)?
             }
         };

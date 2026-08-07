@@ -216,12 +216,13 @@ impl<'a> Patcher<'a> {
             return Ok((offset, symbol.address, symbol.size as usize, Located::Symbol));
         }
 
-        let signature = crate::signatures::find(&patch.symbol).ok_or_else(|| {
-            Error::Unpatchable(format!(
+        let candidates = crate::signatures::candidates(&patch.symbol);
+        if candidates.is_empty() {
+            return Err(Error::Unpatchable(format!(
                 "{} has no byte signature, and the firmware shipped no .elf",
                 patch.symbol
-            ))
-        })?;
+            )));
+        }
         // Search the app image only. The rest of flash holds the bootloader,
         // NVS and whatever the filesystem contains, and a chance match out
         // there would be a patch written somewhere meaningless.
@@ -229,12 +230,40 @@ impl<'a> Patcher<'a> {
         let region = flash.get(self.app_offset..end).ok_or_else(|| {
             Error::Unpatchable("the app image runs past the end of the flash image".into())
         })?;
-        let at = signature
-            .find_unique(region)
-            .map_err(|e| Error::Unpatchable(e.to_string()))?;
+
+        // Try every variant. Two variants agreeing on a location is fine and
+        // expected -- near-identical builds -- but two pointing *elsewhere*
+        // means we cannot say which is the function, and a wrong guess writes
+        // a stub over unrelated code.
+        let mut found: Vec<(usize, usize)> = Vec::new();
+        for (signature, _source) in &candidates {
+            for at in signature.scan(region) {
+                if !found.iter().any(|(o, _)| *o == at) {
+                    found.push((at, signature.len()));
+                }
+            }
+        }
+        let (at, size) = match found.len() {
+            0 => {
+                return Err(Error::Unpatchable(format!(
+                    "no byte signature matched {} ({} variant(s) tried); \
+                     this build is probably a different IDF version",
+                    patch.symbol,
+                    candidates.len()
+                )))
+            }
+            1 => found[0],
+            _ => {
+                return Err(Error::Unpatchable(format!(
+                    "{} matched {} different places; refusing to guess",
+                    patch.symbol,
+                    found.len()
+                )))
+            }
+        };
         let offset = self.app_offset + at;
         let address = self.vaddr_at(offset).unwrap_or(0);
-        Ok((offset, address, signature.len(), Located::Signature))
+        Ok((offset, address, size, Located::Signature))
     }
 
     /// Apply patches in place, then repair the image trailer.
@@ -327,15 +356,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_table_carries_several_compilations_of_the_same_function() {
+        // The point of variants: one project's build is not every build. If
+        // this collapses to one entry per symbol, coverage has been lost.
+        let phy = crate::signatures::candidates("esp_phy_enable");
+        assert!(phy.len() >= 3, "only {} variants of esp_phy_enable", phy.len());
+
+        // And they must genuinely differ -- three copies of one compilation
+        // would look like coverage while providing none.
+        let lengths: std::collections::BTreeSet<usize> =
+            phy.iter().map(|(s, _)| s.len()).collect();
+        assert!(lengths.len() >= 3, "variants are all the same size: {lengths:?}");
+
+        // Every variant says where it came from.
+        for (_, source) in &phy {
+            assert!(!source.is_empty());
+        }
+    }
+
+    #[test]
     fn every_shipped_signature_is_specific_enough_to_be_worth_having() {
         // A signature that pins only a handful of bits will match all over a
         // megabyte of firmware. The two entry points that failed this are not
         // shipped at all, so anything in the table should clear it easily.
-        for sig in crate::signatures::radio_bypass() {
+        for variant in crate::signatures::VARIANTS {
+            let (sig, source) = crate::signatures::candidates(variant.symbol)
+                .into_iter()
+                .find(|(_, s)| *s == variant.source)
+                .expect("every listed variant is a candidate for its own symbol");
             let bits = (sig.len() * 8) as u32;
             assert!(
                 sig.pinned_bits() >= 128,
-                "{} pins only {} of {bits} bits",
+                "{} [{source}] pins only {} of {bits} bits",
                 sig.name,
                 sig.pinned_bits()
             );
@@ -347,9 +399,9 @@ mod tests {
         // esp_wifi_connect and esp_wifi_disconnect compile to ten bytes and
         // matched six places each. Shipping them would patch the wrong code
         // five times out of six.
-        assert!(crate::signatures::find("esp_wifi_connect").is_none());
-        assert!(crate::signatures::find("esp_wifi_disconnect").is_none());
-        assert!(crate::signatures::find("esp_phy_enable").is_some());
+        assert!(!crate::signatures::has("esp_wifi_connect"));
+        assert!(!crate::signatures::has("esp_wifi_disconnect"));
+        assert!(crate::signatures::has("esp_phy_enable"));
     }
 
     #[test]
