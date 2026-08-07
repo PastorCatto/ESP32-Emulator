@@ -120,10 +120,6 @@ static void esp32s3_i2c_run(Esp32s3I2CState *s)
         unsigned opcode = FIELD_EX32(cmd, I2C_COMD, OPCODE);
 
         s->cmd[i] = FIELD_DP32(cmd, I2C_COMD, DONE, 1);
-        qemu_log_mask(LOG_UNIMP, "i2c%u: cmd%u op=%u n=%u addr=%02x pend=%u\n",
-                      s->vpb_controller, i, opcode,
-                      FIELD_EX32(cmd, I2C_COMD, BYTE_NUM), s->address,
-                      s->pending_len);
 
         switch (opcode) {
         case I2C_OPCODE_RSTART:
@@ -222,9 +218,6 @@ static void esp32s3_i2c_write_reg(void *opaque, hwaddr addr, uint64_t value,
 {
     Esp32s3I2CState *s = ESP32S3_I2C(opaque);
     unsigned index = addr / sizeof(uint32_t);
-
-    qemu_log_mask(LOG_UNIMP, "i2c%u: W %03x = %08x\n", s->vpb_controller,
-                  (unsigned)addr, (uint32_t)value);
 
     if (addr >= A_I2C_COMD &&
         addr < A_I2C_COMD + ESP32S3_I2C_CMD_COUNT * sizeof(uint32_t)) {
