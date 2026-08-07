@@ -20,6 +20,7 @@
 
 pub mod input;
 pub mod registry;
+pub mod server;
 pub mod trace;
 pub mod wire;
 

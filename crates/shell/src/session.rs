@@ -3,7 +3,9 @@
 //!
 //! Kept free of any UI types so the boot path can be tested on its own.
 
+use crate::hardware::{self, Hardware};
 use boards::Board;
+use devices::st7789::ScreenHandle;
 use flashimg::{Chip, Dropped, FlashImage, FlashSize};
 use qemuctl::{Instance, LaunchConfig, Qemu};
 use std::path::{Path, PathBuf};
@@ -110,6 +112,10 @@ pub struct Session {
     pub flash_path: Option<PathBuf>,
     pub instance: Option<Instance>,
     pub serial: SerialBuffer,
+    /// Disk image backing the SD card, when one has been dropped in.
+    pub sd_image: Option<PathBuf>,
+    /// The device models and the bus server, alive only while running.
+    pub hardware: Option<Hardware>,
 }
 
 impl Session {
@@ -120,7 +126,14 @@ impl Session {
             flash_path: None,
             instance: None,
             serial: SerialBuffer::default(),
+            sd_image: None,
+            hardware: None,
         }
+    }
+
+    /// The live display, if the board has a panel this build can model.
+    pub fn screen(&self) -> Option<&ScreenHandle> {
+        self.hardware.as_ref().and_then(|h| h.screen.as_ref())
     }
 
     pub fn is_running(&mut self) -> bool {
@@ -200,10 +213,18 @@ impl Session {
         self.stop();
         self.serial.clear();
 
+        // Devices first: the emulator connects on startup and does not retry,
+        // so the server has to be listening before QEMU exists.
+        let hardware = hardware::start(&self.board, self.sd_image.clone())?;
+
         let qemu = Qemu::locate(chip)?;
         let mut config = LaunchConfig::new(chip, &flash);
         config.psram = self.board.qemu_psram();
+        config.vpb_port = Some(hardware.port);
+        config.display_dc_gpio = self.board.display_dc_gpio();
+
         self.instance = Some(Instance::spawn(&qemu, &config)?);
+        self.hardware = Some(hardware);
         Ok(())
     }
 
@@ -211,6 +232,9 @@ impl Session {
         if let Some(mut inst) = self.instance.take() {
             inst.shutdown();
         }
+        // After the emulator, so the last transactions are still answered
+        // while it shuts down rather than blocking on a server that is gone.
+        self.hardware = None;
     }
 
     /// Pull any new serial output into the buffer. Call once per frame.

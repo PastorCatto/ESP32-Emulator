@@ -132,9 +132,22 @@ impl PeripheralSpec {
             return Ok(None);
         };
         Ok(match self.bus_kind {
+            // `cs` is the GPIO the chip select comes out on, which is what a
+            // schematic gives you and what the emulated SoC needs for pin
+            // routing. The *bus* routes on the controller's CS line index,
+            // 0..5, which is a different number: the driver allocates it at
+            // runtime through the GPIO matrix. On a T-Deck the display is
+            // GPIO 12 on line 0, and the SD card GPIO 39 on line 5.
+            //
+            // So a board file gives both, and `cs_line` is the one that
+            // decides which device answers. Falling back to `cs` keeps older
+            // files loading, and is right only where the two coincide.
             Some(BusKind::Spi) => Some(Claim::Spi {
                 controller,
-                cs: self.params.u8("cs").map_err(err)?,
+                cs: match self.params.opt_u8("cs_line").map_err(err)? {
+                    Some(line) => line,
+                    None => self.params.u8("cs").map_err(err)?,
+                },
             }),
             Some(BusKind::I2c) => Some(Claim::I2c {
                 controller,
@@ -363,6 +376,23 @@ impl Board {
         })
     }
 
+    /// The GPIO carrying the display's data/command line.
+    ///
+    /// Needed by the emulated SPI controller, not by the display model: the
+    /// level has to be sampled where the transfer starts and sent along with
+    /// it, because by the time the bytes reach a device model the pin has
+    /// already moved on.
+    ///
+    /// The first display panel that declares one wins. Boards with two panels
+    /// on separate controllers exist, but nothing here handles them yet, and
+    /// silently picking one is better than refusing to show either.
+    pub fn display_dc_gpio(&self) -> Option<u8> {
+        self.peripherals
+            .iter()
+            .filter(|p| p.enabled)
+            .find_map(|p| p.params.opt_u8("dc").ok().flatten())
+    }
+
     pub fn bus(&self, id: &str) -> Option<&Bus> {
         self.buses.iter().find(|b| b.id == id)
     }
@@ -408,9 +438,16 @@ mod tests {
         let b = Board::from_toml(T_DECK).unwrap();
         // Display, SD, and LoRa share one bus and differ only by chip select;
         // getting this wrong is the classic T-Deck emulation bug.
+        //
+        // A claim routes on the controller's CS line, not the GPIO the line
+        // comes out on. Those are different numbers -- the display is GPIO 12
+        // on line 0 -- and matching against the GPIO means no device ever
+        // answers, which looks exactly like a bus that is not working.
         let claims: HashMap<String, Claim> = b.claims().unwrap().into_iter().collect();
-        assert_eq!(claims["st7789"], Claim::Spi { controller: 2, cs: 12 });
-        assert_eq!(claims["sdcard"], Claim::Spi { controller: 2, cs: 39 });
+        assert_eq!(claims["st7789"], Claim::Spi { controller: 2, cs: 0 });
+        assert_eq!(claims["sdcard"], Claim::Spi { controller: 2, cs: 5 });
+        // No `cs_line` recorded for the radio yet, so this still falls back to
+        // its GPIO -- and will not match the bus until it is measured.
         assert_eq!(claims["sx1262"], Claim::Spi { controller: 2, cs: 9 });
     }
 

@@ -47,6 +47,10 @@ kind = "st7789"
 label = "2.8in LCD"
 bus = "fspi"
 cs = 12
+# The controller's CS line, not the GPIO. ESP-IDF allocates these at runtime
+# through the GPIO matrix, so they are not derivable from the schematic --
+# these come from a bus trace of the real driver.
+cs_line = 0
 dc = 11
 backlight = 42
 width = 320
@@ -89,6 +93,7 @@ kind = "sdcard"
 label = "microSD"
 bus = "fspi"
 cs = 39
+cs_line = 5
 
 [[peripheral]]
 kind = "sx1262"

@@ -84,14 +84,32 @@ Everything attached to a bus.
 kind = "st7789"
 label = "2.8in LCD"     # shown in the UI; defaults to kind
 bus = "fspi"            # a [[bus]] id
-cs = 12                 # chip select, for SPI
-dc = 11
+cs = 12                 # GPIO the chip select comes out on
+cs_line = 0             # the controller's CS index — see below
+dc = 11                 # data/command; without it a display cannot be decoded
 backlight = 42
 width = 320
 height = 240
 rotation = 90
+invert = true           # the glass is wired inverted, not the register
 enabled = true          # default true
 ```
+
+### `cs` and `cs_line` are different numbers
+
+`cs` is the pin, which is what a schematic gives you and what the emulated SoC
+needs for routing. `cs_line` is the chip-select line the SPI controller
+drives, 0..5, and that is what decides which device answers a transaction.
+
+They rarely match. ESP-IDF assigns the line at runtime through the GPIO
+matrix, so it cannot be worked out from the board: on a T-Deck the display is
+GPIO 12 on line 0, and the SD card GPIO 39 on line 5. The values in `boards/`
+were read off a bus trace of the real driver.
+
+Leaving `cs_line` out falls back to `cs`, which keeps older files loading and
+is correct only where the two happen to coincide. If a device never answers,
+this is the first thing to check — turn the SPI tracer on and see which line
+the traffic is actually arriving at.
 
 For I²C, use `address` and optionally `alt_address` — several controllers are
 strapped to one of two addresses, and the GT911 is one:

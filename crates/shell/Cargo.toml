@@ -16,6 +16,7 @@ flashimg = { path = "../flashimg" }
 boards = { path = "../boards" }
 qemuctl = { path = "../qemuctl" }
 vpb = { path = "../vpb" }
+devices = { path = "../devices" }
 eframe = { version = "0.35", default-features = false, features = [
     "default_fonts",
     "glow",

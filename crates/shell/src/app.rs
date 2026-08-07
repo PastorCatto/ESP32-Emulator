@@ -1,6 +1,7 @@
 //! The emulator window.
 
 use crate::session::{classify, DropKind, Session, SessionError};
+use crate::screen::ScreenView;
 use crate::terminal::Terminal;
 use boards::Board;
 use egui::{Color32, RichText};
@@ -16,6 +17,10 @@ const BUILTIN_BOARDS: &[(&str, &str)] = &[
     ("cyd-s028r", include_str!("../../../boards/cyd-s028r.toml")),
     ("generic-esp32s3", include_str!("../../../boards/generic-esp32s3.toml")),
 ];
+
+/// Bus trace lines kept in memory. A single framebuffer push is thousands of
+/// transactions, so this is a tail, not a log.
+const BUS_LOG_LIMIT: usize = 5000;
 
 const GENERIC: &str = include_str!("../../../boards/generic-esp32s3.toml");
 
@@ -38,6 +43,9 @@ pub struct App {
     run_dir: PathBuf,
     autoscroll: bool,
     terminal: Terminal,
+    screen_view: ScreenView,
+    /// Recent bus traffic, when the tracer is on.
+    bus_log: Vec<String>,
 }
 
 impl App {
@@ -72,6 +80,8 @@ impl App {
             run_dir: std::env::current_dir().unwrap_or_default().join("run"),
             autoscroll: true,
             terminal: Terminal::default(),
+            screen_view: ScreenView::default(),
+            bus_log: Vec::new(),
         }
     }
 
@@ -107,10 +117,7 @@ impl App {
         match classify(path, &head) {
             DropKind::Firmware => self.load_firmware(path),
             DropKind::BoardDefinition => self.load_board(path),
-            DropKind::SdCard => self.error(format!(
-                "{}: SD card images are not wired up yet (needs the SPI controller)",
-                name_of(path)
-            )),
+            DropKind::SdCard => self.load_sd_image(path),
             DropKind::Unrecognised => {
                 self.error(format!("{}: not something I recognise", name_of(path)))
             }
@@ -148,6 +155,25 @@ impl App {
         }
     }
 
+    /// Attach a disk image as the SD card.
+    ///
+    /// Takes effect at the next boot: the card is a device model, and swapping
+    /// one underneath a mounted filesystem is not something the firmware would
+    /// survive on real hardware either.
+    fn load_sd_image(&mut self, path: &Path) {
+        let size = match std::fs::metadata(path) {
+            Ok(m) => m.len(),
+            Err(e) => return self.error(format!("{}: {e}", name_of(path))),
+        };
+        self.session.sd_image = Some(path.to_path_buf());
+
+        let mib = size as f64 / (1024.0 * 1024.0);
+        self.note(format!("SD card: {} ({mib:.0} MiB)", name_of(path)));
+        if self.session.is_running() {
+            self.note("Restart to insert it.");
+        }
+    }
+
     fn load_board(&mut self, path: &Path) {
         let src = match std::fs::read_to_string(path) {
             Ok(s) => s,
@@ -177,9 +203,60 @@ impl App {
 
     fn boot(&mut self) {
         match self.session.boot() {
-            Ok(()) => self.note("Booting"),
+            Ok(()) => {
+                self.note("Booting");
+                self.report_hardware();
+                // The bus server starts fresh each boot, so the tracer has to
+                // be told again what the UI is currently asking for.
+                self.apply_trace();
+            }
             Err(SessionError::Qemu(e)) => self.error(format!("Could not start QEMU: {e}")),
             Err(e) => self.error(e.to_string()),
+        }
+    }
+
+    /// Say what actually got attached, and what the board asked for that this
+    /// build has no model for. Silence there is how you end up debugging
+    /// firmware that is behaving correctly against hardware that is not here.
+    fn report_hardware(&mut self) {
+        let Some(hw) = &self.session.hardware else { return };
+        let (attached, unmodelled) = (hw.attached.join(", "), hw.unmodelled.join(", "));
+
+        if attached.is_empty() {
+            self.note("No devices attached; the buses will look empty");
+        } else {
+            self.note(format!("Attached: {attached}"));
+        }
+        if !unmodelled.is_empty() {
+            self.note(format!("Not modelled, so absent from the bus: {unmodelled}"));
+        }
+    }
+
+    fn apply_trace(&self) {
+        if let Some(hw) = &self.session.hardware {
+            hw.set_trace(self.trace);
+        }
+    }
+
+    /// Drain what the devices reported since the last frame.
+    ///
+    /// Must happen every frame whether or not anything is displayed: the
+    /// channel is unbounded, and a traced boot produces thousands of records.
+    fn drain_events(&mut self) {
+        let Some(hw) = &self.session.hardware else { return };
+        let mut lines = Vec::new();
+        for event in hw.events.try_iter() {
+            if let vpb::Event::Trace(record) = event {
+                lines.push(record.to_string());
+            }
+        }
+        for line in lines {
+            self.bus_log.push(line);
+        }
+        // Keep the tail. A framebuffer push is thousands of transactions and
+        // the interesting part is almost always the most recent.
+        if self.bus_log.len() > BUS_LOG_LIMIT {
+            self.bus_log.drain(..self.bus_log.len() - BUS_LOG_LIMIT);
         }
     }
 }
@@ -201,6 +278,7 @@ impl eframe::App for App {
         }
 
         self.session.pump();
+        self.drain_events();
         let running = self.session.is_running();
         if running {
             // Serial arrives asynchronously, so drive repaints rather than
@@ -211,6 +289,7 @@ impl eframe::App for App {
         self.top_bar(ui, running);
         self.status_bar(ui);
         self.side_panel(ui);
+        self.display_panel(ui);
         self.serial_console(ui);
         self.draw_drop_overlay(&ctx);
 
@@ -324,13 +403,29 @@ impl App {
                 if self.session.board.peripherals.is_empty() {
                     ui.label(RichText::new("This board declares no peripherals.").italics().weak());
                 }
+                // Which of these are real is only known once a bus is running,
+                // because it depends on what models this build carries and on
+                // whether an SD image was supplied. Before that, say nothing
+                // rather than guess.
+                let attached: Vec<&str> = self
+                    .session
+                    .hardware
+                    .as_ref()
+                    .map(|h| h.attached.iter().map(String::as_str).collect())
+                    .unwrap_or_default();
+                let running = self.session.hardware.is_some();
+
                 for (i, p) in self.session.board.peripherals.iter().enumerate() {
                     if let Some(on) = self.device_enabled.get_mut(i) {
                         ui.horizontal(|ui| {
                             ui.checkbox(on, p.display_name());
-                            // Be honest: the buses these hang off do not exist
-                            // in QEMU yet, so nothing here is driving hardware.
-                            ui.label(RichText::new("no driver").small().weak());
+                            if running {
+                                if attached.contains(&p.kind.as_str()) {
+                                    ui.label(RichText::new("on the bus").small().weak());
+                                } else {
+                                    ui.label(RichText::new("not modelled").small().weak());
+                                }
+                            }
                         });
                     }
                 }
@@ -342,15 +437,30 @@ impl App {
                         .small()
                         .weak(),
                 );
-                ui.checkbox(&mut self.trace.i2c, "I²C");
-                ui.checkbox(&mut self.trace.spi, "SPI");
-                ui.checkbox(&mut self.trace.uart, "UART");
-                ui.checkbox(&mut self.trace.gpio, "GPIO");
-                ui.checkbox(&mut self.trace.decode, "Decode commands");
-                ui.add(
-                    egui::Slider::new(&mut self.trace.max_bytes, 8..=512)
-                        .text("max bytes")
-                        .logarithmic(true),
+                let mut changed = false;
+                changed |= ui.checkbox(&mut self.trace.i2c, "I²C").changed();
+                changed |= ui.checkbox(&mut self.trace.spi, "SPI").changed();
+                changed |= ui.checkbox(&mut self.trace.uart, "UART").changed();
+                changed |= ui.checkbox(&mut self.trace.gpio, "GPIO").changed();
+                changed |= ui.checkbox(&mut self.trace.decode, "Decode commands").changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.trace.max_bytes, 8..=512)
+                            .text("max bytes")
+                            .logarithmic(true),
+                    )
+                    .changed();
+                if changed {
+                    // The registry lives on the bus thread, so this is handed
+                    // over and applied between transactions.
+                    if let Some(hw) = &self.session.hardware {
+                        hw.set_trace(self.trace);
+                    }
+                }
+                ui.label(
+                    RichText::new(format!("{} lines captured", self.bus_log.len()))
+                        .small()
+                        .weak(),
                 );
 
                 if !self.session.board.warnings.is_empty() {
@@ -374,6 +484,17 @@ impl App {
                     if ui.small_button("clear").clicked() {
                         self.notes.clear();
                     }
+                    // Whether the emulator has actually reached the peripheral
+                    // server. A boot that never connects looks identical to one
+                    // whose devices are all silent, and this tells them apart.
+                    if let Some(hw) = &self.session.hardware {
+                        let (text, colour) = if hw.is_connected() {
+                            ("bus connected", Color32::from_rgb(120, 200, 130))
+                        } else {
+                            ("bus waiting", Color32::from_rgb(230, 180, 100))
+                        };
+                        ui.label(RichText::new(text).small().color(colour));
+                    }
                 });
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
@@ -387,6 +508,29 @@ impl App {
                             }
                         }
                     });
+            });
+    }
+
+    /// The emulated panel. Absent entirely on a board with no display this
+    /// build can model, rather than showing an empty frame that looks broken.
+    fn display_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(screen) = self.session.screen().cloned() else {
+            return;
+        };
+        let (w, h) = {
+            let s = screen.lock().expect("screen");
+            (s.width, s.height)
+        };
+
+        egui::Panel::right("display")
+            .default_size(f32::from(w) + 24.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Display");
+                    ui.label(RichText::new(format!("{w}x{h}")).small().weak());
+                });
+                ui.separator();
+                self.screen_view.show(ui, &screen);
             });
     }
 

@@ -244,11 +244,27 @@ PSRAM needs *two* QEMU settings that do nothing alone: `-m 8M` for size and a
 global switching the modelled chip to octal. Without both the T-Deck calls
 `abort()` during startup and boot-loops. `scripts/run-emu.sh` sets them.
 
-Still open: the framebuffer is written to a PNG when the emulator exits rather
-than shown in a window, so there is no live screen yet. A freshly created
-`.img` has no filesystem on it, so the card initialises and then FATFS reports
-`FR_NO_FILESYSTEM`; a real card image mounts. I²C is unmodelled, so the GT911
-touch controller is not found. Wi-Fi is untouched.
+The shell drives all of that itself: it reads the board file, builds the
+device models it has, serves them on a port it picked, tells the emulator
+where to find them, and draws the panel live. `cargo run -p shell --example
+headless` runs the same path with no window, which is how it gets tested.
+
+Still open: a freshly created `.img` has no filesystem on it, so the card
+initialises and then FATFS reports `FR_NO_FILESYSTEM`; a real card image
+mounts. I²C is unmodelled, so the GT911 touch controller is not found. Nothing
+sends input to the guest yet. Wi-Fi is untouched.
+
+### Board files carry two different chip-select numbers
+
+`cs` is the GPIO the chip select comes out on, which is what a schematic gives
+you. `cs_line` is the controller's CS index, 0..5, which is what the bus
+actually routes on — and they are not the same number. On a T-Deck the display
+is GPIO 12 on line 0, and the SD card GPIO 39 on line 5.
+
+The mapping is made at runtime by ESP-IDF through the GPIO matrix, so it is
+not derivable from the board; the values in `boards/` came from a bus trace of
+the real driver. Matching against the GPIO means no device ever answers, which
+looks exactly like a bus that is not working.
 
 ### The data/command pin
 

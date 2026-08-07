@@ -238,6 +238,14 @@ pub struct LaunchConfig {
     /// Enable QEMU's own framebuffer window. Off for us: the SPI display is
     /// rendered by the shell, and a second window would only confuse.
     pub graphics: bool,
+    /// Port of the peripheral server the SPI controllers should connect to.
+    /// Without it the general-purpose SPI buses look empty, which is a
+    /// legitimate way to run.
+    pub vpb_port: Option<u16>,
+    /// GPIO carrying the display's data/command line, from the board file.
+    /// An ST7789 tells a command byte from pixel data by this pin and nothing
+    /// on the bus, so a display model cannot decode the stream without it.
+    pub display_dc_gpio: Option<u8>,
     /// Expose a QMP control socket on this TCP port.
     pub qmp_port: Option<u16>,
     /// Expose a GDB stub on this TCP port.
@@ -254,6 +262,8 @@ impl LaunchConfig {
             chip,
             flash_image: flash_image.into(),
             psram: None,
+            vpb_port: None,
+            display_dc_gpio: None,
             data_dir: None,
             graphics: false,
             qmp_port: None,
@@ -311,6 +321,24 @@ impl LaunchConfig {
             }
         }
 
+        // Both are set on the controller type rather than an instance,
+        // because there is no id to address these devices by -- the machine
+        // creates them. That means SPI2 and SPI3 get the same values, which is
+        // fine: they are told apart by the controller number in each
+        // transaction, and the machine fans the D/C line out to both.
+        if let Some(port) = self.vpb_port {
+            args.push("-global".into());
+            args.push(format!(
+                "driver=ssi.esp32s3.gpspi,property=vpb-port,value={port}"
+            ));
+        }
+        if let Some(pin) = self.display_dc_gpio {
+            args.push("-global".into());
+            args.push(format!(
+                "driver=ssi.esp32s3.gpspi,property=dc-gpio,value={pin}"
+            ));
+        }
+
         if let Some(port) = self.qmp_port {
             args.push("-qmp".into());
             args.push(format!("tcp:127.0.0.1:{port},server,nowait"));
@@ -349,6 +377,33 @@ mod tests {
 
     fn cfg() -> LaunchConfig {
         LaunchConfig::new(Chip::Esp32S3, "flash.bin")
+    }
+
+    #[test]
+    fn the_peripheral_bridge_is_set_on_both_spi_controllers() {
+        // -global matches on type name and the machine creates these devices,
+        // so there is no instance to address. Both controllers get the same
+        // values; each transaction says which one it came from.
+        let mut c = cfg();
+        c.vpb_port = Some(5559);
+        c.display_dc_gpio = Some(11);
+        let args = c.to_args().unwrap();
+
+        assert!(args.contains(
+            &"driver=ssi.esp32s3.gpspi,property=vpb-port,value=5559".to_string()
+        ));
+        assert!(args.contains(
+            &"driver=ssi.esp32s3.gpspi,property=dc-gpio,value=11".to_string()
+        ));
+    }
+
+    #[test]
+    fn no_bridge_means_no_arguments_rather_than_a_zero_port() {
+        // Port 0 is "pick one for me" to the OS, so emitting it by accident
+        // would point the emulator at nothing in particular.
+        let args = cfg().to_args().unwrap();
+        assert!(!args.iter().any(|a| a.contains("vpb-port")));
+        assert!(!args.iter().any(|a| a.contains("dc-gpio")));
     }
 
     #[test]

@@ -64,6 +64,21 @@ fn decode(&self, tx: &Transaction, _r: &Response) -> Option<String> {
 }
 ```
 
+Then add one arm to `build` in [crates/shell/src/hardware.rs](../crates/shell/src/hardware.rs),
+matching the `kind` your board file uses. That function is the only place that
+knows device names; everything above it works in terms of `dyn Peripheral`.
+
+A kind with no arm is reported as "not modelled" and left off the bus, rather
+than silently ignored — a board that lists a touchscreen the build cannot
+model should say so, not behave like a board with no touchscreen.
+
+If the UI needs to reach into your device — a display's pixels, say — hand it
+a shared handle at construction and return it alongside the boxed device.
+Recovering the concrete type from a `dyn Peripheral` afterwards would mean
+either putting `Any` on the trait, which every third-party model would then
+carry, or casting on the strength of `kind()` returning a particular string,
+which is unsound the moment two models pick the same name.
+
 ## 3. External driver
 
 **This is the interesting one.** Your driver is a separate process in any
