@@ -111,7 +111,7 @@ pub struct Session {
     pub firmware: Option<LoadedFirmware>,
     pub flash_path: Option<PathBuf>,
     pub instance: Option<Instance>,
-    pub serial: SerialBuffer,
+    pub serial: SerialLog,
     /// Disk image backing the SD card, when one has been dropped in.
     pub sd_image: Option<PathBuf>,
     /// The device models and the bus server, alive only while running.
@@ -125,7 +125,7 @@ impl Session {
             firmware: None,
             flash_path: None,
             instance: None,
-            serial: SerialBuffer::default(),
+            serial: SerialLog::default(),
             sd_image: None,
             hardware: None,
         }
@@ -222,6 +222,7 @@ impl Session {
         config.psram = self.board.qemu_psram();
         config.vpb_port = Some(hardware.port);
         config.display_dc_gpio = self.board.display_dc_gpio();
+        config.serial_count = SerialBuffer::PORTS;
 
         self.instance = Some(Instance::spawn(&qemu, &config)?);
         self.hardware = Some(hardware);
@@ -240,21 +241,81 @@ impl Session {
     /// Pull any new serial output into the buffer. Call once per frame.
     pub fn pump(&mut self) {
         if let Some(inst) = &mut self.instance {
-            let bytes = inst.read_serial();
-            if !bytes.is_empty() {
-                self.serial.push(&bytes);
+            for chunk in inst.read_serial() {
+                self.serial.push(chunk.port, &chunk.bytes);
             }
         }
     }
 
-    pub fn send_serial(&mut self, text: &str) {
+    /// Type into a serial port, as a terminal would.
+    pub fn send_serial(&mut self, port: usize, text: &str) {
         if let Some(inst) = &mut self.instance {
-            let _ = inst.write_serial(text.as_bytes());
+            let _ = inst.write_serial(port, text.as_bytes());
+        }
+    }
+
+    /// Names for the machine's serial ports, in the order it wires them.
+    pub fn serial_port_names(&self) -> &'static [&'static str] {
+        // The S3 wires these unconditionally, so the console lands on the
+        // third whether or not the first two are used.
+        &["UART0", "UART1", "USB Serial/JTAG"]
+    }
+}
+
+/// Every serial port's scrollback, plus a merged view of all of them.
+///
+/// Both are needed, and neither is sufficient. The ESP32-S3 ROM writes its
+/// banner to UART0 *and* the USB console, so a merged view shows the whole
+/// boot twice; but the application afterwards splits its output between them
+/// -- PURR OS logs through IDF's console on one and its own logger on the
+/// other -- so a single port shows half the story.
+///
+/// Per-port is the default because it is readable. The merged view is there
+/// for the question per-port views cannot answer: what happened first.
+#[derive(Debug)]
+pub struct SerialLog {
+    ports: [SerialBuffer; SerialBuffer::PORTS],
+    merged: SerialBuffer,
+}
+
+impl Default for SerialLog {
+    fn default() -> Self {
+        SerialLog {
+            ports: std::array::from_fn(|_| SerialBuffer::default()),
+            merged: SerialBuffer {
+                label_sources: true,
+                ..SerialBuffer::default()
+            },
         }
     }
 }
 
-/// The serial console's scrollback.
+impl SerialLog {
+    pub fn push(&mut self, port: usize, bytes: &[u8]) {
+        if let Some(buf) = self.ports.get_mut(port) {
+            buf.push(port, bytes);
+        }
+        self.merged.push(port, bytes);
+    }
+
+    /// One port's output, or the merged view when `port` is out of range.
+    pub fn view(&self, port: Option<usize>) -> &SerialBuffer {
+        port.and_then(|p| self.ports.get(p)).unwrap_or(&self.merged)
+    }
+
+    /// Bytes seen on each port, so the UI can show which are alive.
+    pub fn counts(&self) -> [usize; SerialBuffer::PORTS] {
+        std::array::from_fn(|i| self.ports[i].per_port[i])
+    }
+
+    pub fn clear(&mut self) {
+        for buf in &mut self.ports {
+            buf.clear();
+        }
+        self.merged.clear();
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SerialBuffer {
     text: String,
@@ -263,14 +324,45 @@ pub struct SerialBuffer {
     raw: std::collections::VecDeque<u8>,
     /// Bytes discarded from the front, so the UI can say the log was trimmed.
     pub trimmed: usize,
+    /// Which port wrote last, so a marker is only emitted on a change.
+    last_port: Option<usize>,
+    /// Whether to mark where the source changes. On for the merged view, off
+    /// for a single port's, where every line has the same source anyway.
+    label_sources: bool,
+    /// Bytes seen per port, so the UI can show which ones are alive.
+    pub per_port: [usize; Self::PORTS],
 }
 
 impl SerialBuffer {
     /// Firmware can produce output indefinitely; keep the most recent slice.
     const LIMIT: usize = 512 * 1024;
     const RAW_LIMIT: usize = 16 * 1024;
+    pub const PORTS: usize = 3;
 
-    pub fn push(&mut self, bytes: &[u8]) {
+    pub fn push(&mut self, port: usize, bytes: &[u8]) {
+        if let Some(count) = self.per_port.get_mut(port) {
+            *count += bytes.len();
+        }
+
+        if self.label_sources && self.last_port != Some(port) {
+            // On its own line, so a marker never lands mid-sentence.
+            if !self.text.is_empty() && !self.text.ends_with('\n') {
+                self.text.push('\n');
+            }
+            let name = match port {
+                0 => "UART0",
+                1 => "UART1",
+                2 => "USB Serial/JTAG",
+                n => return self.push_untagged(n, bytes),
+            };
+            self.text.push_str(&format!("--- {name} ---\n"));
+            self.last_port = Some(port);
+        }
+
+        self.push_untagged(port, bytes);
+    }
+
+    fn push_untagged(&mut self, _port: usize, bytes: &[u8]) {
         self.raw.extend(bytes.iter().copied());
         while self.raw.len() > Self::RAW_LIMIT {
             self.raw.pop_front();
@@ -305,6 +397,8 @@ impl SerialBuffer {
         self.text.clear();
         self.raw.clear();
         self.trimmed = 0;
+        self.last_port = None;
+        self.per_port = [0; Self::PORTS];
     }
 }
 
@@ -365,14 +459,56 @@ mod tests {
     #[test]
     fn serial_buffer_strips_ansi_colour() {
         let mut b = SerialBuffer::default();
-        b.push(b"\x1b[0;32mI (123) boot: ok\x1b[0m\n");
-        assert_eq!(b.text(), "I (123) boot: ok\n");
+        b.push(0, b"\x1b[0;32mI (123) boot: ok\x1b[0m\n");
+        assert!(b.text().ends_with("I (123) boot: ok\n"), "got {:?}", b.text());
+        assert!(!b.text().contains('\x1b'));
+    }
+
+    #[test]
+    fn the_merged_view_labels_where_the_source_changes() {
+        // The case this exists for: a run that looks hung is often just output
+        // going to a port nobody is reading.
+        let mut log = SerialLog::default();
+        log.push(2, b"ESP-ROM:esp32s3\n");
+        log.push(0, b"I (200) app: hello\n");
+        log.push(2, b"more rom\n");
+
+        let text = log.view(None).text();
+        assert!(text.starts_with("--- USB Serial/JTAG ---\n"));
+        assert!(text.contains("--- UART0 ---\nI (200) app: hello\n"));
+        // Switching back re-labels, so the order is never ambiguous.
+        assert_eq!(text.matches("--- USB Serial/JTAG ---").count(), 2);
+    }
+
+    #[test]
+    fn a_single_port_view_carries_only_that_port_and_no_labels() {
+        // Labels would be noise here: every line has the same source. This is
+        // the readable view, and the reason both exist -- the S3 ROM writes
+        // its banner to UART0 *and* the USB console, so the merged view shows
+        // the whole boot twice.
+        let mut log = SerialLog::default();
+        log.push(0, b"ESP-ROM\n");
+        log.push(2, b"ESP-ROM\n");
+        log.push(0, b"I (200) app: hello\n");
+
+        let uart0 = log.view(Some(0)).text();
+        assert_eq!(uart0, "ESP-ROM\nI (200) app: hello\n");
+        assert_eq!(log.view(Some(2)).text(), "ESP-ROM\n");
+        assert_eq!(log.view(Some(1)).text(), "", "nothing was sent to UART1");
+    }
+
+    #[test]
+    fn byte_counts_say_which_ports_are_alive() {
+        let mut log = SerialLog::default();
+        log.push(0, b"hello");
+        log.push(2, b"hi");
+        assert_eq!(log.counts(), [5, 0, 2]);
     }
 
     #[test]
     fn serial_buffer_survives_invalid_utf8() {
         let mut b = SerialBuffer::default();
-        b.push(&[0xff, 0xfe, b'o', b'k']);
+        b.push(0, &[0xff, 0xfe, b'o', b'k']);
         assert!(b.text().ends_with("ok"), "got {:?}", b.text());
     }
 
@@ -381,7 +517,7 @@ mod tests {
         let mut b = SerialBuffer::default();
         // Multi-byte characters straddling the cut point must not panic.
         for _ in 0..40_000 {
-            b.push("ünïcødé line\n".as_bytes());
+            b.push(0, "ünïcødé line\n".as_bytes());
         }
         assert!(b.trimmed > 0, "buffer should have been trimmed");
         assert!(b.text().len() <= SerialBuffer::LIMIT);

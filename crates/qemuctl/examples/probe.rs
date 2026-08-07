@@ -53,10 +53,12 @@ fn main() -> std::process::ExitCode {
     let mut serial = String::new();
     let mut last_output = Instant::now();
     while Instant::now() < deadline {
-        let chunk = inst.read_serial();
-        if !chunk.is_empty() {
+        let chunks = inst.read_serial();
+        if !chunks.is_empty() {
             last_output = Instant::now();
-            serial.push_str(&String::from_utf8_lossy(&chunk));
+            for chunk in chunks {
+                serial.push_str(&String::from_utf8_lossy(&chunk.bytes));
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     }

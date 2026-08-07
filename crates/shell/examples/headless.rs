@@ -71,7 +71,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("no display attached");
     }
 
-    print!("{}", sess.serial.text());
+    // Every port, labelled where the source changes. On a real boot the ROM
+    // writes the same banner to UART0 and the USB console, so seeing it twice
+    // here is correct and is the whole reason this prints the merged view.
+    let counts = sess.serial.counts();
+    for (i, name) in sess.serial_port_names().iter().enumerate() {
+        println!("{name}: {} bytes", counts.get(i).copied().unwrap_or(0));
+    }
+    print!("{}", sess.serial.view(None).text());
     sess.stop();
     Ok(())
 }

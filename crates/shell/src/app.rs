@@ -44,6 +44,8 @@ pub struct App {
     autoscroll: bool,
     terminal: Terminal,
     screen_view: ScreenView,
+    /// Which serial port the console shows; None is the merged view.
+    serial_view: Option<usize>,
     /// Recent bus traffic, when the tracer is on.
     bus_log: Vec<String>,
 }
@@ -81,6 +83,10 @@ impl App {
             autoscroll: true,
             terminal: Terminal::default(),
             screen_view: ScreenView::default(),
+            // UART0 carries the ROM banner and, for most firmware, the
+            // application log too -- the closest thing to a single
+            // complete view.
+            serial_view: Some(0),
             bus_log: Vec::new(),
         }
     }
@@ -538,18 +544,44 @@ impl App {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Serial");
+
+                // Which port to read. The S3 ROM writes its banner to UART0
+                // and the USB console both, so merging shows the boot twice;
+                // the application afterwards splits across them, so one port
+                // shows half. Hence the choice.
+                let names = self.session.serial_port_names();
+                let counts = self.session.serial.counts();
+                let label = match self.serial_view {
+                    Some(p) => names.get(p).copied().unwrap_or("port"),
+                    None => "All ports",
+                };
+                egui::ComboBox::from_id_salt("serial-view")
+                    .selected_text(label)
+                    .width(150.0)
+                    .show_ui(ui, |ui| {
+                        for (i, name) in names.iter().enumerate() {
+                            let bytes = counts.get(i).copied().unwrap_or(0);
+                            let text = if bytes > 0 {
+                                format!("{name} ({} KiB)", bytes / 1024)
+                            } else {
+                                format!("{name} (silent)")
+                            };
+                            ui.selectable_value(&mut self.serial_view, Some(i), text);
+                        }
+                        ui.selectable_value(&mut self.serial_view, None, "All ports (merged)");
+                    });
+
                 ui.checkbox(&mut self.autoscroll, "follow");
                 if ui.small_button("clear").clicked() {
                     self.session.serial.clear();
                 }
-                if self.session.serial.trimmed > 0 {
+
+                let view = self.session.serial.view(self.serial_view);
+                if view.trimmed > 0 {
                     ui.label(
-                        RichText::new(format!(
-                            "({} KiB trimmed)",
-                            self.session.serial.trimmed / 1024
-                        ))
-                        .small()
-                        .weak(),
+                        RichText::new(format!("({} KiB trimmed)", view.trimmed / 1024))
+                            .small()
+                            .weak(),
                     );
                 }
                 ui.label(
@@ -563,12 +595,11 @@ impl App {
                 .stick_to_bottom(self.autoscroll)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    let text = self.session.serial.view(self.serial_view).text();
                     ui.add(
-                        egui::Label::new(
-                            RichText::new(self.session.serial.text()).monospace(),
-                        )
-                        .selectable(true)
-                        .wrap(),
+                        egui::Label::new(RichText::new(text).monospace())
+                            .selectable(true)
+                            .wrap(),
                     );
                 });
         });

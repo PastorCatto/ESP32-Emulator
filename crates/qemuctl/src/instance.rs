@@ -2,13 +2,42 @@
 
 use crate::{LaunchConfig, Qemu, QemuError, QmpClient};
 use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-/// Bytes read from the emulated UART.
-pub type SerialChunk = Vec<u8>;
+/// Forward everything a serial port produces until it closes.
+///
+/// Raw bytes rather than lines: firmware output is not reliably
+/// line-buffered, and waiting for a newline would make prompts and partial
+/// output invisible.
+fn pump(mut reader: impl Read, port: usize, tx: &Sender<SerialChunk>) {
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let chunk = SerialChunk { port, bytes: buf[..n].to_vec() };
+                if tx.send(chunk).is_err() {
+                    break; // receiver gone; nobody is listening
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Bytes read from one of the emulated serial ports.
+#[derive(Debug, Clone)]
+pub struct SerialChunk {
+    /// Which port produced them, indexed as the machine wires them: on an
+    /// ESP32-S3, 0 and 1 are UART0 and UART1, and 2 is the USB Serial/JTAG
+    /// console.
+    pub port: usize,
+    pub bytes: Vec<u8>,
+}
 
 /// A live emulator process.
 #[derive(Debug)]
@@ -16,6 +45,8 @@ pub struct Instance {
     child: Child,
     stdin: Option<ChildStdin>,
     serial: Receiver<SerialChunk>,
+    /// Write halves of the socket-backed serial ports, once connected.
+    serial_out: Vec<Arc<Mutex<Option<TcpStream>>>>,
     /// Anything QEMU wrote to stderr, kept for diagnosing a failed launch.
     stderr: Arc<Mutex<String>>,
     qmp_port: Option<u16>,
@@ -36,6 +67,19 @@ impl Instance {
         if config.data_dir.is_none() {
             config.data_dir = qemu.data_dir.clone();
         }
+
+        // Bind before spawning: the emulator dials out at startup and does not
+        // retry, and binding afterwards would race the connection.
+        let listeners: Vec<TcpListener> = (0..config.serial_count)
+            .map(|_| TcpListener::bind(("127.0.0.1", 0)))
+            .collect::<std::io::Result<_>>()
+            .map_err(QemuError::Io)?;
+        config.serial_ports = listeners
+            .iter()
+            .map(|l| l.local_addr().map(|a| a.port()))
+            .collect::<std::io::Result<_>>()
+            .map_err(QemuError::Io)?;
+
         let args = config.to_args()?;
 
         let mut child = Command::new(&qemu.binary)
@@ -51,27 +95,41 @@ impl Instance {
         let stderr_pipe = child.stderr.take().expect("stderr was piped");
 
         let (tx, serial) = mpsc::channel();
-        thread::Builder::new()
-            .name("qemu-serial".into())
-            .spawn(move || {
-                let mut reader = stdout;
-                // Read raw bytes rather than lines: firmware output is not
-                // reliably line-buffered, and waiting for a newline would make
-                // prompts and partial output invisible.
-                let mut buf = [0u8; 4096];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if tx.send(buf[..n].to_vec()).is_err() {
-                                break; // receiver gone; nobody is listening
-                            }
-                        }
-                        Err(_) => break,
+
+        // Port 0 on stdio when no sockets were asked for, so the simple case
+        // stays a plain pipe.
+        if listeners.is_empty() {
+            let tx = tx.clone();
+            thread::Builder::new()
+                .name("qemu-serial".into())
+                .spawn(move || pump(stdout, 0, &tx))
+                .map_err(QemuError::Io)?;
+        }
+
+        let mut serial_out = Vec::with_capacity(listeners.len());
+        for (port, listener) in listeners.into_iter().enumerate() {
+            let writer = Arc::new(Mutex::new(None));
+            let sink = Arc::clone(&writer);
+            let tx = tx.clone();
+            thread::Builder::new()
+                .name(format!("qemu-serial{port}"))
+                .spawn(move || {
+                    // One connection per port, for the life of the machine.
+                    let Ok((stream, _)) = listener.accept() else { return };
+                    let Ok(out) = stream.try_clone() else { return };
+                    if let Ok(mut slot) = sink.lock() {
+                        *slot = Some(out);
                     }
-                }
-            })
-            .map_err(QemuError::Io)?;
+                    pump(stream, port, &tx);
+                    // Dropped so a write after shutdown fails loudly rather
+                    // than disappearing into a dead socket.
+                    if let Ok(mut slot) = sink.lock() {
+                        *slot = None;
+                    }
+                })
+                .map_err(QemuError::Io)?;
+            serial_out.push(writer);
+        }
 
         let stderr = Arc::new(Mutex::new(String::new()));
         let stderr_sink = Arc::clone(&stderr);
@@ -91,37 +149,46 @@ impl Instance {
             child,
             stdin,
             serial,
+            serial_out,
             stderr,
             qmp_port: config.qmp_port,
             exited: None,
         })
     }
 
-    /// Take everything the UART has produced since the last call.
+    /// Take everything the serial ports have produced since the last call.
     ///
     /// Non-blocking, so the UI can call it every frame without stalling.
-    pub fn read_serial(&mut self) -> Vec<u8> {
+    /// Chunks arrive in the order they were read, which is what makes a merged
+    /// view of several ports readable.
+    pub fn read_serial(&mut self) -> Vec<SerialChunk> {
         let mut out = Vec::new();
         // Both Empty and Disconnected mean "nothing more right now"; a
         // disconnected channel is handled by is_running, not here.
         while let Ok(chunk) = self.serial.try_recv() {
-            out.extend_from_slice(&chunk);
+            out.push(chunk);
         }
         out
     }
 
-    /// Send bytes to the emulated UART, as if typed into a terminal.
-    pub fn write_serial(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        match &mut self.stdin {
-            Some(stdin) => {
-                stdin.write_all(bytes)?;
-                stdin.flush()
-            }
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "serial input is closed",
-            )),
+    /// Send bytes to a serial port, as if typed into a terminal.
+    pub fn write_serial(&mut self, port: usize, bytes: &[u8]) -> std::io::Result<()> {
+        let closed = || {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "serial input is closed")
+        };
+
+        // No sockets means the single stdio port, whatever index was asked for.
+        if self.serial_out.is_empty() {
+            let stdin = self.stdin.as_mut().ok_or_else(closed)?;
+            stdin.write_all(bytes)?;
+            return stdin.flush();
         }
+
+        let slot = self.serial_out.get(port).ok_or_else(closed)?;
+        let mut guard = slot.lock().map_err(|_| closed())?;
+        let stream = guard.as_mut().ok_or_else(closed)?;
+        stream.write_all(bytes)?;
+        stream.flush()
     }
 
     /// Has the process finished? Reaps it if so, so we do not leave a zombie.

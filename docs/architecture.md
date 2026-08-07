@@ -307,11 +307,29 @@ scripts/sample-pc.sh flash.bin 40 8 sd.img
 cargo run -p flashimg --example addr2sym -- build/app.elf 0x42119853
 ```
 
-`run-emu.sh` captures all three serial ports, not just the console. Firmware
-does not always log where you expect: PURR OS prints its boot through UART0
-while the USB Serial/JTAG console carries only the ROM and bootloader, and
+Everything captures all three serial ports, not just the console — the scripts
+and the application both. Firmware does not always log where you expect, and
 chasing a "hang" that was really output going to a port nobody was reading
 costs an afternoon.
+
+The ports are not interchangeable and neither is redundant. On a T-Deck
+running PURR OS:
+
+| Port | Carries |
+| --- | --- |
+| UART0 | the ROM banner, then the application's own logger — 11.6 KB of a 70s boot |
+| UART1 | nothing |
+| USB Serial/JTAG | the ROM banner again, then ESP-IDF's console — 4.7 KB |
+
+The ROM writes its banner to UART0 *and* the USB console, so a merged view
+shows the whole early boot twice; the application afterwards splits across
+them, so a single port shows half. The shell keeps a buffer per port plus a
+merged one and lets you pick, defaulting to UART0 as the closest thing to a
+complete view. The merged view marks where the source changes.
+
+The emulator dials out to sockets the shell is already listening on, rather
+than listening itself, so nothing is lost between QEMU starting and something
+attaching — the ROM banner is gone in milliseconds otherwise.
 
 `sample-pc.sh` takes `MON_EXTRA` for one-off monitor commands. Reading an
 interrupt matrix mapping with `xp /1wx 0x600c2054` and comparing it against

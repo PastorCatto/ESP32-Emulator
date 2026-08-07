@@ -238,6 +238,20 @@ pub struct LaunchConfig {
     /// Enable QEMU's own framebuffer window. Off for us: the SPI display is
     /// rendered by the shell, and a second window would only confuse.
     pub graphics: bool,
+    /// How many serial ports to give the machine.
+    ///
+    /// Zero means one port on stdio, which is enough for a console and is what
+    /// the tests build. Firmware does not always log where you expect: an
+    /// ESP32-S3 wires UART0, UART1 and the USB Serial/JTAG console to the
+    /// first three, and PURR OS puts its ROM and bootloader output on the
+    /// third while its own logging goes to the first. Reading one of those and
+    /// not the other looks exactly like a hang.
+    pub serial_count: usize,
+    /// TCP ports the serial devices connect out to, in order.
+    ///
+    /// Filled in by [`Instance`], which binds the listeners before spawning --
+    /// the emulator connects at startup and does not retry.
+    pub serial_ports: Vec<u16>,
     /// Port of the peripheral server the SPI controllers should connect to.
     /// Without it the general-purpose SPI buses look empty, which is a
     /// legitimate way to run.
@@ -262,6 +276,8 @@ impl LaunchConfig {
             chip,
             flash_image: flash_image.into(),
             psram: None,
+            serial_count: 0,
+            serial_ports: Vec::new(),
             vpb_port: None,
             display_dc_gpio: None,
             data_dir: None,
@@ -300,7 +316,24 @@ impl LaunchConfig {
             args.push("-display".into());
             args.push("none".into());
         }
-        args.extend(["-serial", "stdio", "-monitor", "none"].map(String::from));
+        // The monitor is always off. `-nographic` would multiplex it onto the
+        // serial stream, which makes serial unusable programmatically.
+        args.extend(["-monitor", "none"].map(String::from));
+
+        if self.serial_ports.is_empty() {
+            args.extend(["-serial", "stdio"].map(String::from));
+        } else {
+            // The emulator dials out to us rather than listening, so no output
+            // is lost between it starting and something connecting.
+            for (i, port) in self.serial_ports.iter().enumerate() {
+                args.push("-chardev".into());
+                args.push(format!(
+                    "socket,id=ser{i},host=127.0.0.1,port={port},server=off"
+                ));
+                args.push("-serial".into());
+                args.push(format!("chardev:ser{i}"));
+            }
+        }
 
         args.push("-drive".into());
         args.push(format!(
@@ -414,11 +447,43 @@ mod tests {
             vec![
                 "-machine", "esp32s3",
                 "-display", "none",
-                "-serial", "stdio",
                 "-monitor", "none",
+                "-serial", "stdio",
                 "-drive", "file=flash.bin,if=mtd,format=raw",
             ]
         );
+    }
+
+    #[test]
+    fn each_serial_port_gets_its_own_socket_the_emulator_dials_out_to() {
+        // server=off matters: the emulator connects at startup, so nothing is
+        // lost between it starting and something being ready to read. The
+        // other way round, the ROM banner is gone before you can attach.
+        let mut c = cfg();
+        c.serial_ports = vec![7001, 7002, 7003];
+        let args = c.to_args().unwrap();
+
+        assert!(!args.contains(&"stdio".to_string()), "sockets replace stdio");
+        for (i, port) in [7001, 7002, 7003].iter().enumerate() {
+            assert!(args.contains(&format!(
+                "socket,id=ser{i},host=127.0.0.1,port={port},server=off"
+            )));
+            assert!(args.contains(&format!("chardev:ser{i}")));
+        }
+    }
+
+    #[test]
+    fn the_ports_stay_in_order_because_the_machine_wires_them_that_way() {
+        // An ESP32-S3 gives UART0, UART1 and the USB Serial/JTAG console the
+        // first three chardevs in order, so which log lands where depends on
+        // this sequence being stable.
+        let mut c = cfg();
+        c.serial_ports = vec![9001, 9002, 9003];
+        let args = c.to_args().unwrap();
+
+        let at = |needle: &str| args.iter().position(|a| a.contains(needle)).unwrap();
+        assert!(at("port=9001") < at("port=9002"));
+        assert!(at("port=9002") < at("port=9003"));
     }
 
     #[test]

@@ -63,6 +63,9 @@ pub struct Terminal {
     pub local_echo: bool,
     pub autoscroll: bool,
     pub hex_view: bool,
+    /// Which serial port typing goes to. A board can have a shell on any of
+    /// them, and the one carrying the boot log is often not the one listening.
+    pub port: usize,
     /// Locally echoed text, interleaved into the view.
     echo: String,
 }
@@ -79,6 +82,9 @@ impl Default for Terminal {
             local_echo: false,
             autoscroll: true,
             hex_view: false,
+            // UART0 is where an application shell usually lives; the boot log
+            // arriving on another port does not mean commands go there.
+            port: 0,
             echo: String::new(),
         }
     }
@@ -121,6 +127,30 @@ impl Terminal {
                 }
                 ui.separator();
 
+                // Which port this terminal is attached to: what it shows and
+                // where typing goes. One port, like a real terminal -- the
+                // main window's console is the place to watch all of them.
+                let names = session.serial_port_names();
+                let counts = session.serial.counts();
+                egui::ComboBox::from_id_salt("serial-port")
+                    .selected_text(names.get(self.port).copied().unwrap_or("port"))
+                    .width(140.0)
+                    .show_ui(ui, |ui| {
+                        for (i, name) in names.iter().enumerate() {
+                            // Byte counts, so a port nothing ever talks on is
+                            // visibly the wrong one to be typing at.
+                            let bytes = counts.get(i).copied().unwrap_or(0);
+                            let label = if bytes > 0 {
+                                format!("{name} ({bytes} B)")
+                            } else {
+                                format!("{name} (silent)")
+                            };
+                            ui.selectable_value(&mut self.port, i, label);
+                        }
+                    });
+                ui.label(RichText::new("port").small().weak());
+
+                ui.separator();
                 egui::ComboBox::from_id_salt("line-ending")
                     .selected_text(self.line_ending.label())
                     .width(70.0)
@@ -143,14 +173,14 @@ impl Terminal {
                     .on_hover_text("Interrupt (0x03)")
                     .clicked()
                 {
-                    session.send_serial("\x03");
+                    session.send_serial(self.port, "\x03");
                 }
                 if ui
                     .add_enabled(running, egui::Button::new("Ctrl-D"))
                     .on_hover_text("End of transmission (0x04)")
                     .clicked()
                 {
-                    session.send_serial("\x04");
+                    session.send_serial(self.port, "\x04");
                 }
                 if ui.button("clear").clicked() {
                     session.serial.clear();
@@ -199,12 +229,12 @@ impl Terminal {
                     if self.hex_view {
                         ui.add(
                             egui::Label::new(
-                                RichText::new(hex_dump(&session.serial.raw())).monospace(),
+                                RichText::new(hex_dump(&session.serial.view(Some(self.port)).raw())).monospace(),
                             )
                             .selectable(true),
                         );
                     } else {
-                        let mut body = session.serial.text().to_string();
+                        let mut body = session.serial.view(Some(self.port)).text().to_string();
                         if self.local_echo && !self.echo.is_empty() {
                             body.push_str(&self.echo);
                         }
@@ -268,7 +298,7 @@ impl Terminal {
             self.echo.push_str(&line);
             self.echo.push('\n');
         }
-        session.send_serial(&format!("{line}{}", self.line_ending.as_str()));
+        session.send_serial(self.port, &format!("{line}{}", self.line_ending.as_str()));
     }
 }
 

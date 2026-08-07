@@ -49,7 +49,9 @@ fn wait_for_serial(inst: &mut Instance, needle: &str, timeout: Duration) -> Stri
     let deadline = Instant::now() + timeout;
     let mut text = String::new();
     while Instant::now() < deadline {
-        text.push_str(&String::from_utf8_lossy(&inst.read_serial()));
+        for chunk in inst.read_serial() {
+            text.push_str(&String::from_utf8_lossy(&chunk.bytes));
+        }
         if text.contains(needle) {
             break;
         }
