@@ -6,6 +6,8 @@
 
 mod chip;
 mod elf;
+mod sha256;
+pub mod patch;
 mod error;
 mod image;
 mod layout;

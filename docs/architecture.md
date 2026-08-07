@@ -219,8 +219,48 @@ segment loads, octal PSRAM detection and `app_init`, then:
   registers it, along with the trackball and the BBQ20 keyboard;
 - loads its static modules and reaches Wi-Fi PHY init.
 
-It stops inside `phy_init`, which is where the unmodelled radio begins — see
-[section 6](#6-wi-fi-and-why-it-is-not-emulated) and the note below.
+With the radio bypassed it boots all the way to its home screen and stays up:
+`wifi_mgr: init complete`, the system UI loads, modules register, and hardware
+this build cannot model (the LoRa radio) fails its init and is skipped rather
+than halting the kernel.
+
+![PURR OS at its home screen](images/tdeck-plus-home.png)
+
+Without the bypass it stops inside `phy_init` — see
+[section 6](#6-wi-fi-and-why-it-is-not-emulated) and the notes below.
+
+### Bypassing the radio instead of emulating it
+
+The PHY is a closed blob calibrating analog circuitry that does not exist
+here, and the MAC below it is undocumented. Register-level modelling gets the
+blob part-way and then it waits forever (see the next section for how far).
+
+So [`flashimg::patch`](../crates/flashimg/src/patch.rs) replaces the entry
+points instead. `cargo run -p flashimg --example bypass-radio -- flash.bin
+app.elf out.bin` rewrites `esp_phy_enable` and the `esp_wifi_*` calls with
+stubs that return without touching hardware, and prints every patch it makes.
+
+Three things are worth knowing about it:
+
+- **Firmware patched this way is not running what it would run on hardware.**
+  That is the point, and it should never be a surprise, which is why the tool
+  reports each patch and why the scan call reports failure rather than
+  returning an empty result that looks like a real scan of an empty room.
+- **It needs the ELF for that exact build.** Patches are located by symbol;
+  a missing symbol or an address outside a mapped segment is an error, not a
+  guess. Locating functions in firmware you did not build needs byte
+  signatures, which this does not do yet.
+- **The image has to be resealed.** The second-stage bootloader verifies the
+  XOR checksum and the appended SHA-256 on *every* boot, not just under secure
+  boot. Editing a byte without recomputing both gets `Checksum failed` and a
+  boot loop — which is how this was discovered.
+
+The stubs are five to seven bytes of Xtensa: `entry a1, 32`, optionally
+`movi.n a2, <n>`, then `retw.n`. The encodings were read out of a disassembly
+of real firmware rather than assembled, and one of them bit back — `movi.n`
+shares an opcode with `bnez.n`, so a negative immediate assembles to a branch
+into the middle of the function being replaced. Only non-negative constants
+are allowed now, which costs nothing: callers test `!= ESP_OK`.
 
 ### How far register-level modelling gets the PHY, and where it stops
 
@@ -271,6 +311,11 @@ The shell drives all of that itself: it reads the board file, builds the
 device models it has, serves them on a port it picked, tells the emulator
 where to find them, and draws the panel live. `cargo run -p shell --example
 headless` runs the same path with no window, which is how it gets tested.
+
+Still open on the radio: nothing produces scan results yet. Making fake APs
+appear needs `esp_wifi_scan_get_ap_records` to fill a caller-supplied buffer,
+which is a real stub rather than a constant return -- the mechanism is in
+place, the AP data is not.
 
 Still open: a freshly created `.img` has no filesystem on it, so the card
 initialises and then FATFS reports `FR_NO_FILESYSTEM`; a real card image
