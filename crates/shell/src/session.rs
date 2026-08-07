@@ -115,6 +115,9 @@ pub struct LoadedFirmware {
     pub version: Option<String>,
     pub idf_version: Option<String>,
     pub size: usize,
+    /// Digest of the ELF this image was built from, as recorded by the build.
+    /// `None` when the descriptor left it zeroed, which some builds do.
+    pub elf_sha256: Option<[u8; 32]>,
 }
 
 /// A symbol table for the firmware, loaded from its `.elf`.
@@ -125,7 +128,31 @@ pub struct LoadedFirmware {
 pub struct LoadedSymbols {
     pub path: PathBuf,
     pub count: usize,
+    /// Digest of the ELF file itself. The build records this in the image's
+    /// app descriptor, so the two can be checked against each other.
+    pub sha256: [u8; 32],
     table: flashimg::ElfSymbols,
+}
+
+/// Whether a symbol table belongs to the image currently loaded.
+///
+/// Symbols and images arrive as separate drops and nothing stops them being
+/// from different builds. A mismatched pair is worse than a missing one:
+/// addresses from the wrong build usually still land *somewhere* in the
+/// image, so patching succeeds and writes over whatever happened to be at
+/// that offset, and the firmware fails later somewhere unrelated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolMatch {
+    /// No symbols, or no image, so there is nothing to check.
+    Nothing,
+    /// The image records the digest of the ELF it was built from, and it is
+    /// this one.
+    Matches,
+    /// The image names a different ELF. Patching with these is meaningless.
+    Mismatch,
+    /// The image carries no ELF digest, so this cannot be settled either way.
+    /// Older builds, and anything not produced by `esptool elf2image`.
+    Unverifiable,
 }
 
 impl std::fmt::Debug for LoadedSymbols {
@@ -238,6 +265,12 @@ impl Session {
             version: descriptor.as_ref().map(|d| d.app_version.clone()),
             idf_version: descriptor.as_ref().map(|d| d.idf_version.clone()),
             size: raw.len(),
+            // All-zero means the build did not record one, not that the ELF
+            // hashes to zero.
+            elf_sha256: descriptor
+                .as_ref()
+                .map(|d| d.elf_sha256)
+                .filter(|d| d.iter().any(|&b| b != 0)),
         });
         // The image was just rewritten from source, so any patches are gone.
         self.patches.clear();
@@ -253,14 +286,35 @@ impl Session {
         self.symbols = Some(LoadedSymbols {
             path: path.to_path_buf(),
             count,
+            sha256: flashimg::sha256(&raw),
             table,
         });
         Ok(count)
     }
 
+    /// Do the loaded symbols belong to the loaded image?
+    pub fn symbol_match(&self) -> SymbolMatch {
+        let (Some(symbols), Some(firmware)) = (&self.symbols, &self.firmware) else {
+            return SymbolMatch::Nothing;
+        };
+        match firmware.elf_sha256 {
+            None => SymbolMatch::Unverifiable,
+            Some(recorded) if recorded == symbols.sha256 => SymbolMatch::Matches,
+            Some(_) => SymbolMatch::Mismatch,
+        }
+    }
+
     /// Can the radio bypass be applied right now?
+    ///
+    /// Symbols from a different build are refused. They are not merely
+    /// useless: the addresses usually still land inside the image, so the
+    /// patch writes over something arbitrary and the firmware dies later,
+    /// somewhere with no connection to the cause.
     pub fn can_patch(&self) -> bool {
-        self.flash_path.is_some() && self.symbols.is_some() && self.patches.is_empty()
+        self.flash_path.is_some()
+            && self.symbols.is_some()
+            && self.patches.is_empty()
+            && self.symbol_match() != SymbolMatch::Mismatch
     }
 
     /// Replace the radio entry points in the assembled image.
@@ -516,6 +570,58 @@ fn strip_ansi(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session carrying a symbol table and an image, without touching disk.
+    fn paired(recorded: Option<[u8; 32]>, elf: [u8; 32]) -> Session {
+        let mut s = Session::new(Board::from_toml(include_str!("../../../boards/generic-esp32s3.toml")).unwrap());
+        s.firmware = Some(LoadedFirmware {
+            path: PathBuf::from("app.bin"),
+            chip: flashimg::Chip::Esp32S3,
+            kind: "merged flash image",
+            project: None,
+            version: None,
+            idf_version: None,
+            size: 0,
+            elf_sha256: recorded,
+        });
+        s.symbols = Some(LoadedSymbols {
+            path: PathBuf::from("app.elf"),
+            count: 1,
+            sha256: elf,
+            table: flashimg::ElfSymbols::default(),
+        });
+        s
+    }
+
+    #[test]
+    fn symbols_from_another_build_are_refused() {
+        // The real case this comes from: two builds of the same project, one
+        // image loaded and the other's .elf left over from an earlier drop.
+        // The addresses are plausible and completely wrong.
+        let s = paired(Some([0xaa; 32]), [0xbb; 32]);
+        assert_eq!(s.symbol_match(), SymbolMatch::Mismatch);
+        assert!(!s.can_patch(), "patching a mismatched pair corrupts the image");
+    }
+
+    #[test]
+    fn symbols_matching_the_image_are_accepted() {
+        let s = paired(Some([0xaa; 32]), [0xaa; 32]);
+        assert_eq!(s.symbol_match(), SymbolMatch::Matches);
+    }
+
+    #[test]
+    fn an_image_without_a_digest_cannot_be_checked_either_way() {
+        // Refusing here would break every build that leaves the field zeroed,
+        // so this stays allowed -- flagged in the UI, not blocked.
+        let s = paired(None, [0xbb; 32]);
+        assert_eq!(s.symbol_match(), SymbolMatch::Unverifiable);
+    }
+
+    #[test]
+    fn nothing_loaded_is_not_a_mismatch() {
+        let s = Session::new(Board::from_toml(include_str!("../../../boards/generic-esp32s3.toml")).unwrap());
+        assert_eq!(s.symbol_match(), SymbolMatch::Nothing);
+    }
 
     #[test]
     fn classifies_by_content_not_extension() {

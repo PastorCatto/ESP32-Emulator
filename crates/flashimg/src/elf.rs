@@ -51,7 +51,7 @@ impl Symbol {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ElfSymbols {
     pub machine: u16,
     pub entry: u32,

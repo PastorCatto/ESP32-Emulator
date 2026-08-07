@@ -523,6 +523,32 @@ impl App {
                             .small()
                             .weak(),
                         );
+                        // Say which build these came from when it is not this
+                        // one. Greying the button out without a reason sends
+                        // people looking for the wrong problem.
+                        match self.session.symbol_match() {
+                            crate::session::SymbolMatch::Mismatch => {
+                                ui.colored_label(
+                                    Color32::from_rgb(235, 130, 120),
+                                    RichText::new(
+                                        "these symbols are from a different build — \
+                                         drop this image's own .elf",
+                                    )
+                                    .small(),
+                                );
+                            }
+                            crate::session::SymbolMatch::Unverifiable => {
+                                ui.label(
+                                    RichText::new(
+                                        "image records no ELF digest, so the pair \
+                                         cannot be checked",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                            _ => {}
+                        }
                     }
                     None => {
                         ui.label(

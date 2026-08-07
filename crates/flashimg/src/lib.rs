@@ -6,7 +6,7 @@
 
 mod chip;
 mod elf;
-mod sha256;
+pub(crate) mod sha256;
 pub mod patch;
 mod error;
 mod image;
@@ -14,6 +14,8 @@ mod layout;
 mod partition;
 
 pub use chip::{Chip, FlashSize, ALL_CHIPS};
+/// Digest of an ELF, for checking it against the image built from it.
+pub use sha256::sha256;
 pub use elf::{ElfSymbols, Symbol, SymbolKind, EM_RISCV, EM_XTENSA};
 pub use error::{Error, Result};
 pub use image::{
