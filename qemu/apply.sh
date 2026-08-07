@@ -163,6 +163,45 @@ insert_after "hw/xtensa/esp32s3.c" \
         ss->gpspi3.gdma_periph = GDMA_SPI3;" \
   "gpspi2.gdma = ESP_GDMA"
 
+# --- analog master (regi2c) -------------------------------------------------
+#
+# Unmapped, so it reads zero, so the PHY's readiness poll never completes and
+# a boot stops dead after "phy_init: falling back to full calibration".
+
+insert_after "hw/misc/meson.build" \
+  "  'esp_vpb.c'," \
+  "  'esp32s3_ana_mst.c'," \
+  "esp32s3_ana_mst.c"
+
+insert_after "hw/xtensa/esp32s3.c" \
+  '#include "hw/misc/esp32s3_sens.h"' \
+  '#include "hw/misc/esp32s3_ana_mst.h"' \
+  'hw/misc/esp32s3_ana_mst.h'
+
+insert_after "hw/xtensa/esp32s3.c" \
+  "    Esp32s3SensState sens;" \
+  "    Esp32s3AnaMstState ana_mst;" \
+  "Esp32s3AnaMstState ana_mst;"
+
+insert_after "hw/xtensa/esp32s3.c" \
+  '    object_initialize_child(obj, "sens", &s->sens, TYPE_ESP32S3_SENS);' \
+  '    object_initialize_child(obj, "ana_mst", &s->ana_mst, TYPE_ESP32S3_ANA_MST);' \
+  'TYPE_ESP32S3_ANA_MST);'
+
+insert_after "hw/xtensa/esp32s3.c" \
+  "    esp32s3_soc_add_periph_device(sys_mem, &s->i2c1, DR_REG_I2C1_EXT_BASE);" \
+  "
+    sysbus_realize(SYS_BUS_DEVICE(&s->ana_mst), &error_fatal);
+    esp32s3_soc_add_periph_device(sys_mem, &s->ana_mst, DR_REG_I2C_ANA_MST_BASE);" \
+  "DR_REG_I2C_ANA_MST_BASE"
+
+# Not in the vendored register map, and not in ESP-IDF's public reg_base.h
+# either -- IDF hardcodes the individual addresses in regi2c_defs.h.
+insert_after "include/hw/misc/esp32s3_reg.h" \
+  "#define DR_REG_RTC_I2C_BASE                     0x60008C00" \
+  "#define DR_REG_I2C_ANA_MST_BASE                 0x6000E000" \
+  'DR_REG_I2C_ANA_MST_BASE'
+
 # --- I2C (I2C0 / I2C1) ------------------------------------------------------
 #
 # There is an ESP32 I2C model in the tree, but nothing instantiates one on the

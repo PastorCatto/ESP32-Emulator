@@ -219,8 +219,30 @@ segment loads, octal PSRAM detection and `app_init`, then:
   registers it, along with the trackball and the BBQ20 keyboard;
 - loads its static modules and reaches Wi-Fi PHY init.
 
-It stops at `phy_init`, which is where the unmodelled Wi-Fi hardware begins —
-see [section 6](#6-wi-fi-and-why-it-is-not-emulated).
+It stops inside `phy_init`, which is where the unmodelled radio begins — see
+[section 6](#6-wi-fi-and-why-it-is-not-emulated) and the note below.
+
+### How far register-level modelling gets the PHY, and where it stops
+
+Worth recording, because the answer is "further than expected, and still not
+far enough".
+
+The closed PHY blob's first stall was an infinite spin in ROM waiting on the
+analog master at `0x6000E050`, which nothing mapped, so it read zero forever.
+Modelling that block's completion bits got past it. Then PLL calibration
+failed three times and gave up; adding the operation-done bit at `0x6000E04C`
+got past that. Then it waited on `SENS_TSENS_READY` — the on-die temperature
+sensor, which RF calibration compensates against — and modelling that got past
+*that*.
+
+It now stops dead at guest time ~3.7 s with no further output, four PLL
+calibration failures behind it, somewhere inside the blob's own calibration.
+
+Each fix revealed the next poll, and the trend is not toward completion: the
+PHY is calibrating a radio, and there is no radio. The two device models this
+produced are worth keeping either way — the temperature sensor is a real
+documented block, and the analog master's handshake is real — but the
+remaining path to a working `esp_wifi` is not more of this.
 
 Getting there meant writing four device models that did not exist, and fixing
 four bugs that did.

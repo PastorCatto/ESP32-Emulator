@@ -37,6 +37,26 @@ REG32(SENS_SAR_ATTEN2,       0x038)
 REG32(SENS_SAR_POWER_XPD_SAR, 0x03c)
 
 /*
+ * On-die temperature sensor. Not something an application usually reads, but
+ * the Wi-Fi PHY does: RF calibration compensates for die temperature, so
+ * phy_init powers this on and waits for READY before it will continue.
+ */
+REG32(SENS_SAR_TSENS_CTRL, 0x050)
+    FIELD(SENS_SAR_TSENS_CTRL, OUT, 0, 8)
+    FIELD(SENS_SAR_TSENS_CTRL, READY, 8, 1)
+    FIELD(SENS_SAR_TSENS_CTRL, POWER_UP, 22, 1)
+
+/*
+ * Raw reading handed back, chosen to decode as ordinary room temperature.
+ *
+ * ESP-IDF converts with roughly `raw * 0.4386 - offset * 27.88 - 20.52`; at
+ * the default range that puts 128 near 25 C. Nothing here gets hot, and a
+ * value that decoded as -40 or 120 would send a calibration routine looking
+ * for compensation it does not need.
+ */
+#define ESP32S3_SENS_TSENS_RAW  128
+
+/*
  * MEAS1_CTRL2 and MEAS2_CTRL2 share a layout, so the bit positions are
  * defined once rather than duplicated per register.
  *

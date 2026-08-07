@@ -74,6 +74,23 @@ static uint64_t esp32s3_sens_read(void *opaque, hwaddr addr, unsigned int size)
                       __func__, addr);
         return 0;
     }
+
+    /*
+     * A conversion finishes as soon as it is asked for. Reporting READY only
+     * while powered up matters: firmware powers the sensor down between
+     * readings, and a permanently-ready sensor would let a driver read a
+     * value it never actually requested.
+     */
+    if (addr == A_SENS_SAR_TSENS_CTRL) {
+        uint32_t value = s->regs[index];
+        if (FIELD_EX32(value, SENS_SAR_TSENS_CTRL, POWER_UP)) {
+            value = FIELD_DP32(value, SENS_SAR_TSENS_CTRL, READY, 1);
+            value = FIELD_DP32(value, SENS_SAR_TSENS_CTRL, OUT,
+                               ESP32S3_SENS_TSENS_RAW);
+        }
+        return value;
+    }
+
     return s->regs[index];
 }
 
