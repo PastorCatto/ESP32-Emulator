@@ -123,6 +123,36 @@ alt_address = 0x14
 irq = 16
 ```
 
+### Touch panels have two resolutions, and they disagree
+
+A touch controller *advertises* a resolution in a register, and separately
+*emits* coordinates in some range. Those are usually the same number. On a
+panel mounted sideways they are not, and the difference is the single most
+confusing bug in this whole project to diagnose:
+
+```toml
+# What the chip reports at X_RESOLUTION, which drivers read.
+width = 320
+height = 240
+# What its point registers actually span, in the panel's own frame.
+point_width = 312
+point_height = 236
+rotation = 270
+```
+
+Both `point_*` keys default to `width`/`height`, and `rotation` to `0`, so a
+board you have not measured behaves as before.
+
+Get this wrong and **the centre of the screen still works**. Swapping the two
+axes and flipping one leaves the midpoint almost exactly where it started, so
+the first gesture anybody tries — tap the middle to unlock — succeeds, and
+every other tap lands somewhere else. It reads as "touch is flaky" rather than
+"touch is systematically wrong", which sends you looking in the wrong place.
+
+The numbers are not derivable from a datasheet. A T-Deck's GT911 spans
+`0..=311` by `0..=235`, a quarter turn from the display, and the only way to
+know that is to read what the firmware divides by, or measure a real panel.
+
 ### `kind` is not a fixed list
 
 An unrecognised `kind` is **not** an error. It may be served by an external

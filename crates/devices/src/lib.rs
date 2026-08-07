@@ -33,6 +33,7 @@ pub mod png;
 
 #[cfg(all(test, feature = "gt911", feature = "tdeck-keyboard"))]
 mod i2c_tests {
+    use super::gt911::Geometry;
     use super::{Gt911, TdeckKeyboard};
     use vpb::input::{PointerPhase, Rotation};
     use vpb::registry::EventQueue;
@@ -41,9 +42,7 @@ mod i2c_tests {
     fn touch_panel() -> Gt911 {
         Gt911::new(
             Claim::I2c { controller: 0, address: 0x5d, alt: None },
-            320,
-            240,
-            Rotation::None,
+            Geometry::new(320, 240).rotated(Rotation::None),
         )
     }
 

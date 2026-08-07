@@ -126,11 +126,22 @@ fn build(
         }
         "gt911" => {
             let claim = claim.ok_or("gt911 needs a bus and an address")?;
-            // The touch panel's own resolution, which is not always the
-            // display's -- though on a T-Deck it is.
+            // The resolution the chip advertises, which drivers read...
             let width = spec.params.u16_or("width", 320).map_err(|e| e.to_string())?;
             let height = spec.params.u16_or("height", 240).map_err(|e| e.to_string())?;
-            let panel = devices::Gt911::new(claim, width, height, Rotation::None);
+            // ...and the range its point registers actually span, which is a
+            // different thing on a panel mounted sideways. Defaulting to the
+            // advertised figures keeps an unmeasured board behaving sanely.
+            let point_width = spec.params.u16_or("point_width", width).map_err(|e| e.to_string())?;
+            let point_height =
+                spec.params.u16_or("point_height", height).map_err(|e| e.to_string())?;
+            let rotation = Rotation::from_degrees(
+                spec.params.u16_or("rotation", 0).map_err(|e| e.to_string())?,
+            );
+            let geometry = devices::gt911::Geometry::new(width, height)
+                .points(point_width, point_height)
+                .rotated(rotation);
+            let panel = devices::Gt911::new(claim, geometry);
             let touch = panel.touch().clone();
             Ok(Some(Built::new(Box::new(panel)).touch(touch)))
         }

@@ -67,8 +67,18 @@ bus = "i2c0"
 address = 0x5d
 alt_address = 0x14
 irq = 16
+# What the chip advertises at X_RESOLUTION.
 width = 320
 height = 240
+# What its point registers actually report, which is not the same thing. The
+# glass is mounted a quarter turn from the display, and the raw fields span
+# 0..=311 by 0..=235 rather than the display's 320x240 -- measured on a real
+# T-Deck, and the numbers PURR OS's own driver divides by. Emitting display
+# coordinates here instead swaps the axes and flips Y, which leaves the centre
+# of the screen roughly correct and everywhere else wrong.
+point_width = 312
+point_height = 236
+rotation = 270
 
 [[peripheral]]
 kind = "tdeck-keyboard"

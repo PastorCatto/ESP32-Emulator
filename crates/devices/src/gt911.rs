@@ -39,6 +39,54 @@ const POINT_LEN: u16 = 8;
 /// Shared with the UI so a click on the panel widget lands here.
 pub type TouchHandle = Arc<Mutex<TouchState>>;
 
+/// How a finger on the glass turns into numbers in the point registers.
+///
+/// Two resolutions, because on real hardware they disagree. The chip
+/// *advertises* one at `X_RESOLUTION` and drivers read it; the points it
+/// actually emits span another, in the panel's own frame rather than the
+/// display's. A T-Deck advertises the display's 320x240 while its points run
+/// 0..=311 by 0..=235 rotated a quarter turn -- so a model that emits screen
+/// coordinates straight through puts every tap in the wrong place, and only
+/// the centre of the screen looks right.
+#[derive(Debug, Clone, Copy)]
+pub struct Geometry {
+    /// Resolution reported at `X_RESOLUTION`, in the display's frame.
+    pub width: u16,
+    pub height: u16,
+    /// Range the point registers span, in the panel's own frame.
+    pub point_width: u16,
+    pub point_height: u16,
+    /// How the panel is mounted relative to the displayed image.
+    pub rotation: Rotation,
+}
+
+impl Geometry {
+    /// A panel whose points span exactly what it advertises, mounted square.
+    /// True of most boards, and the right default for one we have not
+    /// measured.
+    pub fn new(width: u16, height: u16) -> Self {
+        Geometry {
+            width,
+            height,
+            point_width: width,
+            point_height: height,
+            rotation: Rotation::None,
+        }
+    }
+
+    /// Override the range the point registers span.
+    pub fn points(mut self, width: u16, height: u16) -> Self {
+        self.point_width = width;
+        self.point_height = height;
+        self
+    }
+
+    pub fn rotated(mut self, rotation: Rotation) -> Self {
+        self.rotation = rotation;
+        self
+    }
+}
+
 pub struct Gt911 {
     claim: Claim,
     touch: TouchHandle,
@@ -65,10 +113,11 @@ impl std::fmt::Debug for Gt911 {
 }
 
 impl Gt911 {
-    pub fn new(claim: Claim, width: u16, height: u16, rotation: Rotation) -> Self {
+    pub fn new(claim: Claim, geometry: Geometry) -> Self {
+        let Geometry { width, height, point_width, point_height, rotation } = geometry;
         Gt911 {
             claim,
-            touch: Arc::new(Mutex::new(TouchState::new(width, height, rotation))),
+            touch: Arc::new(Mutex::new(TouchState::new(point_width, point_height, rotation))),
             width,
             height,
             cursor: 0,
@@ -225,5 +274,104 @@ impl Peripheral for Gt911 {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vpb::input::PointerPhase;
+
+    /// The T-Deck's panel, in the frame its point registers actually use.
+    ///
+    /// The numbers come from PURR OS's own driver, which measured them on
+    /// hardware rather than trusting the datasheet: the raw fields span
+    /// 0..=311 and 0..=235, and the panel reads back a quarter turn from the
+    /// display. Points are one past each maximum, since a span of 0..=311 is
+    /// 312 values wide.
+    fn t_deck() -> Geometry {
+        Geometry::new(320, 240).points(312, 236).rotated(Rotation::Cw270)
+    }
+
+    /// PURR OS's transform, transcribed from `drivers/touch/gt911/gt911.c`.
+    ///
+    /// This is the half of the contract we do not control. Writing it out
+    /// here is what makes the test meaningful: it fails if our model stops
+    /// agreeing with the firmware, not merely with itself.
+    fn firmware_maps(raw_x: u16, raw_y: u16) -> (i32, i32) {
+        const LCD_W: i32 = 320;
+        const LCD_H: i32 = 240;
+        const NATIVE_X_MAX: i32 = 311;
+        const NATIVE_Y_MAX: i32 = 235;
+
+        let sx = (i32::from(raw_y) * LCD_W) / NATIVE_Y_MAX;
+        let sy = (LCD_H - 1) - (i32::from(raw_x) * LCD_H) / NATIVE_X_MAX;
+        (sx.clamp(0, LCD_W - 1), sy.clamp(0, LCD_H - 1))
+    }
+
+    /// Where the firmware believes a click at `(x, y)` on the displayed
+    /// 320x240 image happened.
+    fn round_trip(geometry: Geometry, x: f32, y: f32) -> (i32, i32) {
+        let panel = Gt911::new(Claim::I2c { controller: 0, address: 0x5d, alt: None }, geometry);
+        let mut touch = panel.touch().lock().unwrap();
+        touch.pointer(PointerPhase::Press, x, y, 320.0, 240.0);
+        let point = touch.current().expect("a press inside the image is a touch");
+        firmware_maps(point.x, point.y)
+    }
+
+    #[track_caller]
+    fn lands_at(x: f32, y: f32, want: (i32, i32)) {
+        let got = round_trip(t_deck(), x, y);
+        // Two axes of integer division, each rounding down; a couple of
+        // pixels of slack is the arithmetic, not a mapping error.
+        let slack = (got.0 - want.0).abs() <= 2 && (got.1 - want.1).abs() <= 2;
+        assert!(slack, "click ({x}, {y}) reached the firmware as {got:?}, wanted {want:?}");
+    }
+
+    #[test]
+    fn taps_land_where_the_firmware_thinks_they_did() {
+        lands_at(160.0, 120.0, (160, 120));
+        lands_at(0.0, 0.0, (0, 0));
+        lands_at(319.0, 0.0, (319, 0));
+        lands_at(0.0, 239.0, (0, 239));
+        lands_at(319.0, 239.0, (319, 239));
+        // Off-centre and asymmetric, which is where a swapped axis hides.
+        lands_at(80.0, 60.0, (80, 60));
+        lands_at(240.0, 180.0, (240, 180));
+    }
+
+    #[test]
+    fn passing_screen_coordinates_straight_through_is_what_broke_it() {
+        // The old configuration: no rotation, points assumed to span the
+        // display. Kept as a test because the failure is so plausible-looking
+        // -- the centre still lands on the centre, so the one gesture anybody
+        // tries first (tap to unlock) works, and everything else is wrong.
+        let naive = Geometry::new(320, 240);
+        let centre = round_trip(naive, 160.0, 120.0);
+        assert!((centre.0 - 160).abs() <= 4 && (centre.1 - 120).abs() <= 4, "{centre:?}");
+
+        let corner = round_trip(naive, 10.0, 10.0);
+        assert!(corner.1 > 200, "the top of the screen reported as the bottom: {corner:?}");
+    }
+
+    #[test]
+    fn a_board_that_has_not_been_measured_maps_one_to_one() {
+        let plain = Geometry::new(320, 240);
+        assert_eq!(plain.point_width, 320);
+        assert_eq!(plain.point_height, 240);
+        assert_eq!(plain.rotation, Rotation::None);
+    }
+
+    #[test]
+    fn the_advertised_resolution_is_not_the_point_range() {
+        // A driver reading X_RESOLUTION still sees the display's numbers,
+        // which is what the chip does on hardware even though its points
+        // span something else.
+        let mut panel =
+            Gt911::new(Claim::I2c { controller: 0, address: 0x5d, alt: None }, t_deck());
+        panel.cursor = reg::X_RESOLUTION;
+        let res = panel.read(4);
+        assert_eq!(u16::from_le_bytes([res[0], res[1]]), 320);
+        assert_eq!(u16::from_le_bytes([res[2], res[3]]), 240);
     }
 }

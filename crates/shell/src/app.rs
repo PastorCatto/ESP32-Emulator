@@ -724,6 +724,23 @@ impl App {
         let Ok(mut state) = touch.lock() else { return };
         match (phase, pointer) {
             (PointerPhase::Release, _) => {
+                // A click whose press and release both landed in the same
+                // frame arrives here having never been pressed, and releasing
+                // something that was never touched does nothing -- the tap
+                // vanishes. Frames get slow enough for that to happen (the
+                // panel is repainted from an emulated bus), so put the press
+                // in first and let the release follow it.
+                if !state.is_touched() {
+                    if let Some(pos) = pointer.filter(|p| rect.contains(*p)) {
+                        state.pointer(
+                            PointerPhase::Press,
+                            pos.x - rect.min.x,
+                            pos.y - rect.min.y,
+                            rect.width(),
+                            rect.height(),
+                        );
+                    }
+                }
                 state.pointer(PointerPhase::Release, 0.0, 0.0, rect.width(), rect.height());
             }
             (phase, Some(pos)) => state.pointer(
