@@ -92,6 +92,34 @@ impl App {
         }
     }
 
+    /// Start with files already loaded, as if they had been dropped in.
+    ///
+    /// Routed through the same classifier, so a path argument and a drag
+    /// behave identically -- including the ordering rule that a board file
+    /// resets the session, which is why boards are applied first.
+    pub fn with_files(
+        cc: &eframe::CreationContext<'_>,
+        paths: &[PathBuf],
+        autostart: bool,
+    ) -> Self {
+        let mut app = App::new(cc);
+
+        let is_board = |p: &PathBuf| {
+            matches!(classify(p, &read_head(p, 64)), DropKind::BoardDefinition)
+        };
+        for path in paths.iter().filter(|p| is_board(p)) {
+            app.handle_drop(path);
+        }
+        for path in paths.iter().filter(|p| !is_board(p)) {
+            app.handle_drop(path);
+        }
+
+        if autostart && app.session.firmware.is_some() {
+            app.boot();
+        }
+        app
+    }
+
     fn note(&mut self, text: impl Into<String>) {
         self.notes.push(Note { text: text.into(), error: false });
         self.trim_notes();

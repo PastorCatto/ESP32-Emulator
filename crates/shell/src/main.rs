@@ -10,7 +10,23 @@ mod screen;
 mod terminal;
 mod session;
 
+/// Files named on the command line, classified the same way a drop is.
+///
+/// Dragging things in is the intended way to use this, but a path argument is
+/// what makes the app usable from a shell, a desktop "open with", and a script
+/// that wants to reproduce a run.
+///
+/// Usage: esp32-emulator [firmware.bin] [card.img] [board.toml] [--run]
 fn main() -> eframe::Result<()> {
+    let mut paths = Vec::new();
+    let mut autostart = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--run" => autostart = true,
+            _ => paths.push(std::path::PathBuf::from(arg)),
+        }
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 720.0])
@@ -22,6 +38,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "ESP32 Emulator",
         options,
-        Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(app::App::with_files(cc, &paths, autostart)))),
     )
 }
