@@ -10,10 +10,16 @@ use flashimg::{Chip, Dropped, FlashImage, FlashSize};
 use qemuctl::{Instance, LaunchConfig, Qemu};
 use std::path::{Path, PathBuf};
 
+/// Where the application image starts in flash. Every default partition
+/// layout puts it here.
+const APP_OFFSET: usize = 0x10000;
+
 /// What a dropped file was understood to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DropKind {
     Firmware,
+    /// An ELF. Not bootable, but it carries the symbols patching needs.
+    Symbols,
     BoardDefinition,
     SdCard,
     Unrecognised,
@@ -22,7 +28,13 @@ pub enum DropKind {
 /// Classify by content where we can, extension only as a fallback. A firmware
 /// image is identified by its header, not by being called `.bin`.
 pub fn classify(path: &Path, head: &[u8]) -> DropKind {
-    if flashimg::AppImage::looks_like_image(head) || head.starts_with(b"\x7fELF") {
+    // An ELF is never the thing we boot -- the bootloader wants a flash image
+    // -- but it is the only place the symbol table lives, so it is useful in
+    // its own right rather than an error.
+    if head.starts_with(b"\x7fELF") {
+        return DropKind::Symbols;
+    }
+    if flashimg::AppImage::looks_like_image(head) {
         return DropKind::Firmware;
     }
     match path
@@ -33,7 +45,8 @@ pub fn classify(path: &Path, head: &[u8]) -> DropKind {
     {
         Some("toml") => DropKind::BoardDefinition,
         Some("img" | "vhd" | "vhdx" | "iso") => DropKind::SdCard,
-        Some("bin" | "elf") => DropKind::Firmware,
+        Some("elf") => DropKind::Symbols,
+        Some("bin") => DropKind::Firmware,
         _ => DropKind::Unrecognised,
     }
 }
@@ -104,6 +117,26 @@ pub struct LoadedFirmware {
     pub size: usize,
 }
 
+/// A symbol table for the firmware, loaded from its `.elf`.
+///
+/// Kept separate from the firmware itself because they arrive separately: an
+/// ELF is not bootable and a `.bin` carries no symbols, so patching needs
+/// both and neither implies the other.
+pub struct LoadedSymbols {
+    pub path: PathBuf,
+    pub count: usize,
+    table: flashimg::ElfSymbols,
+}
+
+impl std::fmt::Debug for LoadedSymbols {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadedSymbols")
+            .field("path", &self.path)
+            .field("count", &self.count)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Everything about a running (or ready-to-run) machine.
 #[derive(Debug)]
 pub struct Session {
@@ -114,6 +147,13 @@ pub struct Session {
     pub serial: SerialLog,
     /// Disk image backing the SD card, when one has been dropped in.
     pub sd_image: Option<PathBuf>,
+    /// Symbols for the loaded firmware, from a dropped `.elf`. Patching needs
+    /// them: functions are located by name, never guessed at.
+    pub symbols: Option<LoadedSymbols>,
+    /// Patches applied to the assembled image, in the order they went in.
+    /// Cleared whenever the firmware is reloaded, because that rewrites the
+    /// image from its source.
+    pub patches: Vec<flashimg::patch::Applied>,
     /// The device models and the bus server, alive only while running.
     pub hardware: Option<Hardware>,
 }
@@ -127,6 +167,8 @@ impl Session {
             instance: None,
             serial: SerialLog::default(),
             sd_image: None,
+            symbols: None,
+            patches: Vec::new(),
             hardware: None,
         }
     }
@@ -197,8 +239,49 @@ impl Session {
             idf_version: descriptor.as_ref().map(|d| d.idf_version.clone()),
             size: raw.len(),
         });
+        // The image was just rewritten from source, so any patches are gone.
+        self.patches.clear();
         self.flash_path = Some(flash_path);
         Ok(())
+    }
+
+    /// Read a `.elf` for its symbols. Does not patch anything by itself.
+    pub fn load_symbols(&mut self, path: &Path) -> Result<usize, SessionError> {
+        let raw = std::fs::read(path)?;
+        let table = flashimg::ElfSymbols::parse(&raw)?;
+        let count = table.len();
+        self.symbols = Some(LoadedSymbols {
+            path: path.to_path_buf(),
+            count,
+            table,
+        });
+        Ok(count)
+    }
+
+    /// Can the radio bypass be applied right now?
+    pub fn can_patch(&self) -> bool {
+        self.flash_path.is_some() && self.symbols.is_some() && self.patches.is_empty()
+    }
+
+    /// Replace the radio entry points in the assembled image.
+    ///
+    /// A separate step from booting, and it says what it did, because
+    /// patched firmware is not running what it would run on hardware. Doing
+    /// it silently as part of "run" would make that invisible.
+    pub fn patch_radio(&mut self) -> Result<usize, SessionError> {
+        let (Some(flash_path), Some(symbols)) = (self.flash_path.clone(), self.symbols.as_ref())
+        else {
+            return Ok(0);
+        };
+
+        let mut flash = std::fs::read(&flash_path)?;
+        let patcher = flashimg::patch::Patcher::new(&symbols.table, &flash, APP_OFFSET)?;
+        let applied = patcher.apply(&mut flash, &flashimg::patch::radio_bypass())?;
+        std::fs::write(&flash_path, &flash)?;
+
+        let n = applied.len();
+        self.patches = applied;
+        Ok(n)
     }
 
     /// Start the machine. Replaces any currently running one.
@@ -452,8 +535,19 @@ mod tests {
     }
 
     #[test]
-    fn elf_is_recognised_as_firmware() {
-        assert_eq!(classify(Path::new("f.elf"), b"\x7fELF\x02\x01"), DropKind::Firmware);
+    fn an_elf_is_symbols_not_something_to_boot() {
+        // The bootloader wants a flash image, so an ELF is never what we run
+        // -- but it is the only place the symbol table lives, and patching
+        // locates functions by symbol. Classifying it as firmware made
+        // dropping one an error instead of the useful thing it is.
+        assert_eq!(
+            classify(Path::new("f.elf"), b"\x7fELF\x02\x01"),
+            DropKind::Symbols
+        );
+        assert_eq!(
+            classify(Path::new("no-extension"), b"\x7fELF\x02\x01"),
+            DropKind::Symbols
+        );
     }
 
     #[test]

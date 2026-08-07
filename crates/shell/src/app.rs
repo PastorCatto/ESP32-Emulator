@@ -152,6 +152,7 @@ impl App {
         match classify(path, &head) {
             DropKind::Firmware => self.load_firmware(path),
             DropKind::BoardDefinition => self.load_board(path),
+            DropKind::Symbols => self.load_symbols(path),
             DropKind::SdCard => self.load_sd_image(path),
             DropKind::Unrecognised => {
                 self.error(format!("{}: not something I recognise", name_of(path)))
@@ -187,6 +188,36 @@ impl App {
                 }
             }
             Err(e) => self.error(format!("{}: {e}", name_of(path))),
+        }
+    }
+
+    /// Load an ELF's symbols, which is what makes patching possible.
+    fn load_symbols(&mut self, path: &Path) {
+        match self.session.load_symbols(path) {
+            Ok(n) => self.note(format!("Symbols: {} ({n} symbols)", name_of(path))),
+            Err(e) => self.error(format!("{}: {e}", name_of(path))),
+        }
+    }
+
+    /// Replace the radio entry points in the assembled image.
+    ///
+    /// Its own action rather than part of booting. Patched firmware is not
+    /// running what it would run on hardware, and burying that inside "run"
+    /// would make it invisible at exactly the moment it matters.
+    fn patch_radio(&mut self) {
+        match self.session.patch_radio() {
+            Ok(0) => self.error("Nothing to patch: load firmware and its .elf first"),
+            Ok(n) => {
+                self.note(format!("Patched {n} radio entry points — this image no longer runs the code hardware would"));
+                let details: Vec<String> = self
+                    .session
+                    .patches
+                    .iter()
+                    .map(|p| format!("{} @ {:#010x}", p.symbol, p.address))
+                    .collect();
+                self.note(details.join(", "));
+            }
+            Err(e) => self.error(format!("Patch failed: {e}")),
         }
     }
 
@@ -375,6 +406,51 @@ impl App {
                 }
 
                 ui.separator();
+
+                // Patching and booting are separate buttons as well as a
+                // combined one, so the one-shot path is convenient without
+                // making the two-step path harder to reach.
+                let can_patch = self.session.can_patch();
+                let patched = !self.session.patches.is_empty();
+                let patch_hint = if patched {
+                    "Already patched; reload the firmware to start over"
+                } else if self.session.symbols.is_none() {
+                    "Drop the firmware's .elf first — patches are located by symbol"
+                } else if !have_fw {
+                    "Load firmware first"
+                } else {
+                    "Replace the radio entry points so the boot completes"
+                };
+                if ui
+                    .add_enabled(can_patch, egui::Button::new("Bypass radio"))
+                    .on_hover_text(patch_hint)
+                    .on_disabled_hover_text(patch_hint)
+                    .clicked()
+                {
+                    self.patch_radio();
+                }
+                if ui
+                    .add_enabled(can_patch && !running, egui::Button::new("Bypass + boot"))
+                    .on_hover_text("Patch, then start")
+                    .clicked()
+                {
+                    self.patch_radio();
+                    if !self.session.patches.is_empty() {
+                        self.boot();
+                    }
+                }
+                if patched {
+                    ui.label(
+                        RichText::new(format!("⚑ {} patched", self.session.patches.len()))
+                            .small()
+                            .color(Color32::from_rgb(230, 180, 100)),
+                    )
+                    .on_hover_text(
+                        "This image no longer runs the code hardware would run",
+                    );
+                }
+
+                ui.separator();
                 // The serial backdoor: a real terminal in its own window, for
                 // driving a firmware shell rather than just watching a boot.
                 let label = if self.terminal.open {
@@ -431,6 +507,47 @@ impl App {
                             }
                             row("Size", format!("{:.1} KiB", fw.size as f32 / 1024.0));
                         });
+                    }
+                }
+
+                ui.add_space(12.0);
+                ui.heading("Patches");
+                match &self.session.symbols {
+                    Some(s) => {
+                        ui.label(
+                            RichText::new(format!(
+                                "symbols: {} ({})",
+                                name_of(&s.path),
+                                s.count
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new(
+                                "Drop the firmware's .elf to enable patching. \
+                                 Functions are located by symbol, never guessed.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    }
+                }
+                if self.session.patches.is_empty() {
+                    ui.label(RichText::new("none applied").small().weak());
+                } else {
+                    ui.colored_label(
+                        Color32::from_rgb(230, 180, 100),
+                        RichText::new("not what hardware would run").small(),
+                    );
+                    for p in &self.session.patches {
+                        ui.label(
+                            RichText::new(format!("{} @ {:#010x}", p.symbol, p.address))
+                                .small()
+                                .monospace(),
+                        );
                     }
                 }
 

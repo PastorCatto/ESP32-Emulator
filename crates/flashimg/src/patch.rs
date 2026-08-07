@@ -97,6 +97,45 @@ pub struct Patch {
     pub reason: &'static str,
 }
 
+/// Everything needed to boot firmware whose radio cannot be emulated.
+///
+/// `esp_phy_enable` is the one that matters: without it a boot stops there
+/// forever. The rest keep the Wi-Fi driver's own state machine consistent
+/// afterwards, so firmware believes the interface came up and carries on.
+///
+/// Shared by the UI and the command-line tool deliberately -- two lists that
+/// drift apart would mean the tool and the application patch differently, and
+/// only one of them would be the one you tested.
+pub fn radio_bypass() -> Vec<Patch> {
+    let ok = |name: &str, reason| Patch {
+        symbol: name.into(),
+        stub: Stub::ReturnConst(0),
+        reason,
+    };
+    vec![
+        Patch {
+            symbol: "esp_phy_enable".into(),
+            stub: Stub::ReturnVoid,
+            reason: "calibrates a radio that does not exist; never returns",
+        },
+        ok("esp_wifi_init", "would start the MAC"),
+        ok("esp_wifi_set_mode", "driver state only"),
+        ok("esp_wifi_set_config", "driver state only"),
+        ok("esp_wifi_start", "would bring the MAC up"),
+        ok("esp_wifi_stop", "nothing to stop"),
+        ok("esp_wifi_disconnect", "nothing to disconnect"),
+        ok("esp_wifi_connect", "no radio to associate with"),
+        // Reports failure rather than an empty result: an empty scan is
+        // indistinguishable from a real scan of an empty room, and it would
+        // also send the caller into an uninitialised result buffer.
+        Patch {
+            symbol: "esp_wifi_scan_start".into(),
+            stub: Stub::ReturnConst(1),
+            reason: "no radio to hear beacons; reports failure",
+        },
+    ]
+}
+
 /// A patch that was applied, for reporting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Applied {

@@ -11,7 +11,7 @@
 //! That is the point, and it should never be a surprise -- so this prints
 //! every patch it makes.
 
-use flashimg::patch::{Patch, Patcher, Stub};
+use flashimg::patch::Patcher;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -28,35 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // partition table instead.
     const APP_OFFSET: usize = 0x10000;
 
-    // ESP_OK for everything that only sets driver state, so firmware believes
-    // Wi-Fi came up; a real failure for the calls that would need a radio.
-    let ok = |name: &str, reason| Patch {
-        symbol: name.into(),
-        stub: Stub::ReturnConst(0),
-        reason,
-    };
-    let patches = [
-        Patch {
-            symbol: "esp_phy_enable".into(),
-            stub: Stub::ReturnVoid,
-            reason: "calibrates a radio that does not exist; never returns",
-        },
-        ok("esp_wifi_init", "would start the MAC"),
-        ok("esp_wifi_set_mode", "driver state only"),
-        ok("esp_wifi_set_config", "driver state only"),
-        ok("esp_wifi_start", "would bring the MAC up"),
-        ok("esp_wifi_stop", "nothing to stop"),
-        ok("esp_wifi_disconnect", "nothing to disconnect"),
-        ok("esp_wifi_connect", "no radio to associate with"),
-        // Scanning needs beacons off the air. Failing cleanly is honest and
-        // stops the caller before it reads an uninitialised result buffer;
-        // returning ESP_OK without filling one hands it garbage SSIDs.
-        Patch {
-            symbol: "esp_wifi_scan_start".into(),
-            stub: Stub::ReturnConst(1),
-            reason: "no radio to hear beacons; reports failure",
-        },
-    ];
+    let patches = flashimg::patch::radio_bypass();
 
     let patcher = Patcher::new(&symbols, &flash, APP_OFFSET)?;
     let applied = patcher.apply(&mut flash, &patches)?;
