@@ -43,7 +43,9 @@ fn main() -> std::io::Result<()> {
     // emulator disconnects. There is no window yet, so a file is how you find
     // out whether the panel is being driven correctly.
     let snapshot = std::env::args().nth(3);
-    let screen = devices::st7789::Screen::handle(320, 240);
+    // The T-Deck's panel is wired inverted (`invert = true` in its board
+    // file), which is why its driver sends INVON and leaves it on.
+    let screen = devices::st7789::Screen::handle(320, 240, true);
     registry
         .register(Box::new(devices::St7789::new(
             vpb::Claim::Spi { controller: 2, cs: 0 },

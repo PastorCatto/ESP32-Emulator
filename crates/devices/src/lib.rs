@@ -27,7 +27,7 @@ mod display_tests {
     use vpb::{Claim, Peripheral, Transaction};
 
     fn panel() -> (St7789, ScreenHandle) {
-        let screen = Screen::handle(8, 4);
+        let screen = Screen::handle(8, 4, false);
         (St7789::new(Claim::Spi { controller: 2, cs: 0 }, screen.clone()), screen)
     }
 
@@ -138,6 +138,32 @@ mod display_tests {
             before,
             "a command wrote no pixels"
         );
+    }
+
+    #[test]
+    fn invon_against_an_inverted_panel_cancels_out() {
+        // The T-Deck's glass is wired inverted, so its driver sends INVON and
+        // leaves it on -- the controller's inversion is what makes the picture
+        // look right. Counting only the register produced a photo negative of
+        // a correctly driven display: black text on white, when the firmware
+        // had drawn white text on black.
+        let screen = Screen::handle(1, 1, true);
+        let mut p = St7789::new(Claim::Spi { controller: 2, cs: 0 }, screen.clone());
+
+        window(&mut p, (0, 0), (0, 0));
+        send(&mut p, false, &[0x2c]);
+        send(&mut p, true, &[0x00, 0x00]);
+        assert_eq!(&rgb(&screen)[0..3], &[255, 255, 255], "panel alone inverts");
+
+        send(&mut p, false, &[0x21]);
+        assert_eq!(
+            &rgb(&screen)[0..3],
+            &[0, 0, 0],
+            "INVON cancels the panel, so a black pixel shows black"
+        );
+
+        send(&mut p, false, &[0x20]);
+        assert_eq!(&rgb(&screen)[0..3], &[255, 255, 255], "INVOFF inverts again");
     }
 
     #[test]

@@ -34,13 +34,27 @@ pub struct Screen {
     pub on: bool,
     /// Set by MADCTL: the 16-bit values are B-G-R rather than R-G-B.
     pub bgr: bool,
+    /// The controller's own inversion state, as INVON and INVOFF set it.
     pub inverted: bool,
+    /// Whether the glass is wired inverted, from the board file's `invert`.
+    ///
+    /// Not the same thing as the register above, and the difference is
+    /// visible. Essentially every ST7789 IPS module -- the T-Deck's included
+    /// -- is wired so that the panel inverts on its own, which is why drivers
+    /// send INVON during init and leave it on: the controller's inversion is
+    /// what *cancels* the glass and makes the picture look right.
+    ///
+    /// So the two have to be combined. Modelling only the register gives a
+    /// photo negative of a correctly driven display, which reads as a bug in
+    /// the colour conversion and is not one.
+    pub panel_inverts: bool,
 }
 
 pub type ScreenHandle = Arc<Mutex<Screen>>;
 
 impl Screen {
-    pub fn new(width: u16, height: u16) -> Self {
+    /// `panel_inverts` comes from the board file's `invert` flag.
+    pub fn new(width: u16, height: u16, panel_inverts: bool) -> Self {
         Self {
             width,
             height,
@@ -49,11 +63,18 @@ impl Screen {
             on: false,
             bgr: false,
             inverted: false,
+            panel_inverts,
         }
     }
 
-    pub fn handle(width: u16, height: u16) -> ScreenHandle {
-        Arc::new(Mutex::new(Self::new(width, height)))
+    pub fn handle(width: u16, height: u16, panel_inverts: bool) -> ScreenHandle {
+        Arc::new(Mutex::new(Self::new(width, height, panel_inverts)))
+    }
+
+    /// What the glass actually shows: the controller's inversion applied on
+    /// top of the panel's own, so two inversions cancel.
+    pub fn shows_inverted(&self) -> bool {
+        self.inverted != self.panel_inverts
     }
 
     /// The image as 8-bit RGB triples, ready to hand to a texture upload.
@@ -63,9 +84,10 @@ impl Screen {
     /// instead of a half-converted buffer.
     pub fn rgb888(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.pixels.len() * 3);
+        let invert = self.shows_inverted();
 
         for &pixel in &self.pixels {
-            let p = if self.inverted { !pixel } else { pixel };
+            let p = if invert { !pixel } else { pixel };
             // 5-6-5 scaled to 8 bits by repeating the high bits, which keeps
             // full white at 0xff instead of 0xf8.
             let hi = ((p >> 11) & 0x1f) as u8;
