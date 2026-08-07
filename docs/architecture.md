@@ -215,7 +215,8 @@ segment loads, octal PSRAM detection and `app_init`, then:
   bulk DMA mode and pushes full 320×240 framebuffers, ten chunks per frame —
   and those pixels are decoded back into an image, so its boot splash comes
   out the other end;
-- registers the trackball and the BBQ20 keyboard;
+- finds the GT911 touch controller on I²C — `GT911 at 0x5D — ID: 911` — and
+  registers it, along with the trackball and the BBQ20 keyboard;
 - loads its static modules and reaches Wi-Fi PHY init.
 
 It stops at `phy_init`, which is where the unmodelled Wi-Fi hardware begins —
@@ -251,8 +252,38 @@ headless` runs the same path with no window, which is how it gets tested.
 
 Still open: a freshly created `.img` has no filesystem on it, so the card
 initialises and then FATFS reports `FR_NO_FILESYSTEM`; a real card image
-mounts. I²C is unmodelled, so the GT911 touch controller is not found. Nothing
-sends input to the guest yet. Wi-Fi is untouched.
+mounts. The bus tracer works but has no pane of its own in the UI. Wi-Fi is
+untouched.
+
+### The S3 renumbered the I²C command opcodes
+
+Worth writing down because it is invisible. The ESP32 and ESP32-S3 use
+different values for the same I²C command-list opcodes:
+
+| | RESTART | WRITE | READ | STOP | END |
+| --- | --- | --- | --- | --- | --- |
+| ESP32 | 0 | 1 | 2 | 3 | 4 |
+| ESP32-S3 | **6** | 1 | **3** | **2** | 4 |
+
+A controller built from the ESP32's values compiles, runs every command list
+the driver programs, and never drives the bus: restart decodes as an unknown
+opcode, and reads and stops trade places. Nothing errors — the transaction
+completes, and every address reads as empty.
+
+From `components/hal/esp32s3/include/hal/i2c_ll.h`.
+
+### One connection per controller
+
+The emulator opens a separate vpb socket for each controller: SPI2, SPI3,
+I²C0, I²C1. The server therefore has to serve them concurrently — a thread per
+connection, sharing the registry behind a mutex. Handling them one at a time
+leaves every bus after the first sitting in the accept queue for the life of
+the machine, and the symptom is a bus whose traffic never arrives at all.
+
+The lock is taken per transaction rather than per connection, so a framebuffer
+push does not hold off a touch poll. Interleaving between buses is harmless:
+they are independent, and ordering within one is preserved by each having its
+own connection.
 
 ### Board files carry two different chip-select numbers
 

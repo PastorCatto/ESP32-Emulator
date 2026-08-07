@@ -6,6 +6,7 @@ use crate::terminal::Terminal;
 use boards::Board;
 use egui::{Color32, RichText};
 use std::path::{Path, PathBuf};
+use vpb::input::PointerPhase;
 use vpb::trace::TraceConfig;
 
 /// Boards compiled into the binary, so a fresh install has something to pick
@@ -296,6 +297,7 @@ impl eframe::App for App {
         self.status_bar(ui);
         self.side_panel(ui);
         self.display_panel(ui);
+        self.mimic_keyboard(&ctx);
         self.serial_console(ui);
         self.draw_drop_overlay(&ctx);
 
@@ -536,8 +538,94 @@ impl App {
                     ui.label(RichText::new(format!("{w}x{h}")).small().weak());
                 });
                 ui.separator();
-                self.screen_view.show(ui, &screen);
+                let response = self.screen_view.show(ui, &screen);
+                self.mimic_touch(ui, &response);
+
+                if self.session.hardware.as_ref().is_some_and(|h| h.touch.is_some()) {
+                    ui.label(
+                        RichText::new("click to touch · type to use the keyboard")
+                            .small()
+                            .weak(),
+                    );
+                }
             });
+    }
+
+    /// Turn mouse activity over the panel into touch events.
+    ///
+    /// Press, drag and release map straight through, so a drag gesture works
+    /// rather than only taps. The panel widget's own rectangle is the
+    /// reference frame, which is why this needs the response and not just the
+    /// pointer position -- the panel is scaled and centred.
+    fn mimic_touch(&mut self, ui: &egui::Ui, response: &egui::Response) {
+        let Some(touch) = self.session.hardware.as_ref().and_then(|h| h.touch.clone())
+        else {
+            return;
+        };
+        let rect = response.rect;
+        if rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return;
+        }
+
+        let pointer = ui.ctx().pointer_interact_pos();
+        let phase = if response.drag_started() || response.is_pointer_button_down_on() {
+            PointerPhase::Press
+        } else if response.drag_stopped() || ui.ctx().input(|i| i.pointer.any_released()) {
+            PointerPhase::Release
+        } else {
+            return;
+        };
+
+        let Ok(mut state) = touch.lock() else { return };
+        match (phase, pointer) {
+            (PointerPhase::Release, _) => {
+                state.pointer(PointerPhase::Release, 0.0, 0.0, rect.width(), rect.height());
+            }
+            (phase, Some(pos)) => state.pointer(
+                phase,
+                pos.x - rect.min.x,
+                pos.y - rect.min.y,
+                rect.width(),
+                rect.height(),
+            ),
+            _ => {}
+        }
+    }
+
+    /// Send typed characters to the emulated keyboard.
+    ///
+    /// Only while the window has focus and the user is not typing into the
+    /// terminal, which has its own input box and would otherwise receive
+    /// every keystroke twice.
+    fn mimic_keyboard(&mut self, ctx: &egui::Context) {
+        let Some(keys) = self.session.hardware.as_ref().and_then(|h| h.keys.clone())
+        else {
+            return;
+        };
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+
+        let typed: Vec<char> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Text(text) => Some(text.chars()),
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        });
+        for key in typed {
+            devices::TdeckKeyboard::press(&keys, key);
+        }
+        // Enter and Backspace do not arrive as Text events, and a shell is
+        // unusable without them.
+        for (key, code) in [(egui::Key::Enter, b'\r'), (egui::Key::Backspace, 8)] {
+            if ctx.input(|i| i.key_pressed(key)) {
+                devices::TdeckKeyboard::press(&keys, code as char);
+            }
+        }
     }
 
     fn serial_console(&mut self, ui: &mut egui::Ui) {

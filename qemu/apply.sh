@@ -163,6 +163,53 @@ insert_after "hw/xtensa/esp32s3.c" \
         ss->gpspi3.gdma_periph = GDMA_SPI3;" \
   "gpspi2.gdma = ESP_GDMA"
 
+# --- I2C (I2C0 / I2C1) ------------------------------------------------------
+#
+# There is an ESP32 I2C model in the tree, but nothing instantiates one on the
+# S3, so a board's I2C devices are simply absent. On a T-Deck that is the GT911
+# touchscreen and the BBQ20 keyboard, both probed during startup and both
+# reported missing.
+
+insert_after "hw/i2c/meson.build" \
+  "i2c_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('esp32_i2c.c'))" \
+  "i2c_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('esp32s3_i2c.c'))" \
+  "esp32s3_i2c.c"
+
+insert_after "hw/xtensa/esp32s3.c" \
+  '#include "hw/ssi/esp32s3_gpspi.h"' \
+  '#include "hw/i2c/esp32s3_i2c.h"' \
+  'hw/i2c/esp32s3_i2c.h'
+
+insert_after "hw/xtensa/esp32s3.c" \
+  "    Esp32s3GpspiState gpspi2;" \
+  "    Esp32s3I2CState i2c0;
+    Esp32s3I2CState i2c1;" \
+  "Esp32s3I2CState i2c0;"
+
+insert_after "hw/xtensa/esp32s3.c" \
+  '    object_initialize_child(obj, "gpspi2", &s->gpspi2, TYPE_ESP32S3_GPSPI);' \
+  '    object_initialize_child(obj, "i2c0", &s->i2c0, TYPE_ESP32S3_I2C);
+    object_initialize_child(obj, "i2c1", &s->i2c1, TYPE_ESP32S3_I2C);' \
+  'TYPE_ESP32S3_I2C);'
+
+# The controller number is what a device model routes on, so it has to match
+# the base address the driver talks to rather than being left at its default.
+insert_after "hw/xtensa/esp32s3.c" \
+  "    esp32s3_soc_add_periph_device(sys_mem, &s->gpspi3, DR_REG_SPI3_BASE);" \
+  "
+    s->i2c0.vpb_controller = 0;
+    sysbus_realize(SYS_BUS_DEVICE(&s->i2c0), &error_fatal);
+    esp32s3_soc_add_periph_device(sys_mem, &s->i2c0, DR_REG_I2C_EXT_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->i2c0), 0,
+                       qdev_get_gpio_in(intmatrix_dev, ETS_I2C_EXT0_INTR_SOURCE));
+
+    s->i2c1.vpb_controller = 1;
+    sysbus_realize(SYS_BUS_DEVICE(&s->i2c1), &error_fatal);
+    esp32s3_soc_add_periph_device(sys_mem, &s->i2c1, DR_REG_I2C1_EXT_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->i2c1), 0,
+                       qdev_get_gpio_in(intmatrix_dev, ETS_I2C_EXT1_INTR_SOURCE));" \
+  "DR_REG_I2C_EXT_BASE"
+
 # --- SD over SPI -----------------------------------------------------------
 #
 # The T-Deck's microSD shares the display's SPI bus. Without a card, SD init

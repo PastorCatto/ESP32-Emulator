@@ -40,6 +40,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     sess.boot()?;
     if let Some(hw) = &sess.hardware {
+        // VPB_TRACE=i2c,spi turns the bus tracer on for those buses.
+        if let Ok(buses) = std::env::var("VPB_TRACE") {
+            let has = |name: &str| buses.split(',').any(|b| b.trim() == name);
+            hw.set_trace(vpb::trace::TraceConfig {
+                i2c: has("i2c"),
+                spi: has("spi"),
+                uart: has("uart"),
+                gpio: has("gpio"),
+                decode: true,
+                max_bytes: 24,
+            });
+        }
         println!("bus on port {}", hw.port);
         println!("attached: {}", hw.attached.join(", "));
         println!("not modelled: {}", hw.unmodelled.join(", "));
@@ -48,9 +60,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Serial has to be drained or the pipe fills and the guest blocks on its
     // console -- which looks like a hang somewhere much more interesting.
     let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
+    let mut traced = 0usize;
     while std::time::Instant::now() < deadline {
         sess.pump();
+        // The channel is unbounded and a traced boot fills it fast, so this
+        // has to drain whether or not anything is printed.
+        if let Some(hw) = &sess.hardware {
+            for event in hw.events.try_iter() {
+                if let vpb::Event::Trace(record) = event {
+                    // Bounded: a framebuffer push alone is thousands of lines.
+                    if traced < 400 {
+                        eprintln!("{record}");
+                    }
+                    traced += 1;
+                }
+            }
+        }
         std::thread::sleep(Duration::from_millis(50));
+    }
+    if traced > 0 {
+        eprintln!("({traced} traced transactions)");
     }
 
     let connected = sess.hardware.as_ref().is_some_and(hardware::Hardware::is_connected);

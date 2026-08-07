@@ -12,9 +12,11 @@ vpb = { path = "../vpb" }
 
 [features]
 # Each device is a switch, so a build can carry only what it needs.
-default = ["sdcard", "st7789"]
+default = ["sdcard", "st7789", "gt911", "tdeck-keyboard"]
 sdcard = []
 st7789 = []
+gt911 = []
+tdeck-keyboard = []
 
 [lints]
 workspace = true

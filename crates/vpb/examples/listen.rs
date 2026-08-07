@@ -11,6 +11,7 @@
 //!   -global driver=ssi.esp32s3.gpspi,property=dc-gpio,value=11
 
 use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
 
 use vpb::registry::Registry;
 use vpb::trace::TraceConfig;
@@ -62,24 +63,35 @@ fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     eprintln!("vpb: listening on 127.0.0.1:{port}");
 
+    // Shared because the emulator opens one connection per controller and
+    // each is served on its own thread.
+    let registry = Arc::new(Mutex::new(registry));
+    let snapshot = snapshot.map(Arc::new);
+
     vpb::server::listen(
         &listener,
-        &mut registry,
-        &mut |event| {
+        &registry,
+        |event| {
             if let Event::Trace(record) = event {
                 println!("{record}");
             }
         },
-        &mut || eprintln!("vpb: emulator connected"),
-        &mut |outcome| {
+        || eprintln!("vpb: controller connected"),
+        move |outcome| {
             match outcome {
-                Ok(n) => eprintln!("vpb: emulator disconnected after {n} transactions"),
+                Ok(n) => eprintln!("vpb: connection closed after {n} transactions"),
                 Err(e) => eprintln!("vpb: connection ended: {e}"),
             }
+            // Written per closing connection: the display's controller closes
+            // when the machine stops, which is exactly when the frame is
+            // final, and rewriting it for the others costs nothing.
             let Some(path) = &snapshot else { return };
             let s = screen.lock().expect("screen");
+            if s.generation == 0 {
+                return;
+            }
             let out = devices::png::encode_rgb(s.width.into(), s.height.into(), &s.rgb888());
-            match std::fs::write(path, &out) {
+            match std::fs::write(path.as_str(), &out) {
                 Ok(()) => eprintln!(
                     "vpb: wrote {path} ({}x{}, {} writes, panel {})",
                     s.width,

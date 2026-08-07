@@ -11,14 +11,17 @@
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use boards::{Board, PeripheralSpec};
+use devices::gt911::TouchHandle;
+use devices::keyboard::KeyQueue;
 use devices::st7789::{Screen, ScreenHandle};
 use vpb::registry::Registry;
 use vpb::trace::TraceConfig;
+use vpb::input::Rotation;
 use vpb::{Claim, Event, Peripheral};
 
 /// What the UI needs to know about the bus while it runs.
@@ -28,6 +31,10 @@ pub struct Hardware {
     pub port: u16,
     /// The display, when the board has one this build can model.
     pub screen: Option<ScreenHandle>,
+    /// The touch panel, for the UI to feed mouse events into.
+    pub touch: Option<TouchHandle>,
+    /// The keyboard's pending-key queue, for the UI to type into.
+    pub keys: Option<KeyQueue>,
     /// Kinds that were attached, in board order.
     pub attached: Vec<String>,
     /// Kinds named by the board that this build has no model for.
@@ -62,14 +69,38 @@ impl Drop for Hardware {
     }
 }
 
-/// A model, plus anything the UI needs to reach into it afterwards.
+/// A model, plus the handles the UI needs to reach into it afterwards.
+///
+/// Taken at construction rather than recovered later: once the box is a
+/// `dyn Peripheral` the concrete type is gone, and getting it back would mean
+/// either a downcast -- which every third-party model would have to opt into
+/// -- or an unsound cast keyed on the device's own name string.
 struct Built {
     device: Box<dyn Peripheral>,
-    /// Taken here rather than recovered later: once the box is a
-    /// `dyn Peripheral` the concrete type is gone, and getting it back would
-    /// mean either a downcast -- which every third-party model would have to
-    /// opt into -- or an unsound cast keyed on the device's own name string.
     screen: Option<ScreenHandle>,
+    touch: Option<TouchHandle>,
+    keys: Option<KeyQueue>,
+}
+
+impl Built {
+    fn new(device: Box<dyn Peripheral>) -> Self {
+        Built { device, screen: None, touch: None, keys: None }
+    }
+
+    fn screen(mut self, handle: ScreenHandle) -> Self {
+        self.screen = Some(handle);
+        self
+    }
+
+    fn touch(mut self, handle: TouchHandle) -> Self {
+        self.touch = Some(handle);
+        self
+    }
+
+    fn keys(mut self, handle: KeyQueue) -> Self {
+        self.keys = Some(handle);
+        self
+    }
 }
 
 /// Build one device model from a board entry.
@@ -90,10 +121,24 @@ fn build(
             // `invert` describes the glass, not the controller's register.
             let inverts = spec.params.bool_or("invert", false).map_err(|e| e.to_string())?;
             let screen = Screen::handle(width, height, inverts);
-            Ok(Some(Built {
-                device: Box::new(devices::St7789::new(claim, screen.clone())),
-                screen: Some(screen),
-            }))
+            let panel = devices::St7789::new(claim, screen.clone());
+            Ok(Some(Built::new(Box::new(panel)).screen(screen)))
+        }
+        "gt911" => {
+            let claim = claim.ok_or("gt911 needs a bus and an address")?;
+            // The touch panel's own resolution, which is not always the
+            // display's -- though on a T-Deck it is.
+            let width = spec.params.u16_or("width", 320).map_err(|e| e.to_string())?;
+            let height = spec.params.u16_or("height", 240).map_err(|e| e.to_string())?;
+            let panel = devices::Gt911::new(claim, width, height, Rotation::None);
+            let touch = panel.touch().clone();
+            Ok(Some(Built::new(Box::new(panel)).touch(touch)))
+        }
+        "tdeck-keyboard" => {
+            let claim = claim.ok_or("tdeck-keyboard needs a bus and an address")?;
+            let kb = devices::TdeckKeyboard::new(claim);
+            let keys = kb.keys().clone();
+            Ok(Some(Built::new(Box::new(kb)).keys(keys)))
         }
         "sdcard" => {
             let claim = claim.ok_or("sdcard needs a bus and a chip select")?;
@@ -101,10 +146,7 @@ fn build(
             // legitimate way to run and not something to complain about.
             let Some(path) = sd_image else { return Ok(None) };
             let card = devices::SdCard::open(path, claim).map_err(|e| e.to_string())?;
-            Ok(Some(Built {
-                device: Box::new(card),
-                screen: None,
-            }))
+            Ok(Some(Built::new(Box::new(card))))
         }
         _ => Ok(None),
     }
@@ -117,6 +159,8 @@ fn build(
 pub fn start(board: &Board, sd_image: Option<PathBuf>) -> std::io::Result<Hardware> {
     let mut registry = Registry::new();
     let mut screen = None;
+    let mut touch = None;
+    let mut keys = None;
     let mut attached = Vec::new();
     let mut unmodelled = Vec::new();
 
@@ -124,9 +168,9 @@ pub fn start(board: &Board, sd_image: Option<PathBuf>) -> std::io::Result<Hardwa
         let claim = spec.claim().ok().flatten();
         match build(spec, claim, sd_image.as_deref()) {
             Ok(Some(built)) => {
-                if built.screen.is_some() {
-                    screen = built.screen;
-                }
+                screen = built.screen.or(screen);
+                touch = built.touch.or(touch);
+                keys = built.keys.or(keys);
                 match registry.register(built.device) {
                     Ok(_) => attached.push(spec.kind.clone()),
                     // A refused claim means two devices want the same address,
@@ -150,18 +194,22 @@ pub fn start(board: &Board, sd_image: Option<PathBuf>) -> std::io::Result<Hardwa
     let running = Arc::new(AtomicBool::new(true));
     let trace = Arc::new(Mutex::new(None));
 
-    let thread = Threaded {
+    let thread = Arc::new(Threaded {
+        connections: AtomicUsize::new(0),
         connected: connected.clone(),
         running: running.clone(),
         trace: trace.clone(),
-    };
+    });
+    let shared = Arc::new(Mutex::new(registry));
     std::thread::Builder::new()
         .name("vpb".into())
-        .spawn(move || serve_until_stopped(&listener, &mut registry, &tx, &thread))?;
+        .spawn(move || serve_until_stopped(&listener, &shared, &tx, &thread))?;
 
     Ok(Hardware {
         port,
         screen,
+        touch,
+        keys,
         attached,
         unmodelled,
         events,
@@ -174,16 +222,23 @@ pub fn start(board: &Board, sd_image: Option<PathBuf>) -> std::io::Result<Hardwa
 
 /// The half of [`Hardware`] the server thread owns a copy of.
 struct Threaded {
+    /// How many controllers are connected right now.
+    connections: AtomicUsize,
     connected: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     trace: Arc<Mutex<Option<TraceConfig>>>,
 }
 
+/// Accept and serve, one thread per connection.
+///
+/// The emulator opens a connection per controller -- SPI2, SPI3, I2C0, I2C1 --
+/// and holds each for the life of the machine, so serving them in turn would
+/// leave every bus after the first permanently waiting to be accepted.
 fn serve_until_stopped(
     listener: &TcpListener,
-    registry: &mut Registry,
+    registry: &Arc<Mutex<Registry>>,
     tx: &Sender<Event>,
-    shared: &Threaded,
+    shared: &Arc<Threaded>,
 ) {
     for stream in listener.incoming() {
         if !shared.running.load(Ordering::Relaxed) {
@@ -191,23 +246,41 @@ fn serve_until_stopped(
         }
         let Ok(stream) = stream else { continue };
 
+        let registry = Arc::clone(registry);
+        let shared = Arc::clone(shared);
+        let tx = tx.clone();
+
+        // Counted rather than a flag: with several connections, the last one
+        // to close is what "disconnected" means.
+        shared.connections.fetch_add(1, Ordering::Relaxed);
         shared.connected.store(true, Ordering::Relaxed);
-        // A send failure means the UI is gone, so there is nobody to tell.
-        let _ = vpb::server::serve_with(
-            stream,
-            registry,
-            &mut |event| {
-                let _ = tx.send(event);
-            },
-            &mut |registry| {
-                // Taken, not read: applying the same config on every one of
-                // thousands of transactions per second would be pure waste.
-                if let Some(config) = shared.trace.lock().ok().and_then(|mut s| s.take()) {
-                    registry.set_trace(config);
+
+        let spawned = std::thread::Builder::new()
+            .name("vpb-conn".into())
+            .spawn(move || {
+                // A send failure means the UI is gone; nobody to tell.
+                let _ = vpb::server::serve_with(
+                    stream,
+                    &registry,
+                    &mut |event| {
+                        let _ = tx.send(event);
+                    },
+                    &mut |registry| {
+                        // Taken, not read: reapplying the same config on every
+                        // one of thousands of transactions would be waste.
+                        let pending = shared.trace.lock().ok().and_then(|mut s| s.take());
+                        if let Some(config) = pending {
+                            registry.set_trace(config);
+                        }
+                    },
+                );
+                if shared.connections.fetch_sub(1, Ordering::Relaxed) == 1 {
+                    shared.connected.store(false, Ordering::Relaxed);
                 }
-            },
-        );
-        shared.connected.store(false, Ordering::Relaxed);
+            });
+        if spawned.is_err() {
+            return;
+        }
     }
 }
 
@@ -227,9 +300,21 @@ mod tests {
 
         assert!(hw.attached.contains(&"st7789".to_string()));
         assert!(hw.screen.is_some(), "the display must expose its frame");
-        // Named by the board, no model in this build. Reported, not dropped.
-        assert!(hw.unmodelled.iter().any(|k| k.starts_with("gt911")));
+        // Named by the board, no model in this build. Reported, not dropped:
+        // a board listing a radio should not behave like a board without one.
+        assert!(hw.unmodelled.iter().any(|k| k.starts_with("sx1262")));
         assert!(hw.port != 0, "the OS should have assigned a real port");
+    }
+
+    #[test]
+    fn the_i2c_devices_expose_their_input_handles() {
+        // Both are useless without these: the UI has no other way to say a
+        // key was pressed or the panel was touched.
+        let hw = start(&board(), None).expect("server should start");
+        assert!(hw.attached.contains(&"gt911".to_string()));
+        assert!(hw.attached.contains(&"tdeck-keyboard".to_string()));
+        assert!(hw.touch.is_some());
+        assert!(hw.keys.is_some());
     }
 
     #[test]

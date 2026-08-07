@@ -49,5 +49,24 @@ bool esp_vpb_spi_transfer(EspVpbClient *c, uint8_t controller, uint8_t cs,
                           int dc, const uint8_t *mosi, uint32_t len,
                           uint8_t *miso, uint32_t read_len);
 
+/**
+ * Forward one I2C write and wait for the acknowledgement.
+ *
+ * Unlike SPI, this always waits: `nacked` is how firmware learns an address
+ * is empty, and a bus scan is nothing but a sequence of one-byte writes whose
+ * only interesting result is whether they were answered.
+ *
+ * `stop` is false for the repeated start a register read begins with.
+ * Returns false when nothing is listening, leaving `nacked` clear -- an
+ * unattached bus is not the same as a device saying no.
+ */
+bool esp_vpb_i2c_write(EspVpbClient *c, uint8_t controller, uint8_t address,
+                       const uint8_t *data, uint32_t len, bool stop,
+                       bool *nacked);
+
+/** Forward one I2C read. See [esp_vpb_i2c_write] for `nacked`. */
+bool esp_vpb_i2c_read(EspVpbClient *c, uint8_t controller, uint8_t address,
+                      uint8_t *data, uint32_t len, bool *nacked);
+
 /** Release the connection, if any. */
 void esp_vpb_close(EspVpbClient *c);

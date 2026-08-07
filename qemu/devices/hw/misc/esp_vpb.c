@@ -125,12 +125,18 @@ static bool esp_vpb_write_frame(EspVpbClient *c, const char *header,
 /*
  * Read one frame, returning its payload.
  *
- * The header is only inspected for whether it is a data reply; a NACK or an
- * empty response both simply yield no bytes, which is what an absent device
- * looks like on a real bus.
+ * `nacked`, when given, reports whether the device refused the address. SPI
+ * has no such thing and passes NULL; I2C needs it, because a NACK is how
+ * firmware discovers which addresses are populated -- a bus scan that reads
+ * zeroes instead finds a device at every address.
+ *
+ * Matched as a substring rather than parsed. The header is machine-generated
+ * by one known writer, and a JSON parser in a device model is a dependency
+ * this does not need.
  */
 static bool esp_vpb_read_frame(EspVpbClient *c, uint8_t *payload,
-                               uint32_t payload_cap, uint32_t *payload_len)
+                               uint32_t payload_cap, uint32_t *payload_len,
+                               bool *nacked)
 {
     uint32_t prefix[2];
 
@@ -146,12 +152,15 @@ static bool esp_vpb_read_frame(EspVpbClient *c, uint8_t *payload,
         return false;
     }
 
-    /* Skip the header; we do not need to parse it to route the payload. */
     g_autofree char *header = g_malloc(header_len + 1);
     if (!esp_vpb_recv_all(c, header, header_len)) {
         return false;
     }
     header[header_len] = '\0';
+
+    if (nacked) {
+        *nacked = strstr(header, "\"reply\":\"nack\"") != NULL;
+    }
 
     uint32_t remaining = body_len - 4 - header_len;
     *payload_len = MIN(remaining, payload_cap);
@@ -244,7 +253,7 @@ bool esp_vpb_spi_transfer(EspVpbClient *c, uint8_t controller, uint8_t cs,
      * latency fine, because a real bus transaction blocks too.
      */
     uint32_t got = 0;
-    bool ok = esp_vpb_read_frame(c, miso, read_len, &got);
+    bool ok = esp_vpb_read_frame(c, miso, read_len, &got, NULL);
 
     if (!ok) {
         esp_vpb_fail(c, "no reply within the timeout");
@@ -252,5 +261,89 @@ bool esp_vpb_spi_transfer(EspVpbClient *c, uint8_t controller, uint8_t cs,
     }
 
     /* A short answer leaves the rest of the buffer as the caller set it. */
+    return got > 0;
+}
+
+/*
+ * Wait for the answer to a transaction that was sent with an id.
+ *
+ * Shared by both I2C directions, which unlike SPI always wait: a write has to
+ * know whether the address acknowledged.
+ */
+static bool esp_vpb_await(EspVpbClient *c, uint8_t *data, uint32_t len,
+                          uint32_t *got, bool *nacked)
+{
+    qemu_socket_set_block(c->fd);
+#ifdef _WIN32
+    DWORD tv = ESP_VPB_TIMEOUT_MS;
+#else
+    struct timeval tv = {
+        .tv_sec = ESP_VPB_TIMEOUT_MS / 1000,
+        .tv_usec = (ESP_VPB_TIMEOUT_MS % 1000) * 1000,
+    };
+#endif
+    setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+
+    if (!esp_vpb_read_frame(c, data, len, got, nacked)) {
+        esp_vpb_fail(c, "no reply within the timeout");
+        return false;
+    }
+    return true;
+}
+
+bool esp_vpb_i2c_write(EspVpbClient *c, uint8_t controller, uint8_t address,
+                       const uint8_t *data, uint32_t len, bool stop,
+                       bool *nacked)
+{
+    *nacked = false;
+    if (!esp_vpb_connect(c)) {
+        return false;
+    }
+    if (len > ESP_VPB_MAX_PAYLOAD) {
+        return false;
+    }
+
+    /*
+     * Always carries an id, unlike a write-only SPI transfer. The answer is
+     * the acknowledgement, and firmware acts on it.
+     */
+    uint64_t id = c->next_id++;
+    g_autofree char *header = g_strdup_printf(
+        "{\"type\":\"transact\",\"id\":%" PRIu64 ",\"op\":\"i2c_write\","
+        "\"controller\":%u,\"address\":%u,\"stop\":%s}",
+        id, controller, address, stop ? "true" : "false");
+
+    if (!esp_vpb_write_frame(c, header, data, len)) {
+        esp_vpb_fail(c, "send failed");
+        return false;
+    }
+
+    uint32_t got = 0;
+    return esp_vpb_await(c, NULL, 0, &got, nacked);
+}
+
+bool esp_vpb_i2c_read(EspVpbClient *c, uint8_t controller, uint8_t address,
+                      uint8_t *data, uint32_t len, bool *nacked)
+{
+    *nacked = false;
+    if (!esp_vpb_connect(c) || len > ESP_VPB_MAX_PAYLOAD) {
+        return false;
+    }
+
+    uint64_t id = c->next_id++;
+    g_autofree char *header = g_strdup_printf(
+        "{\"type\":\"transact\",\"id\":%" PRIu64 ",\"op\":\"i2c_read\","
+        "\"controller\":%u,\"address\":%u,\"len\":%u}",
+        id, controller, address, len);
+
+    if (!esp_vpb_write_frame(c, header, NULL, 0)) {
+        esp_vpb_fail(c, "send failed");
+        return false;
+    }
+
+    uint32_t got = 0;
+    if (!esp_vpb_await(c, data, len, &got, nacked)) {
+        return false;
+    }
     return got > 0;
 }

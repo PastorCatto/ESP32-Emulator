@@ -98,6 +98,9 @@ pub struct TouchState {
     /// Set on press, cleared once a driver has reported the release. Without
     /// this, a click shorter than one poll interval would be missed entirely.
     pending_release: bool,
+    /// Where the last press was, so a click that began and ended between two
+    /// polls still has coordinates to report.
+    last: Option<TouchPoint>,
 }
 
 impl TouchState {
@@ -108,6 +111,7 @@ impl TouchState {
             rotation,
             active: None,
             pending_release: false,
+            last: None,
         }
     }
 
@@ -176,9 +180,30 @@ impl TouchState {
     }
 
     fn release(&mut self) {
-        if self.active.take().is_some() {
+        if let Some(point) = self.active.take() {
+            self.last = Some(point);
             self.pending_release = true;
         }
+    }
+
+    /// What a polling touch controller should report right now.
+    ///
+    /// A press still held reports where it is. A press that started *and*
+    /// ended since the last poll reports once, at the point it happened, and
+    /// then stops -- the driver sees a press followed by a release on the
+    /// next poll, which is what a real fast tap looks like to it.
+    ///
+    /// Without that, a click faster than the poll interval disappears, and
+    /// clicking the emulated screen feels broken in a way that is very hard
+    /// to attribute to a missing branch here.
+    pub fn take_report(&mut self) -> Option<TouchPoint> {
+        if self.active.is_some() {
+            return self.active;
+        }
+        if std::mem::take(&mut self.pending_release) {
+            return self.last;
+        }
+        None
     }
 
     /// Map a point in the displayed area onto panel coordinates.

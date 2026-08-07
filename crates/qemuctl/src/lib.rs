@@ -360,10 +360,13 @@ impl LaunchConfig {
         // fine: they are told apart by the controller number in each
         // transaction, and the machine fans the D/C line out to both.
         if let Some(port) = self.vpb_port {
-            args.push("-global".into());
-            args.push(format!(
-                "driver=ssi.esp32s3.gpspi,property=vpb-port,value={port}"
-            ));
+            // Every controller type that can carry a device model needs
+            // pointing at the server. Missing one is silent: the bus works,
+            // the driver runs, and every address simply reads as empty.
+            for driver in ["ssi.esp32s3.gpspi", "i2c.esp32s3"] {
+                args.push("-global".into());
+                args.push(format!("driver={driver},property=vpb-port,value={port}"));
+            }
         }
         if let Some(pin) = self.display_dc_gpio {
             args.push("-global".into());

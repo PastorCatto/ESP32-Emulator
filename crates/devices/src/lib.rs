@@ -17,7 +17,172 @@ pub mod st7789;
 #[cfg(feature = "st7789")]
 pub use st7789::St7789;
 
+#[cfg(feature = "gt911")]
+pub mod gt911;
+
+#[cfg(feature = "gt911")]
+pub use gt911::Gt911;
+
+#[cfg(feature = "tdeck-keyboard")]
+pub mod keyboard;
+
+#[cfg(feature = "tdeck-keyboard")]
+pub use keyboard::TdeckKeyboard;
+
 pub mod png;
+
+#[cfg(all(test, feature = "gt911", feature = "tdeck-keyboard"))]
+mod i2c_tests {
+    use super::{Gt911, TdeckKeyboard};
+    use vpb::input::{PointerPhase, Rotation};
+    use vpb::registry::EventQueue;
+    use vpb::{Claim, Peripheral, Transaction};
+
+    fn touch_panel() -> Gt911 {
+        Gt911::new(
+            Claim::I2c { controller: 0, address: 0x5d, alt: None },
+            320,
+            240,
+            Rotation::None,
+        )
+    }
+
+    fn write(d: &mut impl Peripheral, bytes: &[u8]) {
+        let mut ev = EventQueue::default();
+        d.transact(
+            &Transaction::I2cWrite {
+                controller: 0,
+                address: 0x5d,
+                data: bytes.to_vec(),
+                stop: true,
+            },
+            &mut ev,
+        );
+    }
+
+    fn read(d: &mut impl Peripheral, len: u32) -> Vec<u8> {
+        let mut ev = EventQueue::default();
+        d.transact(
+            &Transaction::I2cRead { controller: 0, address: 0x5d, len },
+            &mut ev,
+        )
+        .payload()
+        .to_vec()
+    }
+
+    #[test]
+    fn the_product_id_is_what_every_driver_matches_on() {
+        let mut g = touch_panel();
+        // Register address is big-endian, unlike everything else on this chip.
+        write(&mut g, &[0x81, 0x40]);
+        assert_eq!(read(&mut g, 4), b"911\0");
+    }
+
+    #[test]
+    fn a_read_split_across_transfers_continues_from_the_cursor() {
+        // The S3's command list caps how many bytes one transfer carries, so
+        // ESP-IDF splits a 4-byte read into 3 and 1. Restarting at the seek
+        // address instead would return "911" twice and never the terminator.
+        let mut g = touch_panel();
+        write(&mut g, &[0x81, 0x40]);
+        assert_eq!(read(&mut g, 3), b"911");
+        assert_eq!(read(&mut g, 1), b"\0");
+    }
+
+    #[test]
+    fn resolution_is_reported_little_endian() {
+        let mut g = touch_panel();
+        write(&mut g, &[0x81, 0x46]);
+        assert_eq!(read(&mut g, 4), [0x40, 0x01, 0xf0, 0x00], "320 then 240");
+    }
+
+    #[test]
+    fn an_idle_panel_reports_ready_with_no_points() {
+        // Not "not ready": a driver polling for the buffer-ready bit before
+        // believing the count would wait forever.
+        let mut g = touch_panel();
+        write(&mut g, &[0x81, 0x4e]);
+        assert_eq!(read(&mut g, 1), [0x80]);
+    }
+
+    #[test]
+    fn a_press_shows_up_as_one_point_at_panel_coordinates() {
+        let mut g = touch_panel();
+        g.touch()
+            .lock()
+            .unwrap()
+            .pointer(PointerPhase::Press, 80.0, 60.0, 320.0, 240.0);
+
+        write(&mut g, &[0x81, 0x4e]);
+        assert_eq!(read(&mut g, 1), [0x81], "ready, one point");
+
+        write(&mut g, &[0x81, 0x4f]);
+        let p = read(&mut g, 8);
+        assert_eq!(u16::from_le_bytes([p[1], p[2]]), 80);
+        assert_eq!(u16::from_le_bytes([p[3], p[4]]), 60);
+    }
+
+    #[test]
+    fn the_point_stays_until_the_host_clears_the_status() {
+        // The host acknowledges by writing zero. Dropping the point before
+        // that loses touches whenever a poll lands mid-read.
+        let mut g = touch_panel();
+        g.touch()
+            .lock()
+            .unwrap()
+            .pointer(PointerPhase::Press, 10.0, 10.0, 320.0, 240.0);
+
+        write(&mut g, &[0x81, 0x4e]);
+        assert_eq!(read(&mut g, 1), [0x81]);
+        write(&mut g, &[0x81, 0x4e]);
+        assert_eq!(read(&mut g, 1), [0x81], "still there, unacknowledged");
+
+        write(&mut g, &[0x81, 0x4e, 0x00]);
+        g.touch().lock().unwrap().pointer(PointerPhase::Release, 10.0, 10.0, 320.0, 240.0);
+        // The release is still reported once -- see TouchState::take_report.
+        write(&mut g, &[0x81, 0x4e]);
+        assert_eq!(read(&mut g, 1), [0x81]);
+        write(&mut g, &[0x81, 0x4e, 0x00]);
+        write(&mut g, &[0x81, 0x4e]);
+        assert_eq!(read(&mut g, 1), [0x80], "and then nothing");
+    }
+
+    #[test]
+    fn the_configuration_block_reads_back_what_was_written() {
+        // Drivers write the config and re-read it to confirm; the T-Deck's
+        // corrects the resolution that way.
+        let mut g = touch_panel();
+        write(&mut g, &[0x80, 0x48, 0x40, 0x01, 0xf0, 0x00]);
+        write(&mut g, &[0x80, 0x48]);
+        assert_eq!(read(&mut g, 4), [0x40, 0x01, 0xf0, 0x00]);
+    }
+
+    #[test]
+    fn the_keyboard_reports_zero_when_nothing_is_pressed() {
+        let mut kb = TdeckKeyboard::new(Claim::I2c {
+            controller: 0,
+            address: 0x55,
+            alt: None,
+        });
+        assert_eq!(read(&mut kb, 1), [0]);
+
+        TdeckKeyboard::press(kb.keys(), 'k');
+        assert_eq!(read(&mut kb, 1), [b'k']);
+        assert_eq!(read(&mut kb, 1), [0], "and it is consumed");
+    }
+
+    #[test]
+    fn the_keyboard_drops_what_it_could_not_express() {
+        // One byte per key on the real part, so there is nowhere to put this.
+        let mut kb = TdeckKeyboard::new(Claim::I2c {
+            controller: 0,
+            address: 0x55,
+            alt: None,
+        });
+        TdeckKeyboard::press(kb.keys(), 'é');
+        assert_eq!(read(&mut kb, 1), [0]);
+    }
+}
 
 #[cfg(all(test, feature = "st7789"))]
 mod display_tests {

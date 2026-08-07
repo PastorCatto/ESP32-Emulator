@@ -63,6 +63,7 @@ if [ -n "$SD_IMG" ]; then
   # it the display model cannot tell a command byte from a pixel.
   VPB_ARGS=(
     -global driver=ssi.esp32s3.gpspi,property=vpb-port,value=$PORT
+    -global driver=i2c.esp32s3,property=vpb-port,value=$PORT
     -global driver=ssi.esp32s3.gpspi,property=dc-gpio,value="${DC_GPIO:-11}"
   )
 fi
