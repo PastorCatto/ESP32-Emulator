@@ -177,6 +177,15 @@ static void esp32s3_usj_reset_hold(Object *obj, ResetType type)
     s->tx_len = 0;
     s->rx_head = 0;
     s->rx_len = 0;
+
+    /*
+     * The IN endpoint starts empty, so its status bit starts set. Clearing it
+     * with everything else looks harmless and is not: the ROM console polls
+     * EP1_CONF's DATA_FREE and works either way, but once ESP-IDF installs
+     * the driver it waits for this interrupt before its first write -- and
+     * waits forever, because nothing has flushed yet to raise it.
+     */
+    s->regs[R_USJ_INT_RAW] = USJ_SERIAL_IN_EMPTY_INT;
     qemu_irq_lower(s->irq);
 }
 
