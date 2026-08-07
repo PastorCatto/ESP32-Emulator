@@ -73,6 +73,18 @@ fi
 DEBUG_ARGS=()
 [ -n "${QEMU_DEBUG:-}" ] && DEBUG_ARGS=(-d "$QEMU_DEBUG")
 
+# QEMU_TRACE enables trace events, e.g.
+#   QEMU_TRACE=memory_region_ops_read,memory_region_ops_write
+# which logs every MMIO access in the machine. Enormous -- a boot is millions
+# of lines -- but it answers "what does this driver actually touch, in what
+# order" in one run instead of one hang at a time.
+if [ -n "${QEMU_TRACE:-}" ]; then
+  IFS=, read -ra events <<<"$QEMU_TRACE"
+  for e in "${events[@]}"; do
+    DEBUG_ARGS+=(-trace "$e")
+  done
+fi
+
 "$QEMU" \
   -nographic -machine esp32s3 \
   "${DEBUG_ARGS[@]}" \

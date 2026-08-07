@@ -48,7 +48,9 @@ fi
   -drive file="$(win "$FLASH")",if=mtd,format=raw \
   -global driver=esp32s3.gpio,property=strap_mode,value=0x04 \
   "${VPB_ARGS[@]}" \
-  -serial null -serial null -serial file:"$(win "$LOG/serial.log")" \
+  -serial file:"$(win "$LOG/uart0.log")" \
+  -serial file:"$(win "$LOG/uart1.log")" \
+  -serial file:"$(win "$LOG/serial.log")" \
   -monitor tcp:127.0.0.1:$MON_PORT,server,nowait \
   >"$LOG/qemu.log" 2>&1 &
 QEMU_PID=$!
