@@ -312,7 +312,6 @@ impl Session {
     /// somewhere with no connection to the cause.
     pub fn can_patch(&self) -> bool {
         self.flash_path.is_some()
-            && self.symbols.is_some()
             && self.patches.is_empty()
             && self.symbol_match() != SymbolMatch::Mismatch
     }
@@ -323,14 +322,29 @@ impl Session {
     /// patched firmware is not running what it would run on hardware. Doing
     /// it silently as part of "run" would make that invisible.
     pub fn patch_radio(&mut self) -> Result<usize, SessionError> {
-        let (Some(flash_path), Some(symbols)) = (self.flash_path.clone(), self.symbols.as_ref())
-        else {
+        let Some(flash_path) = self.flash_path.clone() else {
             return Ok(0);
         };
+        // Symbols when the firmware shipped them, byte signatures when it did
+        // not. Mismatched symbols are refused earlier rather than quietly
+        // falling back here: a stale .elf gives confident, wrong addresses,
+        // and silently ignoring it would hide that the pair is broken.
+        let usable = self.symbols.as_ref().filter(|_| self.symbol_match() != SymbolMatch::Mismatch);
 
         let mut flash = std::fs::read(&flash_path)?;
-        let patcher = flashimg::patch::Patcher::new(&symbols.table, &flash, APP_OFFSET)?;
-        let applied = patcher.apply(&mut flash, &flashimg::patch::radio_bypass())?;
+        let mut patches = flashimg::patch::radio_bypass();
+        let patcher = match usable {
+            Some(symbols) => {
+                flashimg::patch::Patcher::new(&symbols.table, &flash, APP_OFFSET)?
+            }
+            None => {
+                // Not every entry point has a signature worth trusting; the
+                // ones that do not are left alone rather than guessed at.
+                patches.retain(|p| flashimg::signatures::find(&p.symbol).is_some());
+                flashimg::patch::Patcher::from_signatures(&flash, APP_OFFSET)?
+            }
+        };
+        let applied = patcher.apply(&mut flash, &patches)?;
         std::fs::write(&flash_path, &flash)?;
 
         let n = applied.len();

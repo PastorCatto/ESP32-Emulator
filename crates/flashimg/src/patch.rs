@@ -143,14 +143,30 @@ pub struct Applied {
     pub address: u32,
     pub offset: usize,
     pub bytes: usize,
+    /// Whether the address came from the symbol table or from recognising
+    /// the bytes. Worth surfacing: one is exact, the other is inference.
+    pub how: Located,
 }
 
 #[derive(Debug)]
 pub struct Patcher<'a> {
-    symbols: &'a ElfSymbols,
+    /// Absent when the firmware shipped no `.elf`, which is the case byte
+    /// signatures exist for.
+    symbols: Option<&'a ElfSymbols>,
     image: AppImage,
     /// Where the app image starts within the flash image.
     app_offset: usize,
+}
+
+/// How a function was located, which the caller should show rather than hide.
+///
+/// A symbol is exact. A signature is a considered guess: it says the bytes
+/// look like a function we recognise from a build we could check, which is
+/// strong evidence but not proof, and the two deserve different confidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Located {
+    Symbol,
+    Signature,
 }
 
 impl<'a> Patcher<'a> {
@@ -158,7 +174,67 @@ impl<'a> Patcher<'a> {
     /// partition table decides -- 0x10000 in every default layout.
     pub fn new(symbols: &'a ElfSymbols, flash: &[u8], app_offset: usize) -> Result<Self> {
         let image = AppImage::parse(&flash[app_offset..])?;
-        Ok(Patcher { symbols, image, app_offset })
+        Ok(Patcher { symbols: Some(symbols), image, app_offset })
+    }
+
+    /// A patcher for firmware with no symbol table, which must fall back to
+    /// byte signatures for every function it touches.
+    pub fn from_signatures(flash: &[u8], app_offset: usize) -> Result<Self> {
+        let image = AppImage::parse(&flash[app_offset..])?;
+        Ok(Patcher { symbols: None, image, app_offset })
+    }
+
+    /// Turn a flash offset back into the address the code runs at.
+    fn vaddr_at(&self, offset: usize) -> Option<u32> {
+        let within = offset.checked_sub(self.app_offset)?;
+        self.image.segments.iter().find_map(|seg| {
+            let start = seg.file_offset;
+            let end = start.checked_add(seg.len as usize)?;
+            (within >= start && within < end)
+                .then(|| seg.load_addr + (within - start) as u32)
+        })
+    }
+
+    /// Where a patch should be written, and how sure we are of it.
+    ///
+    /// Symbols first, always: they are exact and free. Signatures only when
+    /// there is no symbol table at all -- not as a cross-check on a build
+    /// that has one, since a disagreement there would mean the signature is
+    /// wrong and the symbol is right.
+    fn locate(&self, patch: &Patch, flash: &[u8]) -> Result<(usize, u32, usize, Located)> {
+        if let Some(symbols) = self.symbols {
+            let symbol = symbols.find(&patch.symbol).ok_or_else(|| {
+                Error::Unpatchable(format!("no symbol {:?} in the ELF", patch.symbol))
+            })?;
+            let offset = flash_offset(&self.image, self.app_offset, symbol.address)
+                .ok_or_else(|| {
+                    Error::Unpatchable(format!(
+                        "{} is at {:#010x}, which is not in a flash-mapped segment",
+                        patch.symbol, symbol.address
+                    ))
+                })?;
+            return Ok((offset, symbol.address, symbol.size as usize, Located::Symbol));
+        }
+
+        let signature = crate::signatures::find(&patch.symbol).ok_or_else(|| {
+            Error::Unpatchable(format!(
+                "{} has no byte signature, and the firmware shipped no .elf",
+                patch.symbol
+            ))
+        })?;
+        // Search the app image only. The rest of flash holds the bootloader,
+        // NVS and whatever the filesystem contains, and a chance match out
+        // there would be a patch written somewhere meaningless.
+        let end = (self.app_offset + self.image.total_len).min(flash.len());
+        let region = flash.get(self.app_offset..end).ok_or_else(|| {
+            Error::Unpatchable("the app image runs past the end of the flash image".into())
+        })?;
+        let at = signature
+            .find_unique(region)
+            .map_err(|e| Error::Unpatchable(e.to_string()))?;
+        let offset = self.app_offset + at;
+        let address = self.vaddr_at(offset).unwrap_or(0);
+        Ok((offset, address, signature.len(), Located::Signature))
     }
 
     /// Apply patches in place, then repair the image trailer.
@@ -177,27 +253,15 @@ impl<'a> Patcher<'a> {
         let mut applied = Vec::with_capacity(patches.len());
 
         for patch in patches {
-            let symbol = self.symbols.find(&patch.symbol).ok_or_else(|| {
-                Error::Unpatchable(format!("no symbol {:?} in the ELF", patch.symbol))
-            })?;
+            let (offset, address, size, how) = self.locate(patch, flash)?;
 
             let bytes = patch.stub.bytes();
-            if (symbol.size as usize) < bytes.len() {
+            if size < bytes.len() {
                 return Err(Error::Unpatchable(format!(
                     "{} is {} bytes, too small for a {}-byte stub",
-                    patch.symbol,
-                    symbol.size,
-                    bytes.len()
+                    patch.symbol, size, bytes.len()
                 )));
             }
-
-            let offset = flash_offset(&self.image, self.app_offset, symbol.address)
-                .ok_or_else(|| {
-                    Error::Unpatchable(format!(
-                        "{} is at {:#010x}, which is not in a flash-mapped segment",
-                        patch.symbol, symbol.address
-                    ))
-                })?;
 
             let end = offset + bytes.len();
             if end > flash.len() {
@@ -209,9 +273,10 @@ impl<'a> Patcher<'a> {
 
             applied.push(Applied {
                 symbol: patch.symbol.clone(),
-                address: symbol.address,
+                address,
                 offset,
                 bytes: bytes.len(),
+                how,
             });
         }
 
@@ -260,6 +325,32 @@ const ESP_CHECKSUM_SEED: u8 = 0xef;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_shipped_signature_is_specific_enough_to_be_worth_having() {
+        // A signature that pins only a handful of bits will match all over a
+        // megabyte of firmware. The two entry points that failed this are not
+        // shipped at all, so anything in the table should clear it easily.
+        for sig in crate::signatures::radio_bypass() {
+            let bits = (sig.len() * 8) as u32;
+            assert!(
+                sig.pinned_bits() >= 128,
+                "{} pins only {} of {bits} bits",
+                sig.name,
+                sig.pinned_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn the_wrapper_entry_points_are_left_out_rather_than_guessed_at() {
+        // esp_wifi_connect and esp_wifi_disconnect compile to ten bytes and
+        // matched six places each. Shipping them would patch the wrong code
+        // five times out of six.
+        assert!(crate::signatures::find("esp_wifi_connect").is_none());
+        assert!(crate::signatures::find("esp_wifi_disconnect").is_none());
+        assert!(crate::signatures::find("esp_phy_enable").is_some());
+    }
 
     #[test]
     fn movi_n_encodes_the_values_a_stub_needs() {

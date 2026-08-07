@@ -553,8 +553,8 @@ impl App {
                     None => {
                         ui.label(
                             RichText::new(
-                                "Drop the firmware's .elf to enable patching. \
-                                 Functions are located by symbol, never guessed.",
+                                "No .elf: patching falls back to byte signatures. \
+                                 Drop the matching .elf for exact addresses.",
                             )
                             .small()
                             .weak(),
