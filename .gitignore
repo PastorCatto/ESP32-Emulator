@@ -19,3 +19,8 @@
 # OS noise
 .DS_Store
 Thumbs.db
+
+# Hand-testing files. About 100 MB of firmware and disk images that are
+# reproducible from a PURR OS build tree; Testrun/README.md says how.
+/Testrun/*
+!/Testrun/README.md
