@@ -37,15 +37,27 @@ impl ScreenView {
         let scale = if fit >= 1.0 { fit.floor() } else { fit };
         let size = egui::vec2(f32::from(w) * scale, f32::from(h) * scale);
 
-        ui.centered_and_justified(|ui| {
-            ui.add(
-                egui::Image::new(texture)
-                    .fit_to_exact_size(size)
-                    // Nearest, for the same reason as the integer scale.
-                    .texture_options(TextureOptions::NEAREST),
-            )
-        })
-        .inner
+        // Centred by hand, and allocated before painting, for two reasons.
+        //
+        // An `Image` carries no `Sense`, so adding one returns a response that
+        // never reports a click however hard you press it -- mimic touch was
+        // wired up and silently dead because of exactly that.
+        //
+        // And the response's rect has to be the *image*, not the space around
+        // it. `centered_and_justified` hands back the full panel, so a click
+        // would be measured against the wrong rectangle and land somewhere
+        // else on the panel -- worse than not working, because it looks like
+        // it nearly works.
+        let area = ui.available_rect_before_wrap();
+        let rect = egui::Rect::from_center_size(area.center(), size);
+        let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+
+        egui::Image::new(texture)
+            // Nearest, for the same reason as the integer scale.
+            .texture_options(TextureOptions::NEAREST)
+            .paint_at(ui, rect);
+
+        response
     }
 
     /// Upload the frame if it has changed since the last one.
