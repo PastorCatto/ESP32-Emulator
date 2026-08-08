@@ -8,6 +8,45 @@
 use devices::st7789::ScreenHandle;
 use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
 
+/// A frame copied out from under the framebuffer lock.
+///
+/// Deliberately owns its pixels. The whole point is that the conversion runs
+/// after the lock is released, so anything borrowed from the model would
+/// defeat it.
+struct Snapshot {
+    size: (u16, u16),
+    generation: u64,
+    on: bool,
+    inverted: bool,
+    bgr: bool,
+    pixels: Vec<u16>,
+}
+
+impl Snapshot {
+    /// 5-6-5 to 8-8-8, the same conversion the model used to do inline.
+    fn rgb888(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.pixels.len() * 3);
+        for &pixel in &self.pixels {
+            let p = if self.inverted { !pixel } else { pixel };
+            // Repeat the high bits when widening, so full white stays 0xff
+            // rather than landing on 0xf8.
+            let hi = ((p >> 11) & 0x1f) as u8;
+            let mid = ((p >> 5) & 0x3f) as u8;
+            let lo = (p & 0x1f) as u8;
+            let hi = (hi << 3) | (hi >> 2);
+            let mid = (mid << 2) | (mid >> 4);
+            let lo = (lo << 3) | (lo >> 2);
+
+            if self.bgr {
+                out.extend_from_slice(&[lo, mid, hi]);
+            } else {
+                out.extend_from_slice(&[hi, mid, lo]);
+            }
+        }
+        out
+    }
+}
+
 #[derive(Default)]
 pub struct ScreenView {
     texture: Option<TextureHandle>,
@@ -61,34 +100,59 @@ impl ScreenView {
     }
 
     /// Upload the frame if it has changed since the last one.
+    ///
+    /// Nothing expensive happens while the framebuffer is locked, and that
+    /// constraint is load-bearing rather than tidiness. The bus thread holds
+    /// the *registry* lock while it dispatches, and the ST7789 model takes
+    /// this lock inside that -- so a slow frame here does not merely stall the
+    /// panel, it stalls every device behind the registry, the SD card
+    /// included. Converting under the lock made SD init time out in the
+    /// window while the identical image mounted in 1.6 seconds headless.
+    ///
+    /// So take a snapshot -- a 150 KB memcpy of raw 5-6-5 -- release, and do
+    /// the 76 800-pixel conversion and the texture upload on our own time.
     fn refresh(&mut self, ctx: &egui::Context, screen: &ScreenHandle) {
-        // A poisoned lock means a device model panicked mid-frame. The pixels
-        // are still structurally fine and a blank window is the worse outcome.
-        let guard = match screen.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
+        let snapshot = {
+            // A poisoned lock means a device model panicked mid-frame. The
+            // pixels are still structurally fine and a blank window is the
+            // worse outcome.
+            let guard = match screen.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+
+            let size = (guard.width, guard.height);
+            let unchanged =
+                self.texture.is_some() && self.shown == guard.generation && self.size == size;
+            if unchanged {
+                return;
+            }
+            // `on` and the inversion decide what to draw, but resolving them
+            // is cheap; only the pixels are worth copying.
+            Snapshot {
+                size,
+                generation: guard.generation,
+                on: guard.on,
+                inverted: guard.shows_inverted(),
+                bgr: guard.bgr,
+                pixels: guard.pixels.clone(),
+            }
         };
 
-        let size = (guard.width, guard.height);
-        let unchanged = self.texture.is_some() && self.shown == guard.generation && self.size == size;
-        if unchanged {
-            return;
-        }
+        let (width, height) = snapshot.size;
+        let dims: [usize; 2] = [width.into(), height.into()];
 
         // A panel the driver has not switched on shows black, whatever is in
         // its RAM -- which is also what you see on the real device while it
         // is still running its init sequence.
-        let image = if guard.on {
-            ColorImage::from_rgb([size.0.into(), size.1.into()], &guard.rgb888())
+        let image = if snapshot.on {
+            ColorImage::from_rgb(dims, &snapshot.rgb888())
         } else {
-            let count = usize::from(size.0) * usize::from(size.1);
-            ColorImage::new([size.0.into(), size.1.into()], vec![Color32::BLACK; count])
+            ColorImage::new(dims, vec![Color32::BLACK; dims[0] * dims[1]])
         };
-        self.shown = guard.generation;
-        self.size = size;
-        drop(guard);
+        self.shown = snapshot.generation;
+        self.size = snapshot.size;
 
-        let dims: [usize; 2] = [size.0.into(), size.1.into()];
         match &mut self.texture {
             Some(texture) if texture.size() == dims => {
                 texture.set(image, TextureOptions::NEAREST);

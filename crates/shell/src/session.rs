@@ -181,6 +181,9 @@ pub struct Session {
     /// Cleared whenever the firmware is reloaded, because that rewrites the
     /// image from its source.
     pub patches: Vec<flashimg::patch::Applied>,
+    /// Every serial byte, teed to a file when ESP32_SERIAL_LOG is set. Reopened
+    /// per boot so a run is measurable on its own.
+    serial_log: Option<std::fs::File>,
     /// The device models and the bus server, alive only while running.
     pub hardware: Option<Hardware>,
 }
@@ -196,8 +199,21 @@ impl Session {
             sd_image: None,
             symbols: None,
             patches: Vec::new(),
+            serial_log: None,
             hardware: None,
         }
+    }
+
+    /// Open the serial tee for a fresh boot, if one was asked for.
+    ///
+    /// Truncates, so each boot's log stands alone and a timestamp in it means
+    /// what it looks like it means.
+    fn open_serial_log(&mut self) {
+        self.serial_log = std::env::var_os("ESP32_SERIAL_LOG").and_then(|path| {
+            std::fs::File::create(&path)
+                .map_err(|e| eprintln!("serial log {path:?}: {e}"))
+                .ok()
+        });
     }
 
     /// The live display, if the board has a panel this build can model.
@@ -363,6 +379,7 @@ impl Session {
         };
         self.stop();
         self.serial.clear();
+        self.open_serial_log();
 
         // Devices first: the emulator connects on startup and does not retry,
         // so the server has to be listening before QEMU exists.
@@ -394,6 +411,16 @@ impl Session {
         if let Some(inst) = &mut self.instance {
             for chunk in inst.read_serial() {
                 self.serial.push(chunk.port, &chunk.bytes);
+                // Tee to disk when asked. Measuring a boot used to mean
+                // running headless, which is a different device set and a
+                // different bus server -- so the thing being measured was
+                // never the thing being used. This makes the window itself
+                // the measurable configuration.
+                if let Some(file) = &mut self.serial_log {
+                    use std::io::Write;
+                    let _ = file.write_all(&chunk.bytes);
+                    let _ = file.flush();
+                }
             }
         }
     }

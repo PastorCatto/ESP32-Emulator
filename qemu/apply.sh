@@ -644,16 +644,30 @@ static void esp32s3_intmatrix_refresh(Esp32s3IntMatrixState *s)
             }
         }
 
-        if (pending == s->driven[cpu]) {
-            continue;
-        }
-
-        const uint32_t changed = pending ^ s->driven[cpu];
+        /*
+         * Every line written every time, with no "has this changed" shortcut.
+         *
+         * There used to be one -- skip the CPU when the mask matched last
+         * time, and within it skip the bits that had not moved -- and it can
+         * swallow a raise. A guest that misses a completion interrupt does not
+         * fail loudly: it stops waking on the interrupt and creeps along one
+         * transfer per FreeRTOS tick. Removing the gate took display init from
+         * 5462ms to 1881ms.
+         *
+         * Both remaining departures from upstream are load-bearing, each
+         * verified by putting it back and watching the machine hang at
+         * "phase 0: baked-in drivers":
+         *
+         *   - the OR across sources sharing a CPU interrupt, because upstream
+         *     drives the line with a single source level and breaks at the first
+         *     match, so a source going low silences another still asserted;
+         *   - the re-drive on a mapping write, because ESP-IDF re-arms a
+         *     queued SPI transfer by writing the map register against a line
+         *     the peripheral has held high since the previous transfer.
+         */
         for (int i = 0; i < s->cpu[cpu]->env.config->nextint; ++i) {
             const unsigned out = s->cpu[cpu]->env.config->extint[i] & 0x1f;
-            if (changed & (1u << out)) {
-                qemu_set_irq(s->outputs[cpu][i], (pending >> out) & 1);
-            }
+            qemu_set_irq(s->outputs[cpu][i], (pending >> out) & 1);
         }
         s->driven[cpu] = pending;
     }

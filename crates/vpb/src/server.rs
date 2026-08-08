@@ -59,7 +59,21 @@ pub fn serve_with(
     let mut sink = EventQueue::default();
     let mut count: u64 = 0;
 
+    // Per-transaction timing, printed to stderr when VPB_TIMING is set.
+    //
+    // The emulator blocks on every transaction, so this latency is not an
+    // implementation detail -- it is the guest's clock. Guessing at it from
+    // the outside produced several confident wrong answers, so measure the
+    // two halves separately: how long we take to answer (ours to fix) against
+    // how long we sit waiting for the next request (the guest's own work).
+    let timing = std::env::var_os("VPB_TIMING").is_some();
+    let mut service_us: u64 = 0;
+    let mut service_max: u64 = 0;
+    let mut idle_us: u64 = 0;
+    let mut window = std::time::Instant::now();
+
     loop {
+        let waiting = std::time::Instant::now();
         let msg = match wire::recv_host(&mut reader) {
             Ok(m) => m,
             // A closed connection is how a run ends, not a failure.
@@ -74,6 +88,10 @@ pub fn serve_with(
             continue;
         };
         count += 1;
+        let started = std::time::Instant::now();
+        if timing {
+            idle_us += waiting.elapsed().as_micros() as u64;
+        }
 
         let response = {
             // A poisoned registry means another connection's thread panicked
@@ -108,6 +126,32 @@ pub fn serve_with(
             )
             .map_err(|e| std::io::Error::other(e.to_string()))?;
             writer.flush()?;
+        }
+
+        if timing {
+            let took = started.elapsed().as_micros() as u64;
+            service_us += took;
+            service_max = service_max.max(took);
+            // Report by elapsed time rather than by count, so a bus that has
+            // gone quiet still says so instead of falling silent.
+            if window.elapsed() >= std::time::Duration::from_secs(2) {
+                let secs = window.elapsed().as_secs_f64();
+                eprintln!(
+                    "vpb: {:>6} tx in {:.1}s ({:>6.0}/s)  service avg {:>5}us max {:>6}us  \
+                     idle avg {:>6}us",
+                    count,
+                    secs,
+                    count as f64 / secs,
+                    service_us / count.max(1),
+                    service_max,
+                    idle_us / count.max(1),
+                );
+                count = 0;
+                service_us = 0;
+                service_max = 0;
+                idle_us = 0;
+                window = std::time::Instant::now();
+            }
         }
     }
 }
