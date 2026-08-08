@@ -9,6 +9,7 @@
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "qemu/sockets.h"
+#include "qemu/main-loop.h"
 #include "qapi/error.h"
 #include "io/channel-socket.h"
 #include "hw/misc/esp_vpb.h"
@@ -180,6 +181,42 @@ static bool esp_vpb_read_frame(EspVpbClient *c, uint8_t *payload,
     return true;
 }
 
+/*
+ * Wait for a reply without freezing the rest of the machine.
+ *
+ * These calls come out of MMIO handlers, and QEMU runs those with the big
+ * lock held. Blocking there stops far more than the core that asked: the
+ * other vCPU cannot run and no timer fires, so from inside the guest *time
+ * stops* for the length of the round trip. An RTOS notices. FreeRTOS ticks
+ * vanish, timeouts are measured against a clock that jumped, watchdogs fire
+ * against work that did happen -- and the resulting misbehaviour looks like
+ * impossible firmware bugs rather than a stalled host.
+ *
+ * It is also self-amplifying: the device server lives in the UI process, so
+ * a busy UI answers slowly, and every slow answer freezes the whole VM for
+ * that much longer.
+ *
+ * Dropping the lock across the wait is safe here. This device's registers are
+ * only touched by the vCPU already inside the transfer, and the socket
+ * belongs to this client alone, so there is nothing for another thread to
+ * race against while we sit in recv().
+ */
+static bool esp_vpb_read_frame_unlocked(EspVpbClient *c, uint8_t *payload,
+                                        uint32_t capacity, uint32_t *got,
+                                        bool *nacked)
+{
+    const bool held = bql_locked();
+
+    if (held) {
+        bql_unlock();
+    }
+    const bool ok = esp_vpb_read_frame(c, payload, capacity, got, nacked);
+    if (held) {
+        bql_lock();
+    }
+    return ok;
+}
+
 bool esp_vpb_spi_transfer(EspVpbClient *c, uint8_t controller, uint8_t cs,
                           int dc, const uint8_t *mosi, uint32_t len,
                           uint8_t *miso, uint32_t read_len)
@@ -253,7 +290,7 @@ bool esp_vpb_spi_transfer(EspVpbClient *c, uint8_t controller, uint8_t cs,
      * latency fine, because a real bus transaction blocks too.
      */
     uint32_t got = 0;
-    bool ok = esp_vpb_read_frame(c, miso, read_len, &got, NULL);
+    bool ok = esp_vpb_read_frame_unlocked(c, miso, read_len, &got, NULL);
 
     if (!ok) {
         esp_vpb_fail(c, "no reply within the timeout");
@@ -284,7 +321,7 @@ static bool esp_vpb_await(EspVpbClient *c, uint8_t *data, uint32_t len,
 #endif
     setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
 
-    if (!esp_vpb_read_frame(c, data, len, got, nacked)) {
+    if (!esp_vpb_read_frame_unlocked(c, data, len, got, nacked)) {
         esp_vpb_fail(c, "no reply within the timeout");
         return false;
     }
