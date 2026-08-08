@@ -49,6 +49,9 @@ pub struct App {
     serial_view: Option<usize>,
     /// Recent bus traffic, when the tracer is on.
     bus_log: Vec<String>,
+    /// Serial byte total and panel write counter as of the last frame, so a
+    /// repaint can be skipped when neither moved.
+    last_activity: (usize, u64),
 }
 
 impl App {
@@ -89,6 +92,7 @@ impl App {
             // complete view.
             serial_view: Some(0),
             bus_log: Vec::new(),
+            last_activity: (0, 0),
         }
     }
 
@@ -118,6 +122,27 @@ impl App {
             app.boot();
         }
         app
+    }
+
+    /// Did anything worth redrawing for change since the last frame?
+    ///
+    /// Deliberately cheap: a byte count per serial port and the panel's write
+    /// counter. Both are already maintained, so this costs a lock and a few
+    /// comparisons -- far less than the repaint it avoids.
+    fn activity(&mut self) -> bool {
+        let serial: usize = self.session.serial.counts().iter().sum();
+        let frame = self
+            .session
+            .screen()
+            .map(|s| match s.lock() {
+                Ok(g) => g.generation,
+                Err(poisoned) => poisoned.into_inner().generation,
+            })
+            .unwrap_or(0);
+
+        let changed = (serial, frame) != self.last_activity;
+        self.last_activity = (serial, frame);
+        changed
     }
 
     fn note(&mut self, text: impl Into<String>) {
@@ -347,9 +372,19 @@ impl eframe::App for App {
         self.drain_events();
         let running = self.session.is_running();
         if running {
-            // Serial arrives asynchronously, so drive repaints rather than
-            // waiting for input events.
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            // Serial and framebuffer updates arrive asynchronously, so
+            // repaints have to be driven rather than waited for. But driving
+            // them at a flat 30fps burns half a core redrawing an unchanged
+            // window -- and burns it on the same core QEMU needs, so the
+            // emulator runs slower the harder the UI spins.
+            //
+            // The guest only redraws at a few frames a second, and serial
+            // arrives in bursts. So poll fast while something is actually
+            // changing and idle back when it is not. egui still repaints
+            // immediately on input, so this costs nothing in responsiveness.
+            let changed = self.activity();
+            let delay = if changed { 33 } else { 250 };
+            ctx.request_repaint_after(std::time::Duration::from_millis(delay));
         }
 
         self.top_bar(ui, running);
@@ -850,16 +885,36 @@ impl App {
                 );
             });
 
-            egui::ScrollArea::vertical()
+            // One label per *visible* line, not one label for the whole log.
+            //
+            // Handing the entire buffer to a single wrapped Label makes egui
+            // shape and wrap every glyph in it to build the galley -- on every
+            // frame, at 30fps, for up to half a megabyte, to display the forty
+            // lines that fit on screen. That measured at around half a core
+            // and got worse as the log grew, which is exactly backwards: the
+            // emulator needs that CPU, and the serial pane was starving it.
+            //
+            // `show_rows` needs a uniform row height, so lines extend
+            // horizontally rather than wrapping. That suits log output, which
+            // is already line-oriented, and the horizontal scrollbar is a
+            // better way to read a long line than a reflowed one anyway.
+            let view = self.session.serial.view(self.serial_view);
+            let text = view.text();
+            let lines: Vec<&str> = text.lines().collect();
+            let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+
+            egui::ScrollArea::both()
                 .stick_to_bottom(self.autoscroll)
                 .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let text = self.session.serial.view(self.serial_view).text();
-                    ui.add(
-                        egui::Label::new(RichText::new(text).monospace())
-                            .selectable(true)
-                            .wrap(),
-                    );
+                .show_rows(ui, row_height, lines.len(), |ui, rows| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for line in &lines[rows] {
+                        ui.add(
+                            egui::Label::new(RichText::new(*line).monospace())
+                                .selectable(true)
+                                .wrap_mode(egui::TextWrapMode::Extend),
+                        );
+                    }
                 });
         });
     }
