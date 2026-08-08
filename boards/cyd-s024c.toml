@@ -1,0 +1,77 @@
+# Sunton ESP32-2432S024C — CYD 2.4" with capacitive touch
+#
+# Same ILI9341 panel and SD wiring as the 2.8" resistive board, but the touch
+# controller is a CST816S on I2C rather than an XPT2046 on SPI, and the
+# backlight moves to GPIO 27.
+#
+# Pins follow PURR OS devices/cyd_s024c/device.pcat, whose backlight entry is
+# marked as verified against hardware ("BL=27 not 21").
+
+[board]
+id = "cyd-s024c"
+name = "CYD 2.4in capacitive (ESP32-2432S024C)"
+chip = "esp32"
+flash_size = "4MB"
+
+[board.psram]
+kind = "none"
+size = "0"
+
+[[bus]]
+id = "tft"
+kind = "spi"
+controller = 2
+sck = 14
+mosi = 13
+miso = 12
+
+[[bus]]
+id = "sdspi"
+kind = "spi"
+controller = 3
+sck = 18
+mosi = 23
+miso = 19
+
+# The capacitive panel is I2C, so unlike the resistive boards there is no
+# third SPI bus here.
+[[bus]]
+id = "touch_i2c"
+kind = "i2c"
+controller = 0
+sda = 33
+scl = 32
+
+[[peripheral]]
+kind = "ili9341"
+label = "2.4in LCD"
+bus = "tft"
+cs = 15
+dc = 2
+backlight = 27
+width = 320
+height = 240
+rotation = 0
+color_order = "bgr"
+invert = false
+
+[[peripheral]]
+kind = "cst816s"
+label = "capacitive touch"
+bus = "touch_i2c"
+address = 0x15
+irq = 21
+reset = 25
+width = 320
+height = 240
+
+[[peripheral]]
+kind = "sdcard"
+label = "microSD"
+bus = "sdspi"
+cs = 5
+
+[support]
+implemented = []
+planned = ["ili9341", "cst816s", "sdcard"]
+stubbed = []

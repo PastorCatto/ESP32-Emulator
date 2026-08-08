@@ -1,0 +1,15 @@
+[package]
+name = "flashimg"
+description = "Parsing and assembly of ESP32 flash images, app images, and partition tables."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Deliberately dependency-free: this crate is pure binary-format work and is the
+# one piece that must never break due to ecosystem churn.
+[dependencies]
+
+[lints]
+workspace = true

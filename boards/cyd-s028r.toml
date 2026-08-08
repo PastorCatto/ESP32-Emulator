@@ -1,0 +1,81 @@
+# Sunton ESP32-2432S028R variant with a flipped panel
+#
+# Electrically the same as the base CYD. The panel is mounted rotated, so
+# firmware programs a different MADCTL; PURR OS records this as
+# display_madctl = 0x40 and calls it a "portrait flip".
+#
+# Kept as its own board rather than a flag on the base one, because from the
+# emulator's point of view a differently oriented screen is exactly the kind
+# of thing a board file should express.
+#
+# See cyd-esp32-2432s028r.toml for the note on XPT2046 touch wiring; it
+# applies here unchanged.
+
+[board]
+id = "cyd-s028r"
+name = "CYD 2.8in resistive, flipped (ESP32-2432S028R)"
+chip = "esp32"
+flash_size = "4MB"
+
+[board.psram]
+kind = "none"
+size = "0"
+
+[[bus]]
+id = "tft"
+kind = "spi"
+controller = 2
+sck = 14
+mosi = 13
+miso = 12
+
+[[bus]]
+id = "sdspi"
+kind = "spi"
+controller = 3
+sck = 18
+mosi = 23
+miso = 19
+
+[[bus]]
+id = "tspi"
+kind = "spi"
+controller = 4
+sck = 25
+mosi = 32
+miso = 39
+
+[[peripheral]]
+kind = "ili9341"
+label = "2.8in LCD (flipped)"
+bus = "tft"
+cs = 15
+dc = 2
+backlight = 21
+width = 320
+height = 240
+# MADCTL 0x40 sets column address order; the panel is mounted the other way up.
+rotation = 180
+madctl = 0x40
+color_order = "bgr"
+invert = false
+
+[[peripheral]]
+kind = "xpt2046"
+label = "resistive touch"
+bus = "tspi"
+cs = 33
+irq = 36
+width = 320
+height = 240
+
+[[peripheral]]
+kind = "sdcard"
+label = "microSD"
+bus = "sdspi"
+cs = 5
+
+[support]
+implemented = []
+planned = ["ili9341", "xpt2046", "sdcard"]
+stubbed = []

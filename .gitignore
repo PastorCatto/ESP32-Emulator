@@ -1,0 +1,28 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Vendored QEMU binaries and the QEMU source tree we patch.
+# These are large and fetched by scripts/fetch-qemu; never commit them.
+/vendor/
+
+# Emulator working state: assembled flash images, SD card images, NVS blobs.
+/run/
+*.img
+*.vhd
+*.vhdx
+
+# Firmware the user drops in for local testing.
+/firmware/
+*.elf
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Hand-testing files. About 100 MB of firmware and disk images that are
+# reproducible from a PURR OS build tree; Testrun/README.md says how.
+/Testrun/*
+!/Testrun/README.md
+esp32-emulator-9d1b10e.exe
+esp32-emulator-7ff8ee3.exe
