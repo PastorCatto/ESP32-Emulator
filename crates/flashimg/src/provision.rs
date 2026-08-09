@@ -141,9 +141,15 @@ pub fn prepare(flash: &mut Vec<u8>) -> Vec<Action> {
 
 /// Append a filesystem partition to a table that has none.
 ///
-/// The rewritten table deliberately carries no MD5 record: ESP-IDF only checks
-/// the checksum when the record is present, so dropping it keeps the table
-/// valid without this crate growing an MD5 implementation.
+/// The rewritten table has to carry an MD5 record. Leaving it off does not make
+/// ESP-IDF skip the check, it makes it reject the table outright:
+///
+/// ```text
+/// partition: No MD5 found in partition table
+/// partition: load_partitions returned 0x105
+/// ```
+///
+/// which costs the app every partition, including the one it boots from.
 fn invent(flash: &mut [u8], table: &PartitionTable, flash_size: u32) -> Result<Action, Action> {
     let Some((offset, size)) = free_tail(table, flash_size) else {
         return Err(Action::Declined { reason: "no room left in flash".into() });
@@ -161,6 +167,7 @@ fn invent(flash: &mut [u8], table: &PartitionTable, flash_size: u32) -> Result<A
         flags: 0,
     });
 
+    // serialize() appends the MD5 record itself.
     let serialized = grown.serialize();
     let at = TABLE_OFFSET as usize;
     // The table lives in one sector and must not run into what follows.

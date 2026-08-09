@@ -183,8 +183,17 @@ impl PartitionTable {
         Ok(())
     }
 
+    /// Serialize the entries followed by the MD5 record.
+    ///
+    /// The record is not optional. Without it ESP-IDF does not skip the check,
+    /// it rejects the whole table and the app loses every partition:
+    ///
+    /// ```text
+    /// partition: No MD5 found in partition table
+    /// partition: load_partitions returned 0x105
+    /// ```
     pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.entries.len() * ENTRY_LEN);
+        let mut out = Vec::with_capacity((self.entries.len() + 1) * ENTRY_LEN);
         for p in &self.entries {
             out.extend_from_slice(&ENTRY_MAGIC.to_le_bytes());
             out.push(p.ty.raw());
@@ -198,6 +207,12 @@ impl PartitionTable {
             out.extend_from_slice(&label);
             out.extend_from_slice(&p.flags.to_le_bytes());
         }
+
+        // 0xEBEB, fourteen erased bytes, then the digest of the entries above.
+        let digest = crate::md5::md5(&out);
+        out.extend_from_slice(&MD5_MAGIC.to_le_bytes());
+        out.extend_from_slice(&[0xff; 14]);
+        out.extend_from_slice(&digest);
         out
     }
 }

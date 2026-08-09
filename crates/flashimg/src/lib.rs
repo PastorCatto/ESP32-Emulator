@@ -11,6 +11,7 @@ pub mod patch;
 pub mod archive;
 pub mod fat;
 pub mod littlefs;
+pub(crate) mod md5;
 pub mod provision;
 pub mod signature;
 pub mod signatures;
@@ -149,6 +150,25 @@ mod tests {
         assert_eq!(parsed.default_app().unwrap().label, "factory");
         assert_eq!(parsed.find("nvs").unwrap().offset, 0x9000);
         table.validate(u64::from(FlashSize::MB16.bytes())).expect("valid");
+    }
+
+    #[test]
+    fn a_serialized_table_carries_the_md5_record() {
+        // Without it ESP-IDF rejects the table and the app gets no partitions
+        // at all, so this is not cosmetic.
+        let table = PartitionTable::single_factory(FlashSize::MB16, 0x30_0000);
+        let bytes = table.serialize();
+        let entries = table.entries.len() * ENTRY_LEN;
+
+        assert_eq!(bytes.len(), entries + ENTRY_LEN, "one record follows the entries");
+        assert_eq!(&bytes[entries..entries + 2], &[0xeb, 0xeb], "record magic");
+        assert!(bytes[entries + 2..entries + 16].iter().all(|&b| b == 0xff));
+        assert_eq!(&bytes[entries + 16..], &sha_free_md5(&bytes[..entries]));
+    }
+
+    /// The digest as ESP-IDF computes it: over the entry bytes only.
+    fn sha_free_md5(entries: &[u8]) -> [u8; 16] {
+        crate::md5::md5(entries)
     }
 
     #[test]

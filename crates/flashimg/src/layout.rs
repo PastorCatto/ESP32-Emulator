@@ -251,9 +251,7 @@ impl FlashImage {
 impl PartitionTable {
     /// The stock ESP-IDF "single factory app" layout, grown to fit `app_len`.
     ///
-    /// We deliberately omit the trailing MD5 record: ESP-IDF skips the checksum
-    /// when no MD5 entry is present, so leaving it out is valid and saves us
-    /// carrying an MD5 implementation.
+    /// serialize() appends the MD5 record ESP-IDF requires.
     pub fn single_factory(flash: FlashSize, app_len: u32) -> Self {
         const NVS_OFFSET: u32 = 0x9000;
         const NVS_SIZE: u32 = 0x5000;
