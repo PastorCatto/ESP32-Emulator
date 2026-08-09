@@ -52,6 +52,8 @@ pub struct App {
     /// Serial byte total and panel write counter as of the last frame, so a
     /// repaint can be skipped when neither moved.
     last_activity: (usize, u64),
+    /// Writes what the panel holds to a file, when ESP32_SCREEN_DUMP is set.
+    screen_dump: Option<crate::dump::ScreenDump>,
 }
 
 impl App {
@@ -93,6 +95,7 @@ impl App {
             serial_view: Some(0),
             bus_log: Vec::new(),
             last_activity: (0, 0),
+            screen_dump: crate::dump::ScreenDump::from_env(),
         }
     }
 
@@ -359,6 +362,10 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        if let (Some(dump), Some(screen)) = (self.screen_dump.as_mut(), self.session.screen()) {
+            dump.tick(&screen);
+        }
 
         // Files dropped anywhere on the window.
         let dropped: Vec<PathBuf> = ctx.input(|i| {
