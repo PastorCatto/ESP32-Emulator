@@ -109,24 +109,28 @@ static void esp32s3_gpspi_dc_changed(void *opaque, int n, int level)
     s->dc_level = level ? 1 : 0;
 }
 
+/* A chip select pin is asserted low. */
+static void esp32s3_gpspi_cs_sel_changed(void *opaque, int n, int level)
+{
+    Esp32s3GpspiState *s = ESP32S3_GPSPI(opaque);
+
+    if (n >= 0 && n < ESP32S3_GPSPI_CS_COUNT) {
+        s->cs_sel_level[n] = level ? 1 : 0;
+    }
+}
+
 /*
  * Which chip select is asserted.
  *
- * ESP-IDF lets the controller drive CS and enables exactly one line, so the
- * register says which device a transfer is for. Arduino does not: TFT_eSPI
- * disables every hardware CS (MISC.CS_DIS = 0x3f) and toggles the CS pin with
- * a plain GPIO write, because it drives the panel by writing SPI registers
- * directly. Reading that as "no device selected" drops every transfer the
- * firmware makes -- Bruce and the T-Deck Launcher issued over a hundred
- * thousand and drew nothing at all.
+ * Two conventions have to be told apart. ESP-IDF lets the controller drive CS
+ * and enables exactly one line, so MISC.CS_DIS says which device a transfer is
+ * for. Arduino's TFT_eSPI writes the SPI registers directly and toggles the CS
+ * pin with a plain GPIO write, leaving every hardware line disabled -- reading
+ * that as "no device selected" dropped every transfer it made, which is why
+ * Bruce issued 127,570 of them and drew nothing.
  *
- * With the hardware lines off there is nothing in the controller saying which
- * device is selected; that lives in a GPIO level we are not wired to. Until
- * the CS pins are plumbed in the way the D/C pin already is, assume the first
- * line, which is the display on every board we ship. A second device selected
- * by GPIO on the same bus -- an SD card sharing the display bus, say -- would
- * be misrouted to it. That is worth knowing about, but it beats dropping the
- * traffic outright, which is what happened before.
+ * So when the hardware lines are off, route on the pin levels the board told
+ * us about instead. Lowest asserted line wins, matching the hardware order.
  */
 static int esp32s3_gpspi_active_cs(Esp32s3GpspiState *s)
 {
@@ -137,7 +141,44 @@ static int esp32s3_gpspi_active_cs(Esp32s3GpspiState *s)
             return i;
         }
     }
-    return 0;
+
+    for (int i = 0; i < ESP32S3_GPSPI_CS_COUNT; i++) {
+        if (s->cs_sel_gpio[i] >= 0 && !s->cs_sel_level[i]) {
+            return i;
+        }
+    }
+
+    /*
+     * The driver is managing CS but the board named no pins, so there is
+     * nothing to route on. Assume the first line rather than discard the
+     * transfer: on a board with one device per bus that is right, and on any
+     * other it is at least visible.
+     */
+    return s->cs_sel_named ? -1 : 0;
+}
+
+/* Parse the board's "line:line:..." CS pin list. -1 leaves a line unwired. */
+static void esp32s3_gpspi_parse_cs_gpios(Esp32s3GpspiState *s)
+{
+    const char *p = s->cs_gpios;
+
+    for (int i = 0; i < ESP32S3_GPSPI_CS_COUNT; i++) {
+        s->cs_sel_gpio[i] = -1;
+        /* Idle high, so nothing looks selected before the driver speaks. */
+        s->cs_sel_level[i] = 1;
+    }
+    s->cs_sel_named = false;
+
+    for (int i = 0; p && *p && i < ESP32S3_GPSPI_CS_COUNT; i++) {
+        char *end = NULL;
+        long pin = strtol(p, &end, 10);
+
+        if (end != p && pin >= 0 && pin < ESP32S3_GPSPI_CS_PIN_LIMIT) {
+            s->cs_sel_gpio[i] = (int32_t)pin;
+            s->cs_sel_named = true;
+        }
+        p = (end && *end == ':') ? end + 1 : "";
+    }
 }
 
 /* Byte `index` of the W0..W15 payload buffer. */
@@ -589,6 +630,9 @@ static void esp32s3_gpspi_init(Object *obj)
     /* No data/command pin known until a board wires one. */
     s->dc_level = -1;
     qdev_init_gpio_in_named(DEVICE(s), esp32s3_gpspi_dc_changed, "dc", 1);
+    qdev_init_gpio_in_named(DEVICE(s), esp32s3_gpspi_cs_sel_changed, "cs-sel",
+                            ESP32S3_GPSPI_CS_COUNT);
+    esp32s3_gpspi_parse_cs_gpios(s);
 }
 
 static const VMStateDescription vmstate_esp32s3_gpspi = {
@@ -611,6 +655,7 @@ static Property esp32s3_gpspi_properties[] = {
     DEFINE_PROP_UINT8("vpb-controller", Esp32s3GpspiState, vpb_controller, 2),
     /* Board wiring: which GPIO the machine should connect to "dc". */
     DEFINE_PROP_INT32("dc-gpio", Esp32s3GpspiState, dc_gpio, -1),
+    DEFINE_PROP_STRING("cs-gpios", Esp32s3GpspiState, cs_gpios),
     DEFINE_PROP_END_OF_LIST(),
 };
 

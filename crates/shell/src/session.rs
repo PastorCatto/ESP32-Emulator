@@ -402,6 +402,7 @@ impl Session {
         config.psram = self.board.qemu_psram();
         config.vpb_port = Some(hardware.port);
         config.display_dc_gpio = self.board.display_dc_gpio();
+        config.spi_cs_gpios = self.board.spi_cs_gpios();
         config.serial_count = SerialBuffer::PORTS;
 
         // Extra QEMU flags, whitespace separated. Exists so a boot can be

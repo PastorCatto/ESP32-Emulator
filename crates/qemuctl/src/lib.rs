@@ -260,6 +260,9 @@ pub struct LaunchConfig {
     /// An ST7789 tells a command byte from pixel data by this pin and nothing
     /// on the bus, so a display model cannot decode the stream without it.
     pub display_dc_gpio: Option<u8>,
+    /// GPIO carrying each SPI chip select, as `(cs_line, gpio)`. Lets the
+    /// controller route a transfer when the driver drives CS itself.
+    pub spi_cs_gpios: Vec<(u8, u8)>,
     /// Expose a QMP control socket on this TCP port.
     pub qmp_port: Option<u16>,
     /// Expose a GDB stub on this TCP port.
@@ -280,6 +283,7 @@ impl LaunchConfig {
             serial_ports: Vec::new(),
             vpb_port: None,
             display_dc_gpio: None,
+            spi_cs_gpios: Vec::new(),
             data_dir: None,
             graphics: false,
             qmp_port: None,
@@ -374,6 +378,24 @@ impl LaunchConfig {
                 "driver=ssi.esp32s3.gpspi,property=dc-gpio,value={pin}"
             ));
         }
+        if !self.spi_cs_gpios.is_empty() {
+            // One entry per CS line, highest line first so the list length
+            // says how many lines it covers; -1 for a line no device uses.
+            let highest = self.spi_cs_gpios.iter().map(|(line, _)| *line).max().unwrap_or(0);
+            let pins: Vec<String> = (0..=highest)
+                .map(|line| {
+                    match self.spi_cs_gpios.iter().find(|(l, _)| *l == line) {
+                        Some((_, gpio)) => gpio.to_string(),
+                        None => "-1".to_string(),
+                    }
+                })
+                .collect();
+            args.push("-global".into());
+            args.push(format!(
+                "driver=ssi.esp32s3.gpspi,property=cs-gpios,value={}",
+                pins.join(":")
+            ));
+        }
 
         if let Some(port) = self.qmp_port {
             args.push("-qmp".into());
@@ -431,6 +453,32 @@ mod tests {
         assert!(args.contains(
             &"driver=ssi.esp32s3.gpspi,property=dc-gpio,value=11".to_string()
         ));
+    }
+
+    #[test]
+    fn chip_select_pins_are_listed_by_line() {
+        // Position is the CS line, so an unused line has to hold a place --
+        // otherwise the SD card at line 5 would be read as line 1 and every
+        // transfer meant for it would land on whatever sits there.
+        let mut c = cfg();
+        c.spi_cs_gpios = vec![(0, 12), (5, 39)];
+        let args = c.to_args().unwrap();
+
+        assert!(
+            args.contains(
+                &"driver=ssi.esp32s3.gpspi,property=cs-gpios,value=12:-1:-1:-1:-1:39".to_string()
+            ),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn no_chip_select_pins_means_no_argument() {
+        // A board that says nothing must not be given an empty list, which the
+        // controller would read as "pins named, none asserted" and drop every
+        // transfer a manual-CS driver made.
+        let args = cfg().to_args().unwrap();
+        assert!(!args.iter().any(|a| a.contains("cs-gpios")), "{args:?}");
     }
 
     #[test]

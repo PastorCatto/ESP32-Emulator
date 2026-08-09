@@ -449,6 +449,30 @@ impl Board {
             .find_map(|p| p.params.opt_u8("dc").ok().flatten())
     }
 
+    /// Which GPIO carries each SPI chip select, as `(cs_line, gpio)`.
+    ///
+    /// Needed because not every driver lets the controller drive CS. ESP-IDF
+    /// does, and then the controller register says which device a transfer is
+    /// for. Arduino's TFT_eSPI disables the hardware lines and toggles the pin
+    /// itself, and then the only evidence of which device is selected is the
+    /// GPIO level -- so the controller has to watch these pins to route at all.
+    ///
+    /// Sorted by line, and a line is reported once: two devices claiming one
+    /// line is a board-file mistake, and taking the first keeps it to a
+    /// misrouted device rather than a panic.
+    pub fn spi_cs_gpios(&self) -> Vec<(u8, u8)> {
+        let mut out: Vec<(u8, u8)> = Vec::new();
+        for p in self.peripherals.iter().filter(|p| p.enabled) {
+            let Ok(Some(Claim::Spi { cs, .. })) = p.claim() else { continue };
+            let Ok(Some(gpio)) = p.params.opt_u8("cs") else { continue };
+            if !out.iter().any(|(line, _)| *line == cs) {
+                out.push((cs, gpio));
+            }
+        }
+        out.sort_by_key(|(line, _)| *line);
+        out
+    }
+
     pub fn bus(&self, id: &str) -> Option<&Bus> {
         self.buses.iter().find(|b| b.id == id)
     }
@@ -505,6 +529,31 @@ mod tests {
         // No `cs_line` recorded for the radio yet, so this still falls back to
         // its GPIO -- and will not match the bus until it is measured.
         assert_eq!(claims["sx1262"], Claim::Spi { controller: 2, cs: 9 });
+    }
+
+    #[test]
+    fn reports_the_gpio_behind_each_chip_select_line() {
+        // A driver that disables the hardware CS lines and toggles the pin
+        // itself leaves the pin level as the only evidence of which device is
+        // selected, so the controller has to be told which pin means which
+        // line. Display on line 0 via GPIO 12, SD on line 5 via GPIO 39.
+        let b = Board::from_toml(T_DECK).unwrap();
+        let map = b.spi_cs_gpios();
+        assert!(map.contains(&(0, 12)), "display: {map:?}");
+        assert!(map.contains(&(5, 39)), "sd card: {map:?}");
+        assert!(map.windows(2).all(|w| w[0].0 < w[1].0), "sorted, unique: {map:?}");
+    }
+
+    #[test]
+    fn a_disabled_device_does_not_claim_a_chip_select_line() {
+        // Switching a peripheral off has to release its line, or a transfer
+        // meant for whatever else is there gets routed to a device that is
+        // not present.
+        let mut b = Board::from_toml(T_DECK).unwrap();
+        for p in b.peripherals.iter_mut().filter(|p| p.kind == "sdcard") {
+            p.enabled = false;
+        }
+        assert!(!b.spi_cs_gpios().contains(&(5, 39)), "{:?}", b.spi_cs_gpios());
     }
 
     #[test]

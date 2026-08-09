@@ -752,6 +752,76 @@ replace_once "hw/dma/esp_gdma.c" \
               : FIELD_EX32(s->ch_conf[dir][i].link, GDMA_OUT_LINK, START))) {" \
   'GDMA_IN_LINK, START)'
 
+# --- Routing when the driver drives chip select itself ----------------------
+#
+# ESP-IDF enables one hardware CS line and the controller register says which
+# device a transfer is for. Arduino's TFT_eSPI disables all of them and toggles
+# the CS pin with a GPIO write, so the only evidence of the selected device is
+# the pin level. Give the controller the board's CS pins so it can watch them.
+
+insert_after "include/hw/ssi/esp32s3_gpspi.h" \
+  "    int32_t dc_gpio;" \
+  "
+    /*
+     * Which GPIO carries each chip select, indexed by CS line, -1 when the
+     * board does not use that line. Only consulted when the driver has
+     * disabled the hardware CS lines and is driving the pin itself.
+     */
+    int32_t cs_sel_gpio[ESP32S3_GPSPI_CS_COUNT];
+
+    /* Level of each of those pins. Chip select is active low. */
+    uint8_t cs_sel_level[ESP32S3_GPSPI_CS_COUNT];
+
+    /* Whether the board named any CS pin at all. */
+    bool cs_sel_named;
+
+    /* The board's pin list, colon separated by CS line, parsed at init. */
+    char *cs_gpios;" \
+  'cs_sel_gpio[ESP32S3_GPSPI_CS_COUNT];'
+
+insert_after "include/hw/ssi/esp32s3_gpspi.h" \
+  "#define ESP32S3_GPSPI_CS_COUNT   6" \
+  "
+/* Highest GPIO number an ESP32-S3 has, for validating the board's pin list. */
+#define ESP32S3_GPSPI_CS_PIN_LIMIT 49" \
+  'ESP32S3_GPSPI_CS_PIN_LIMIT'
+
+# The D/C pin is wired by walking the controllers and fanning one GPIO out to
+# everyone who asked for it. Chip select needs the same, once per CS line.
+
+replace_once "hw/xtensa/esp32s3.c" \
+  "        Esp32s3GpspiState *const gpspi[] = { &ss->gpspi2, &ss->gpspi3 };" \
+  "        Esp32s3GpspiState *const gpspi[] = { &ss->gpspi2, &ss->gpspi3 };
+        for (unsigned line = 0; line < ESP32S3_GPSPI_CS_COUNT; line++) {
+            for (unsigned i = 0; i < ARRAY_SIZE(gpspi); i++) {
+                const int32_t pin = gpspi[i]->cs_sel_gpio[line];
+                if (pin < 0 || pin >= ESP32_GPIO_PIN_COUNT) {
+                    continue;
+                }
+
+                qemu_irq listeners[ARRAY_SIZE(gpspi)];
+                unsigned n = 0;
+                for (unsigned j = i; j < ARRAY_SIZE(gpspi); j++) {
+                    if (gpspi[j]->cs_sel_gpio[line] == pin) {
+                        listeners[n++] = qdev_get_gpio_in_named(
+                            DEVICE(gpspi[j]), \"cs-sel\", line);
+                        gpspi[j]->cs_sel_gpio[line] = pin;
+                    }
+                }
+
+                DeviceState *split = qdev_new(TYPE_SPLIT_IRQ);
+                qdev_prop_set_uint32(split, \"num-lines\", n);
+                qdev_realize_and_unref(split, NULL, &error_fatal);
+                for (unsigned k = 0; k < n; k++) {
+                    qdev_connect_gpio_out(split, k, listeners[k]);
+                }
+                qdev_connect_gpio_out(DEVICE(&ss->gpio), pin,
+                                      qdev_get_gpio_in(split, 0));
+                break;
+            }
+        }" \
+  'gpspi[i]->cs_sel_gpio[line]'
+
 # --- Dummy cycles on a multi-line flash read --------------------------------
 #
 # The controller converts the dummy cycle count to bytes by dividing by 8, as
