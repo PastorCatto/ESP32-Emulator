@@ -110,9 +110,12 @@ impl Built {
 /// describes hardware rather than what happens to be compiled in.
 fn build(
     spec: &PeripheralSpec,
-    claim: Option<Claim>,
+    claims: Vec<Claim>,
     sd_image: Option<&Path>,
 ) -> Result<Option<Built>, String> {
+    // Single-address devices take the first; an I2C device takes the lot,
+    // because firmware picks which controller drives its pins.
+    let claim = claims.first().cloned();
     match spec.kind.as_str() {
         "st7789" => {
             let claim = claim.ok_or("st7789 needs a bus and a chip select")?;
@@ -125,7 +128,9 @@ fn build(
             Ok(Some(Built::new(Box::new(panel)).screen(screen)))
         }
         "gt911" => {
-            let claim = claim.ok_or("gt911 needs a bus and an address")?;
+            if claims.is_empty() {
+                return Err("gt911 needs a bus and an address".into());
+            }
             // The resolution the chip advertises, which drivers read...
             let width = spec.params.u16_or("width", 320).map_err(|e| e.to_string())?;
             let height = spec.params.u16_or("height", 240).map_err(|e| e.to_string())?;
@@ -141,13 +146,15 @@ fn build(
             let geometry = devices::gt911::Geometry::new(width, height)
                 .points(point_width, point_height)
                 .rotated(rotation);
-            let panel = devices::Gt911::new(claim, geometry);
+            let panel = devices::Gt911::new(claims, geometry);
             let touch = panel.touch().clone();
             Ok(Some(Built::new(Box::new(panel)).touch(touch)))
         }
         "tdeck-keyboard" => {
-            let claim = claim.ok_or("tdeck-keyboard needs a bus and an address")?;
-            let kb = devices::TdeckKeyboard::new(claim);
+            if claims.is_empty() {
+                return Err("tdeck-keyboard needs a bus and an address".into());
+            }
+            let kb = devices::TdeckKeyboard::new(claims);
             let keys = kb.keys().clone();
             Ok(Some(Built::new(Box::new(kb)).keys(keys)))
         }
@@ -176,8 +183,8 @@ pub fn start(board: &Board, sd_image: Option<PathBuf>) -> std::io::Result<Hardwa
     let mut unmodelled = Vec::new();
 
     for spec in board.peripherals.iter().filter(|p| p.enabled) {
-        let claim = spec.claim().ok().flatten();
-        match build(spec, claim, sd_image.as_deref()) {
+        let claims = spec.all_claims().unwrap_or_default();
+        match build(spec, claims, sd_image.as_deref()) {
             Ok(Some(built)) => {
                 screen = built.screen.or(screen);
                 touch = built.touch.or(touch);

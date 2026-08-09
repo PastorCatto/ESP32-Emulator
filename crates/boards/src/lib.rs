@@ -85,6 +85,22 @@ pub struct Bus {
     pub kind: BusKind,
     /// Controller index on the SoC: SPI2, I2C0, UART1.
     pub controller: u8,
+    /// Every controller that can drive these pins.
+    ///
+    /// A device is soldered to pins, not to a peripheral. The GPIO matrix
+    /// then lets firmware drive those pins from whichever controller it
+    /// opens, and that choice is arbitrary -- PURR OS opens I2C0 for the
+    /// T-Deck's touch panel, the Arduino Launcher opens I2C1, and both are
+    /// correct on hardware.
+    ///
+    /// Routing purely by `controller` models a distinction the silicon does
+    /// not have, and the symptom is unpleasant: the bus answers NACK, the
+    /// driver reports a real transfer error, and the device looks absent
+    /// rather than misrouted.
+    ///
+    /// Defaults to just `controller`, so a board says nothing unless its
+    /// pins really can be driven from more than one place.
+    pub controllers: Vec<u8>,
     pub pins: HashMap<String, u8>,
 }
 
@@ -112,6 +128,8 @@ pub struct PeripheralSpec {
     pub bus: Option<String>,
     pub bus_kind: Option<BusKind>,
     pub controller: Option<u8>,
+    /// Every controller that can reach this device, from its bus.
+    pub controllers: Vec<u8>,
     /// Enabled devices attach at load; disabled ones are listed but absent
     /// from the bus, so they can be toggled without editing the file.
     pub enabled: bool,
@@ -158,6 +176,36 @@ impl PeripheralSpec {
             // I2S carries no addressing we route on.
             Some(BusKind::I2s) | None => None,
         })
+    }
+
+    /// Every address this device answers on.
+    ///
+    /// One per controller that can drive its pins. On most boards that is a
+    /// single claim and this is [`Self::claim`] in a vector; where a bus
+    /// lists several controllers it is one each, because firmware picks the
+    /// controller and the device has no say in it.
+    pub fn all_claims(&self) -> Result<Vec<Claim>, BoardError> {
+        let Some(base) = self.claim()? else {
+            return Ok(Vec::new());
+        };
+        let others = self.controllers.iter().copied().filter(|c| Some(*c) != self.controller);
+
+        let mut out = vec![base.clone()];
+        for controller in others {
+            out.push(match &base {
+                Claim::Spi { cs, .. } => Claim::Spi { controller, cs: *cs },
+                Claim::I2c { address, alt, .. } => Claim::I2c {
+                    controller,
+                    address: *address,
+                    alt: *alt,
+                },
+                Claim::Uart { .. } => Claim::Uart { controller },
+                // A GPIO belongs to the pin, not to a peripheral, so there is
+                // no second controller to offer it on.
+                Claim::Gpio { .. } => continue,
+            });
+        }
+        Ok(out)
     }
 
     pub fn display_name(&self) -> &str {
@@ -217,6 +265,8 @@ struct RawBus {
     id: String,
     kind: BusKind,
     controller: u8,
+    #[serde(default)]
+    controllers: Vec<u8>,
     #[serde(flatten)]
     pins: HashMap<String, toml::Value>,
 }
@@ -264,6 +314,11 @@ impl Board {
                 id: b.id,
                 kind: b.kind,
                 controller: b.controller,
+                controllers: if b.controllers.is_empty() {
+                    vec![b.controller]
+                } else {
+                    b.controllers.clone()
+                },
                 pins,
             });
         }
@@ -284,14 +339,14 @@ impl Board {
             let enabled = table.remove("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
             let bus_ref = table.remove("bus").and_then(|v| v.as_str().map(str::to_owned));
 
-            let (bus_kind, controller) = match &bus_ref {
+            let (bus_kind, controller, controllers) = match &bus_ref {
                 Some(id) => {
                     // `bus = "i2s"` in a board file names a kind rather than a
                     // declared bus; treat an unmatched reference to a known
                     // kind as an untracked bus rather than an error.
                     match buses.iter().find(|b| &b.id == id) {
-                        Some(b) => (Some(b.kind), Some(b.controller)),
-                        None if id == "i2s" => (Some(BusKind::I2s), None),
+                        Some(b) => (Some(b.kind), Some(b.controller), b.controllers.clone()),
+                        None if id == "i2s" => (Some(BusKind::I2s), None, Vec::new()),
                         None => {
                             return Err(BoardError::UnknownBus {
                                 peripheral: kind,
@@ -300,7 +355,7 @@ impl Board {
                         }
                     }
                 }
-                None => (None, None),
+                None => (None, None, Vec::new()),
             };
 
             peripherals.push(PeripheralSpec {
@@ -309,6 +364,7 @@ impl Board {
                 bus: bus_ref,
                 bus_kind,
                 controller,
+                controllers,
                 enabled,
                 params: Params::new(table),
             });
@@ -405,7 +461,7 @@ impl Board {
     pub fn claims(&self) -> Result<Vec<(String, Claim)>, BoardError> {
         let mut out = Vec::new();
         for p in self.peripherals.iter().filter(|p| p.enabled) {
-            if let Some(c) = p.claim()? {
+            for c in p.all_claims()? {
                 out.push((p.kind.clone(), c));
             }
         }
@@ -454,15 +510,48 @@ mod tests {
     #[test]
     fn resolves_i2c_devices_including_the_alternate_address() {
         let b = Board::from_toml(T_DECK).unwrap();
-        let claims: HashMap<String, Claim> = b.claims().unwrap().into_iter().collect();
-        assert_eq!(
-            claims["gt911"],
-            Claim::I2c { controller: 0, address: 0x5d, alt: Some(0x14) }
-        );
-        assert_eq!(
-            claims["tdeck-keyboard"],
-            Claim::I2c { controller: 0, address: 0x55, alt: None }
-        );
+        let all = b.claims().unwrap();
+        let for_kind = |kind: &str| -> Vec<Claim> {
+            all.iter().filter(|(k, _)| k == kind).map(|(_, c)| c.clone()).collect()
+        };
+        assert!(for_kind("gt911")
+            .contains(&Claim::I2c { controller: 0, address: 0x5d, alt: Some(0x14) }));
+        assert!(for_kind("tdeck-keyboard")
+            .contains(&Claim::I2c { controller: 0, address: 0x55, alt: None }));
+    }
+
+    #[test]
+    fn an_i2c_device_answers_on_every_controller_that_can_reach_its_pins() {
+        // The T-Deck's panel and keyboard hang off SDA 18 / SCL 8, and the
+        // GPIO matrix lets either I2C peripheral drive those pins. PURR OS
+        // opens I2C0 and the Arduino Launcher opens I2C1 -- both correct on
+        // hardware, so the device has to answer either way. Routing on the
+        // controller alone made the Launcher see an empty bus and report
+        // "GT911 not found".
+        let b = Board::from_toml(T_DECK).unwrap();
+        let gt911 = b
+            .peripherals
+            .iter()
+            .find(|p| p.kind == "gt911")
+            .expect("t-deck has a touch panel");
+
+        let claims = gt911.all_claims().unwrap();
+        assert!(claims.contains(&Claim::I2c { controller: 0, address: 0x5d, alt: Some(0x14) }));
+        assert!(claims.contains(&Claim::I2c { controller: 1, address: 0x5d, alt: Some(0x14) }));
+        assert_eq!(claims.len(), 2, "one per controller, no duplicates");
+    }
+
+    #[test]
+    fn a_bus_on_one_controller_still_yields_one_claim() {
+        // The common case must not change: only a board that says its pins
+        // can be driven from elsewhere gets extra claims.
+        let b = Board::from_toml(T_DECK).unwrap();
+        let display = b
+            .peripherals
+            .iter()
+            .find(|p| p.kind == "st7789")
+            .expect("t-deck has a display");
+        assert_eq!(display.all_claims().unwrap().len(), 1);
     }
 
     #[test]

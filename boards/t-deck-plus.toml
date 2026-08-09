@@ -32,6 +32,10 @@ miso = 38
 id = "i2c0"
 kind = "i2c"
 controller = 0
+# The panel and keyboard hang off these pins, and the GPIO matrix lets either
+# I2C peripheral drive them. PURR OS opens I2C0; the Arduino Launcher opens
+# I2C1. Both are correct on hardware, so answer on both here.
+controllers = [0, 1]
 sda = 18
 scl = 8
 
