@@ -39,9 +39,19 @@ static uint64_t esp32s3_ana_mst_read(void *opaque, hwaddr addr, unsigned size)
 
     for (unsigned i = 0; i < ARRAY_SIZE(esp32s3_ana_mst_done); i++) {
         if (esp32s3_ana_mst_done[i].offset == addr) {
-            return value | esp32s3_ana_mst_done[i].always_set;
+            value |= esp32s3_ana_mst_done[i].always_set;
+            break;
         }
     }
+
+    /*
+     * Visible under `-d unimp`. The PHY blob is closed, so the only way to
+     * learn what it is waiting for is to watch what it reads and how often:
+     * a register polled thousands of times is a readiness bit whose value we
+     * are getting wrong.
+     */
+    qemu_log_mask(LOG_UNIMP, "ana_mst: R %03x = %08x\n",
+                  (unsigned)addr, value);
     return value;
 }
 
@@ -60,6 +70,8 @@ static void esp32s3_ana_mst_write(void *opaque, hwaddr addr, uint64_t value,
     if (index < ARRAY_SIZE(s->regs)) {
         s->regs[index] = (uint32_t)value;
     }
+    qemu_log_mask(LOG_UNIMP, "ana_mst: W %03x = %08x\n",
+                  (unsigned)addr, (uint32_t)value);
 }
 
 static const MemoryRegionOps esp32s3_ana_mst_ops = {

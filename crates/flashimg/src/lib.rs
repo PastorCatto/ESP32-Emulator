@@ -8,6 +8,7 @@ mod chip;
 mod elf;
 pub(crate) mod sha256;
 pub mod patch;
+pub mod archive;
 pub mod fat;
 pub mod signature;
 pub mod signatures;

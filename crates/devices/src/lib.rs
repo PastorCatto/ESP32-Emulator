@@ -41,7 +41,7 @@ mod i2c_tests {
 
     fn touch_panel() -> Gt911 {
         Gt911::new(
-            Claim::I2c { controller: 0, address: 0x5d, alt: None },
+            vec![Claim::I2c { controller: 0, address: 0x5d, alt: None }],
             Geometry::new(320, 240).rotated(Rotation::None),
         )
     }
@@ -158,11 +158,11 @@ mod i2c_tests {
 
     #[test]
     fn the_keyboard_reports_zero_when_nothing_is_pressed() {
-        let mut kb = TdeckKeyboard::new(Claim::I2c {
+        let mut kb = TdeckKeyboard::new(vec![Claim::I2c {
             controller: 0,
             address: 0x55,
             alt: None,
-        });
+        }]);
         assert_eq!(read(&mut kb, 1), [0]);
 
         TdeckKeyboard::press(kb.keys(), 'k');
@@ -173,11 +173,11 @@ mod i2c_tests {
     #[test]
     fn the_keyboard_drops_what_it_could_not_express() {
         // One byte per key on the real part, so there is nowhere to put this.
-        let mut kb = TdeckKeyboard::new(Claim::I2c {
+        let mut kb = TdeckKeyboard::new(vec![Claim::I2c {
             controller: 0,
             address: 0x55,
             alt: None,
-        });
+        }]);
         TdeckKeyboard::press(kb.keys(), 'é');
         assert_eq!(read(&mut kb, 1), [0]);
     }

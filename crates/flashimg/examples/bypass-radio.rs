@@ -53,7 +53,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(s) => Patcher::new(s, &flash, APP_OFFSET)?,
         None => Patcher::from_signatures(&flash, APP_OFFSET)?,
     };
-    let applied = patcher.apply(&mut flash, &patches)?;
+    let outcome = patcher.apply(&mut flash, &patches)?;
+    let applied = &outcome.applied;
 
     for (a, p) in applied.iter().zip(patches.iter()) {
         println!(
@@ -68,6 +69,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             p.reason
         );
+    }
+
+    for s in &outcome.skipped {
+        eprintln!("skipped {:<24} {}", s.symbol, s.reason);
+    }
+    if !outcome.radio_disabled() {
+        eprintln!("WARNING: esp_phy_enable was not replaced -- this will still stall in phy_init");
     }
 
     std::fs::write(&out_path, &flash)?;

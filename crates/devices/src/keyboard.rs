@@ -23,14 +23,14 @@ const MAX_PENDING: usize = 64;
 
 #[derive(Debug)]
 pub struct TdeckKeyboard {
-    claim: Claim,
+    claims: Vec<Claim>,
     keys: KeyQueue,
 }
 
 impl TdeckKeyboard {
-    pub fn new(claim: Claim) -> Self {
+    pub fn new(claims: Vec<Claim>) -> Self {
         TdeckKeyboard {
-            claim,
+            claims,
             keys: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
@@ -59,7 +59,7 @@ impl Peripheral for TdeckKeyboard {
     }
 
     fn claims(&self) -> Vec<Claim> {
-        vec![self.claim.clone()]
+        self.claims.clone()
     }
 
     fn transact(&mut self, tx: &Transaction, _events: &mut dyn EventSink) -> Response {

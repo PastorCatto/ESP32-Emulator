@@ -88,7 +88,9 @@ impl Geometry {
 }
 
 pub struct Gt911 {
-    claim: Claim,
+    /// Every address this panel answers on -- one per controller that can
+    /// drive its pins, since firmware chooses the controller.
+    claims: Vec<Claim>,
     touch: TouchHandle,
     width: u16,
     height: u16,
@@ -113,10 +115,10 @@ impl std::fmt::Debug for Gt911 {
 }
 
 impl Gt911 {
-    pub fn new(claim: Claim, geometry: Geometry) -> Self {
+    pub fn new(claims: Vec<Claim>, geometry: Geometry) -> Self {
         let Geometry { width, height, point_width, point_height, rotation } = geometry;
         Gt911 {
-            claim,
+            claims,
             touch: Arc::new(Mutex::new(TouchState::new(point_width, point_height, rotation))),
             width,
             height,
@@ -237,7 +239,7 @@ impl Peripheral for Gt911 {
     }
 
     fn claims(&self) -> Vec<Claim> {
-        vec![self.claim.clone()]
+        self.claims.clone()
     }
 
     fn transact(&mut self, tx: &Transaction, _events: &mut dyn EventSink) -> Response {
@@ -312,7 +314,7 @@ mod tests {
     /// Where the firmware believes a click at `(x, y)` on the displayed
     /// 320x240 image happened.
     fn round_trip(geometry: Geometry, x: f32, y: f32) -> (i32, i32) {
-        let panel = Gt911::new(Claim::I2c { controller: 0, address: 0x5d, alt: None }, geometry);
+        let panel = Gt911::new(vec![Claim::I2c { controller: 0, address: 0x5d, alt: None }], geometry);
         let mut touch = panel.touch().lock().unwrap();
         touch.pointer(PointerPhase::Press, x, y, 320.0, 240.0);
         let point = touch.current().expect("a press inside the image is a touch");
@@ -368,7 +370,7 @@ mod tests {
         // which is what the chip does on hardware even though its points
         // span something else.
         let mut panel =
-            Gt911::new(Claim::I2c { controller: 0, address: 0x5d, alt: None }, t_deck());
+            Gt911::new(vec![Claim::I2c { controller: 0, address: 0x5d, alt: None }], t_deck());
         panel.cursor = reg::X_RESOLUTION;
         let res = panel.read(4);
         assert_eq!(u16::from_le_bytes([res[0], res[1]]), 320);
