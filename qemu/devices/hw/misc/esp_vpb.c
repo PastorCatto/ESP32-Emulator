@@ -10,6 +10,7 @@
 #include "qemu/error-report.h"
 #include "qemu/sockets.h"
 #include "qemu/main-loop.h"
+#include "qemu/timer.h"
 #include "qapi/error.h"
 #include "io/channel-socket.h"
 #include "hw/misc/esp_vpb.h"
@@ -217,6 +218,65 @@ static bool esp_vpb_read_frame_unlocked(EspVpbClient *c, uint8_t *payload,
     return ok;
 }
 
+/* How long a partial buffer may sit before it goes out anyway. */
+#define ESP_VPB_COALESCE_MS 2
+
+/*
+ * Beyond this a buffer is sent immediately. Well under the frame limit, and
+ * large enough that a full screen is tens of frames rather than thousands.
+ */
+#define ESP_VPB_COALESCE_MAX (16 * 1024)
+
+void esp_vpb_flush(EspVpbClient *c)
+{
+    if (!c->has_pending) {
+        return;
+    }
+
+    /* Cleared first: a send failure must not leave the bytes queued again. */
+    uint32_t len = c->pending_len;
+    uint8_t controller = c->pending_controller;
+    uint8_t cs = c->pending_cs;
+    int dc = c->pending_dc;
+
+    c->has_pending = false;
+    c->pending_len = 0;
+    if (c->flush_timer) {
+        timer_del(c->flush_timer);
+    }
+
+    g_autofree char *header =
+        g_strdup_printf("{\"type\":\"transact\","
+                        "\"op\":\"spi_transfer\",\"controller\":%u,\"cs\":%u,"
+                        "%s\"read_len\":0}",
+                        controller, cs,
+                        dc < 0 ? "" : (dc ? "\"dc\":true," : "\"dc\":false,"));
+
+    if (!esp_vpb_write_frame(c, header, c->pending, len)) {
+        esp_vpb_fail(c, "send failed");
+    }
+}
+
+static void esp_vpb_flush_timeout(void *opaque)
+{
+    esp_vpb_flush((EspVpbClient *)opaque);
+}
+
+/*
+ * Can these bytes join what is already buffered?
+ *
+ * Only when they are going to the same place: a different device, or the same
+ * device with the data/command line the other way, is a different meaning for
+ * the bytes and must stay a separate frame.
+ */
+static bool esp_vpb_can_append(EspVpbClient *c, uint8_t controller, uint8_t cs,
+                               int dc, uint32_t len)
+{
+    return c->has_pending && c->pending_controller == controller &&
+           c->pending_cs == cs && c->pending_dc == dc &&
+           c->pending_len + len <= ESP_VPB_COALESCE_MAX;
+}
+
 bool esp_vpb_spi_transfer(EspVpbClient *c, uint8_t controller, uint8_t cs,
                           int dc, const uint8_t *mosi, uint32_t len,
                           uint8_t *miso, uint32_t read_len)
@@ -229,6 +289,56 @@ bool esp_vpb_spi_transfer(EspVpbClient *c, uint8_t controller, uint8_t cs,
                       len);
         return false;
     }
+
+    /*
+     * Hold write-only traffic back briefly and send it as one frame.
+     *
+     * An ESP-IDF driver hands over a whole framebuffer by DMA and this changes
+     * nothing. Arduino's TFT_eSPI writes the SPI registers directly and pushes
+     * pixels through the 64-byte register FIFO, so one screen is tens of
+     * thousands of transfers -- Bruce issues about 127,000 during a boot. Each
+     * one used to cost a JSON header, a syscall and a wakeup on the far side.
+     *
+     * Safe only because the bytes still arrive in order, on the same
+     * connection, before anything that could observe them: a read flushes
+     * first, and so does a change of device or data/command level.
+     */
+    if (read_len == 0 && len > 0) {
+        if (!esp_vpb_can_append(c, controller, cs, dc, len)) {
+            esp_vpb_flush(c);
+        }
+
+        if (!c->pending) {
+            c->pending = g_malloc(ESP_VPB_COALESCE_MAX);
+        }
+        memcpy(c->pending + c->pending_len, mosi, len);
+        c->pending_len += len;
+        c->pending_controller = controller;
+        c->pending_cs = cs;
+        c->pending_dc = dc;
+        c->has_pending = true;
+
+        if (c->pending_len >= ESP_VPB_COALESCE_MAX) {
+            esp_vpb_flush(c);
+            return true;
+        }
+
+        /*
+         * Nothing may force the buffer out if the guest stops drawing, so the
+         * last partial frame of a screen would sit here indefinitely and the
+         * display would show all but its final strip.
+         */
+        if (!c->flush_timer) {
+            c->flush_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                          esp_vpb_flush_timeout, c);
+        }
+        timer_mod(c->flush_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + ESP_VPB_COALESCE_MS);
+        return true;
+    }
+
+    /* Anything that reads has to see the writes that came before it. */
+    esp_vpb_flush(c);
 
     /*
      * Only transactions that read anything carry an id. A write-only transfer

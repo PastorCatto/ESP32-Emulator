@@ -132,6 +132,9 @@ typedef struct Esp32s3I2CState {
     /* Controller number reported to device models: 0 or 1. */
     uint8_t vpb_controller;
 
+    /* Whether the firmware has ever written a register here. */
+    bool seen_write;
+
     /*
      * A transaction in progress, accumulated across command-list entries.
      *
