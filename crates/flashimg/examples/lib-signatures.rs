@@ -50,8 +50,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<std::io::Result<_>>()?;
 
     println!(
-        "{:<30} {:>6} {:>7} {:>8}  {}",
-        "symbol", "bytes", "pinned", "reloc", "match in firmware"
+        "{:<30} {:>6} {:>7} {:>8}  match in firmware",
+        "symbol", "bytes", "pinned", "reloc"
     );
 
     for symbol in WANTED {
