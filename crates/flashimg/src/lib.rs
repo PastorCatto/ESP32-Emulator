@@ -10,6 +10,8 @@ pub(crate) mod sha256;
 pub mod patch;
 pub mod archive;
 pub mod fat;
+pub mod littlefs;
+pub mod provision;
 pub mod signature;
 pub mod signatures;
 mod error;
