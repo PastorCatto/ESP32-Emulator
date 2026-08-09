@@ -392,6 +392,16 @@ impl Session {
         config.display_dc_gpio = self.board.display_dc_gpio();
         config.serial_count = SerialBuffer::PORTS;
 
+        // Extra QEMU flags, whitespace separated. Exists so a boot can be
+        // traced without leaving the window -- `-d unimp -D some\file.log`
+        // being the useful pair. Measuring headless meant measuring a
+        // different device set than the one being used, which cost a day.
+        if let Some(extra) = std::env::var_os("ESP32_QEMU_ARGS") {
+            config.extra_args.extend(
+                extra.to_string_lossy().split_whitespace().map(str::to_owned),
+            );
+        }
+
         self.instance = Some(Instance::spawn(&qemu, &config)?);
         self.hardware = Some(hardware);
         Ok(())
