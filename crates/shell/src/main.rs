@@ -16,13 +16,20 @@ mod session;
 /// what makes the app usable from a shell, a desktop "open with", and a script
 /// that wants to reproduce a run.
 ///
-/// Usage: esp32-emulator [firmware.bin] [card.img] [board.toml] [--run]
+/// Usage: esp32-emulator [firmware.bin] [card.img] [board.toml] [--run] [--bypass]
 fn main() -> eframe::Result<()> {
     let mut paths = Vec::new();
     let mut autostart = false;
+    let mut bypass = false;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--run" => autostart = true,
+            // What the "Bypass + boot" button does, so a scripted run and a
+            // clicked one exercise the same path.
+            "--bypass" => {
+                bypass = true;
+                autostart = true;
+            }
             _ => paths.push(std::path::PathBuf::from(arg)),
         }
     }
@@ -38,6 +45,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "ESP32 Emulator",
         options,
-        Box::new(move |cc| Ok(Box::new(app::App::with_files(cc, &paths, autostart)))),
+        Box::new(move |cc| Ok(Box::new(app::App::with_files(cc, &paths, autostart, bypass)))),
     )
 }

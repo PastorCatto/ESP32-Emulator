@@ -752,6 +752,42 @@ replace_once "hw/dma/esp_gdma.c" \
               : FIELD_EX32(s->ch_conf[dir][i].link, GDMA_OUT_LINK, START))) {" \
   'GDMA_IN_LINK, START)'
 
+# --- Dummy cycles on a multi-line flash read --------------------------------
+#
+# The controller converts the dummy cycle count to bytes by dividing by 8, as
+# though every cycle carried a single bit. That only holds for single-line SPI.
+# Quad I/O moves four bits per cycle and dual moves two, so the same cycle
+# count occupies fewer bytes on the wire.
+#
+# A quad read (0xeb) asks for 6 dummy cycles. Divided by 8 that is 1 byte,
+# where the flash is waiting for 3. The controller therefore stops clocking two
+# bytes early and the flash never emits the last two bytes of the burst: a
+# 64-byte read returns 62, a 32-byte read returns 30. The caller keeps whatever
+# its buffer already held in the gap, so the damage is silent and depends on
+# what was read previously.
+#
+# It goes unnoticed for code, which the cache reads over a different path, and
+# for the erased tail of most partitions, where the missing bytes were 0xff
+# anyway. It is fatal to a filesystem: littlefs puts its commit checksum in the
+# last four bytes of a 64-byte metadata commit, so the checksum never matches
+# and a perfectly good volume reads as a corrupt dir pair. Dual reads are
+# unaffected, which is why firmware configured for DIO mounts and the same
+# firmware in QIO does not.
+
+replace_once "hw/ssi/esp32s3_spi.c" \
+  "    *len = (dummy_count + 7) / 8;" \
+  "    uint32_t lines = 1;
+    if (FIELD_EX32(s->mem_ctrl, SPI_MEM_CTRL, FREAD_QIO) ||
+        FIELD_EX32(s->mem_ctrl, SPI_MEM_CTRL, FREAD_QUAD)) {
+        lines = 4;
+    } else if (FIELD_EX32(s->mem_ctrl, SPI_MEM_CTRL, FREAD_DIO) ||
+               FIELD_EX32(s->mem_ctrl, SPI_MEM_CTRL, FREAD_DUAL)) {
+        lines = 2;
+    }
+
+    *len = (dummy_count * lines + 7) / 8;" \
+  'uint32_t lines = 1;'
+
 # --- USB Serial/JTAG console ------------------------------------------------
 #
 # The stock device is a stub: reads return zero, writes are dropped. Firmware

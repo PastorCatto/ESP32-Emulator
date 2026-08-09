@@ -105,6 +105,7 @@ impl App {
         cc: &eframe::CreationContext<'_>,
         paths: &[PathBuf],
         autostart: bool,
+        bypass: bool,
     ) -> Self {
         let mut app = App::new(cc);
 
@@ -118,6 +119,9 @@ impl App {
             app.handle_drop(path);
         }
 
+        if bypass && app.session.can_patch() {
+            app.patch_radio();
+        }
         if autostart && app.session.firmware.is_some() {
             app.boot();
         }
