@@ -239,6 +239,18 @@ static void esp32s3_i2c_write_reg(void *opaque, hwaddr addr, uint64_t value,
     Esp32s3I2CState *s = ESP32S3_I2C(opaque);
     unsigned index = addr / sizeof(uint32_t);
 
+    /*
+     * First touch of a controller, so a log says whether the driver ever
+     * brought it up. Arduino's Wire fails a read with "NULL buffer pointer"
+     * before it reaches the hardware, so a controller the firmware never
+     * configured and one whose begin() failed look identical from the bus.
+     */
+    if (!s->seen_write) {
+        s->seen_write = true;
+        qemu_log_mask(LOG_UNIMP, "i2c%u: first register write, off=%03x\n",
+                      s->vpb_controller, (unsigned)addr);
+    }
+
     if (addr >= A_I2C_COMD &&
         addr < A_I2C_COMD + ESP32S3_I2C_CMD_COUNT * sizeof(uint32_t)) {
         s->cmd[(addr - A_I2C_COMD) / sizeof(uint32_t)] = (uint32_t)value;
