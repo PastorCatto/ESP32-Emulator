@@ -148,6 +148,31 @@ pub struct Applied {
     pub how: Located,
 }
 
+/// A target that could not be replaced, and why.
+///
+/// Reported rather than fatal. The entry points are independent and unequal:
+/// a boot stops on `esp_phy_enable` and on nothing else here, so losing a
+/// wrapper that moved between builds is worth a note, not a refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skipped {
+    pub symbol: String,
+    pub reason: String,
+}
+
+/// What a patch run did, including what it could not do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Outcome {
+    pub applied: Vec<Applied>,
+    pub skipped: Vec<Skipped>,
+}
+
+impl Outcome {
+    /// Did the one target a boot actually depends on get replaced?
+    pub fn radio_disabled(&self) -> bool {
+        self.applied.iter().any(|a| a.symbol == "esp_phy_enable")
+    }
+}
+
 #[derive(Debug)]
 pub struct Patcher<'a> {
     /// Absent when the firmware shipped no `.elf`, which is the case byte
@@ -278,25 +303,51 @@ impl<'a> Patcher<'a> {
     /// ```
     ///
     /// and then a boot loop.
-    pub fn apply(&self, flash: &mut [u8], patches: &[Patch]) -> Result<Vec<Applied>> {
+    pub fn apply(&self, flash: &mut [u8], patches: &[Patch]) -> Result<Outcome> {
         let mut applied = Vec::with_capacity(patches.len());
+        let mut skipped = Vec::new();
 
         for patch in patches {
-            let (offset, address, size, how) = self.locate(patch, flash)?;
+            // One target we cannot find must not cost the others.
+            //
+            // These are independent replacements, and they are not equally
+            // important: esp_phy_enable is the one a boot actually stops on,
+            // while the rest keep the driver's state machine tidy afterwards.
+            // Refusing the whole patch because a thin wrapper moved between
+            // builds denies a working boot over something that barely
+            // matters -- which is exactly what happened to a DP7 image whose
+            // esp_phy_enable matched perfectly well.
+            let (offset, address, size, how) = match self.locate(patch, flash) {
+                Ok(found) => found,
+                Err(e) => {
+                    skipped.push(Skipped {
+                        symbol: patch.symbol.clone(),
+                        reason: e.to_string(),
+                    });
+                    continue;
+                }
+            };
 
             let bytes = patch.stub.bytes();
             if size < bytes.len() {
-                return Err(Error::Unpatchable(format!(
-                    "{} is {} bytes, too small for a {}-byte stub",
-                    patch.symbol, size, bytes.len()
-                )));
+                skipped.push(Skipped {
+                    symbol: patch.symbol.clone(),
+                    reason: format!(
+                        "{} bytes, too small for a {}-byte stub",
+                        size,
+                        bytes.len()
+                    ),
+                });
+                continue;
             }
 
             let end = offset + bytes.len();
             if end > flash.len() {
-                return Err(Error::Unpatchable(format!(
-                    "{} maps past the end of the image", patch.symbol
-                )));
+                skipped.push(Skipped {
+                    symbol: patch.symbol.clone(),
+                    reason: "maps past the end of the image".into(),
+                });
+                continue;
             }
             flash[offset..end].copy_from_slice(&bytes);
 
@@ -312,7 +363,7 @@ impl<'a> Patcher<'a> {
         if !applied.is_empty() {
             self.reseal(flash)?;
         }
-        Ok(applied)
+        Ok(Outcome { applied, skipped })
     }
 
     /// Recompute the checksum byte and, if present, the appended digest.
@@ -392,6 +443,44 @@ mod tests {
                 sig.pinned_bits()
             );
         }
+    }
+
+    #[test]
+    fn one_missing_target_does_not_cost_the_others() {
+        // A DP7 image patched fine except for esp_wifi_init, and the whole
+        // operation was refused over it -- denying a working boot because a
+        // wrapper moved between builds. What matters is whether the one
+        // target a boot stops on was replaced.
+        let outcome = Outcome {
+            applied: vec![Applied {
+                symbol: "esp_phy_enable".into(),
+                address: 0x4209_8be8,
+                offset: 0xf8be8,
+                bytes: 5,
+                how: Located::Signature,
+            }],
+            skipped: vec![Skipped {
+                symbol: "esp_wifi_init".into(),
+                reason: "no byte signature matched".into(),
+            }],
+        };
+        assert!(outcome.radio_disabled(), "esp_phy_enable is the one that counts");
+        assert_eq!(outcome.skipped.len(), 1, "and the miss is reported, not hidden");
+    }
+
+    #[test]
+    fn a_run_that_misses_the_phy_says_so() {
+        let outcome = Outcome {
+            applied: vec![Applied {
+                symbol: "esp_wifi_start".into(),
+                address: 0,
+                offset: 0,
+                bytes: 7,
+                how: Located::Signature,
+            }],
+            skipped: Vec::new(),
+        };
+        assert!(!outcome.radio_disabled(), "without esp_phy_enable a boot still stalls");
     }
 
     #[test]

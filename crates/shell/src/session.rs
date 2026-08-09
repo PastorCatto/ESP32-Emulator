@@ -360,7 +360,8 @@ impl Session {
                 flashimg::patch::Patcher::from_signatures(&flash, APP_OFFSET)?
             }
         };
-        let applied = patcher.apply(&mut flash, &patches)?;
+        let outcome = patcher.apply(&mut flash, &patches)?;
+        let applied = outcome.applied;
         std::fs::write(&flash_path, &flash)?;
 
         let n = applied.len();
