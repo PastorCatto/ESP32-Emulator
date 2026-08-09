@@ -106,6 +106,17 @@ static void esp32s3_i2c_do_read(Esp32s3I2CState *s, uint32_t cmd)
         s->nacked = true;
     }
 
+    /*
+     * Who is being polled, and with what answer. Under `-d unimp`, because a
+     * transfer that succeeds thousands of times over without the firmware
+     * making progress is the interesting case: the interrupt trace alone
+     * cannot tell a working device from one answering the wrong thing.
+     */
+    qemu_log_mask(LOG_UNIMP, "i2c%u: R %02x n=%u -> %02x %02x%s\n",
+                  s->vpb_controller, s->address, count,
+                  count > 0 ? buf[0] : 0, count > 1 ? buf[1] : 0,
+                  s->nacked ? " NACK" : "");
+
     for (uint32_t i = 0; i < count; i++) {
         if (fifo8_num_free(&s->rx_fifo) == 0) {
             qemu_log_mask(LOG_GUEST_ERROR, "%s: RX FIFO overflow\n", __func__);
