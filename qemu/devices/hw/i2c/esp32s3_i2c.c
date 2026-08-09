@@ -18,6 +18,15 @@ static void esp32s3_i2c_update_irq(Esp32s3I2CState *s)
     uint32_t status = s->regs[R_I2C_INT_RAW] & s->regs[R_I2C_INT_ENA];
 
     s->regs[R_I2C_INT_STATUS] = status;
+    /*
+     * Visible under `-d unimp`. Which bits are raised against which are
+     * enabled is the whole question when a driver reports a transaction that
+     * never completed: raising an event nobody enabled looks identical, from
+     * the guest side, to raising nothing at all.
+     */
+    qemu_log_mask(LOG_UNIMP, "i2c%u: irq raw=%08x ena=%08x st=%08x\n",
+                  s->vpb_controller, s->regs[R_I2C_INT_RAW],
+                  s->regs[R_I2C_INT_ENA], status);
     qemu_set_irq(s->irq, status != 0);
 }
 
