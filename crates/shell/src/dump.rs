@@ -103,7 +103,7 @@ fn render(
     ));
 
     let mut top: Vec<(u16, usize)> = counts.into_iter().collect();
-    top.sort_by(|a, b| b.1.cmp(&a.1));
+    top.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
     out.push_str("colours    ");
     for (colour, n) in top.iter().take(4) {
         let (r, g, b) = rgb(*colour);
@@ -130,7 +130,7 @@ fn render(
                     n += 1;
                 }
             }
-            let mean = if n > 0 { sum / n } else { 0 };
+            let mean = sum.checked_div(n).unwrap_or(0);
             let idx = (mean as usize * (RAMP.len() - 1)) / 255;
             out.push(RAMP[idx] as char);
         }

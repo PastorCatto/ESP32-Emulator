@@ -364,7 +364,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
 
         if let (Some(dump), Some(screen)) = (self.screen_dump.as_mut(), self.session.screen()) {
-            dump.tick(&screen);
+            dump.tick(screen);
         }
 
         // Files dropped anywhere on the window.
