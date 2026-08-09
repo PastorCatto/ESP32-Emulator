@@ -109,7 +109,25 @@ static void esp32s3_gpspi_dc_changed(void *opaque, int n, int level)
     s->dc_level = level ? 1 : 0;
 }
 
-/* Which chip select is asserted, or -1 when the driver has selected none. */
+/*
+ * Which chip select is asserted.
+ *
+ * ESP-IDF lets the controller drive CS and enables exactly one line, so the
+ * register says which device a transfer is for. Arduino does not: TFT_eSPI
+ * disables every hardware CS (MISC.CS_DIS = 0x3f) and toggles the CS pin with
+ * a plain GPIO write, because it drives the panel by writing SPI registers
+ * directly. Reading that as "no device selected" drops every transfer the
+ * firmware makes -- Bruce and the T-Deck Launcher issued over a hundred
+ * thousand and drew nothing at all.
+ *
+ * With the hardware lines off there is nothing in the controller saying which
+ * device is selected; that lives in a GPIO level we are not wired to. Until
+ * the CS pins are plumbed in the way the D/C pin already is, assume the first
+ * line, which is the display on every board we ship. A second device selected
+ * by GPIO on the same bus -- an SD card sharing the display bus, say -- would
+ * be misrouted to it. That is worth knowing about, but it beats dropping the
+ * traffic outright, which is what happened before.
+ */
 static int esp32s3_gpspi_active_cs(Esp32s3GpspiState *s)
 {
     uint32_t dis = FIELD_EX32(s->regs[R_GPSPI_MISC], GPSPI_MISC, CS_DIS);
@@ -119,7 +137,7 @@ static int esp32s3_gpspi_active_cs(Esp32s3GpspiState *s)
             return i;
         }
     }
-    return -1;
+    return 0;
 }
 
 /* Byte `index` of the W0..W15 payload buffer. */
@@ -164,9 +182,6 @@ static bool esp32s3_gpspi_via_vpb(Esp32s3GpspiState *s, uint8_t *buf,
 {
     int cs = esp32s3_gpspi_active_cs(s);
 
-    if (cs < 0) {
-        return false;
-    }
     return esp_vpb_spi_transfer(&s->vpb, s->vpb_controller, (uint8_t)cs,
                                 s->dc_level, buf, bytes,
                                 buf, want_miso ? bytes : 0);
