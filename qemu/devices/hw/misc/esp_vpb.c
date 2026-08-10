@@ -211,7 +211,28 @@ static bool esp_vpb_read_frame_unlocked(EspVpbClient *c, uint8_t *payload,
     if (held) {
         bql_unlock();
     }
+    /*
+     * Time the wait. The guest is stopped for all of it, and the peer is the
+     * UI process, so this is where a busy UI turns into a slow machine. Total
+     * against elapsed says whether the emulator is computing or waiting.
+     */
+    const int64_t start = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     const bool ok = esp_vpb_read_frame(c, payload, capacity, got, nacked);
+    const int64_t waited = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - start;
+
+    c->wait_ns += waited;
+    c->wait_count++;
+    if (waited > c->wait_worst_ns) {
+        c->wait_worst_ns = waited;
+    }
+    if (c->wait_count % 2000 == 0) {
+        qemu_log_mask(LOG_UNIMP,
+                      "vpb: %" PRIu64 " reads, %" PRIu64 " ms waiting, "
+                      "worst %" PRIu64 " us, mean %" PRIu64 " us\n",
+                      c->wait_count, c->wait_ns / 1000000,
+                      c->wait_worst_ns / 1000,
+                      c->wait_ns / c->wait_count / 1000);
+    }
     if (held) {
         bql_lock();
     }

@@ -53,6 +53,11 @@ typedef struct EspVpbClient {
 
     /* Sends whatever is buffered once the guest stops drawing. */
     QEMUTimer *flush_timer;
+
+    /* Time the guest has spent stopped waiting for a device to answer. */
+    uint64_t wait_ns;
+    uint64_t wait_count;
+    uint64_t wait_worst_ns;
 } EspVpbClient;
 
 /**
