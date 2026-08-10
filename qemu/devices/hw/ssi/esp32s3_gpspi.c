@@ -109,7 +109,29 @@ static void esp32s3_gpspi_dc_changed(void *opaque, int n, int level)
     s->dc_level = level ? 1 : 0;
 }
 
-/* Which chip select is asserted, or -1 when the driver has selected none. */
+/* A chip select pin is asserted low. */
+static void esp32s3_gpspi_cs_sel_changed(void *opaque, int n, int level)
+{
+    Esp32s3GpspiState *s = ESP32S3_GPSPI(opaque);
+
+    if (n >= 0 && n < ESP32S3_GPSPI_CS_COUNT) {
+        s->cs_sel_level[n] = level ? 1 : 0;
+    }
+}
+
+/*
+ * Which chip select is asserted.
+ *
+ * Two conventions have to be told apart. ESP-IDF lets the controller drive CS
+ * and enables exactly one line, so MISC.CS_DIS says which device a transfer is
+ * for. Arduino's TFT_eSPI writes the SPI registers directly and toggles the CS
+ * pin with a plain GPIO write, leaving every hardware line disabled -- reading
+ * that as "no device selected" dropped every transfer it made, which is why
+ * Bruce issued 127,570 of them and drew nothing.
+ *
+ * So when the hardware lines are off, route on the pin levels the board told
+ * us about instead. Lowest asserted line wins, matching the hardware order.
+ */
 static int esp32s3_gpspi_active_cs(Esp32s3GpspiState *s)
 {
     uint32_t dis = FIELD_EX32(s->regs[R_GPSPI_MISC], GPSPI_MISC, CS_DIS);
@@ -119,7 +141,44 @@ static int esp32s3_gpspi_active_cs(Esp32s3GpspiState *s)
             return i;
         }
     }
-    return -1;
+
+    for (int i = 0; i < ESP32S3_GPSPI_CS_COUNT; i++) {
+        if (s->cs_sel_gpio[i] >= 0 && !s->cs_sel_level[i]) {
+            return i;
+        }
+    }
+
+    /*
+     * The driver is managing CS but the board named no pins, so there is
+     * nothing to route on. Assume the first line rather than discard the
+     * transfer: on a board with one device per bus that is right, and on any
+     * other it is at least visible.
+     */
+    return s->cs_sel_named ? -1 : 0;
+}
+
+/* Parse the board's "line:line:..." CS pin list. -1 leaves a line unwired. */
+static void esp32s3_gpspi_parse_cs_gpios(Esp32s3GpspiState *s)
+{
+    const char *p = s->cs_gpios;
+
+    for (int i = 0; i < ESP32S3_GPSPI_CS_COUNT; i++) {
+        s->cs_sel_gpio[i] = -1;
+        /* Idle high, so nothing looks selected before the driver speaks. */
+        s->cs_sel_level[i] = 1;
+    }
+    s->cs_sel_named = false;
+
+    for (int i = 0; p && *p && i < ESP32S3_GPSPI_CS_COUNT; i++) {
+        char *end = NULL;
+        long pin = strtol(p, &end, 10);
+
+        if (end != p && pin >= 0 && pin < ESP32S3_GPSPI_CS_PIN_LIMIT) {
+            s->cs_sel_gpio[i] = (int32_t)pin;
+            s->cs_sel_named = true;
+        }
+        p = (end && *end == ':') ? end + 1 : "";
+    }
 }
 
 /* Byte `index` of the W0..W15 payload buffer. */
@@ -164,9 +223,6 @@ static bool esp32s3_gpspi_via_vpb(Esp32s3GpspiState *s, uint8_t *buf,
 {
     int cs = esp32s3_gpspi_active_cs(s);
 
-    if (cs < 0) {
-        return false;
-    }
     return esp_vpb_spi_transfer(&s->vpb, s->vpb_controller, (uint8_t)cs,
                                 s->dc_level, buf, bytes,
                                 buf, want_miso ? bytes : 0);
@@ -439,6 +495,30 @@ static uint64_t esp32s3_gpspi_read(void *opaque, hwaddr addr, unsigned int size)
         return 0;
     }
 
+    /*
+     * A driver watching SPI_CMD for its transfer to finish gets the answer
+     * now rather than after the timer.
+     *
+     * The bytes have already moved; the delay exists only so completion is
+     * not visible inside the guest's store to SPI_CMD, where an ISR could
+     * re-enter a driver mid-bookkeeping. A separate later read is past that
+     * point, and with no interrupt armed there is no ISR to re-enter at all.
+     *
+     * It matters because the wait is spent spinning. TFT_eSPI polls this
+     * register in a tight loop, and virtual time only advances as the host
+     * executes, so a few microseconds of modelled transfer becomes thousands
+     * of MMIO exits -- each one a fault out of the guest and back. Multiplied
+     * by the ~127,000 transfers a screen redraw takes, that is most of what
+     * the emulator was doing while drawing.
+     *
+     * ESP-IDF is unaffected: it arms the completion interrupt, so this is
+     * skipped and the deferred path it depends on stays exactly as it was.
+     */
+    if (reg == A_GPSPI_CMD && s->busy && s->regs[R_GPSPI_DMA_INT_ENA] == 0) {
+        timer_del(s->done_timer);
+        esp32s3_gpspi_done(s);
+    }
+
     switch (reg) {
     case A_GPSPI_DATE:
         return ESP32S3_GPSPI_DATE_VALUE;
@@ -574,6 +654,9 @@ static void esp32s3_gpspi_init(Object *obj)
     /* No data/command pin known until a board wires one. */
     s->dc_level = -1;
     qdev_init_gpio_in_named(DEVICE(s), esp32s3_gpspi_dc_changed, "dc", 1);
+    qdev_init_gpio_in_named(DEVICE(s), esp32s3_gpspi_cs_sel_changed, "cs-sel",
+                            ESP32S3_GPSPI_CS_COUNT);
+    esp32s3_gpspi_parse_cs_gpios(s);
 }
 
 static const VMStateDescription vmstate_esp32s3_gpspi = {
@@ -596,6 +679,7 @@ static Property esp32s3_gpspi_properties[] = {
     DEFINE_PROP_UINT8("vpb-controller", Esp32s3GpspiState, vpb_controller, 2),
     /* Board wiring: which GPIO the machine should connect to "dc". */
     DEFINE_PROP_INT32("dc-gpio", Esp32s3GpspiState, dc_gpio, -1),
+    DEFINE_PROP_STRING("cs-gpios", Esp32s3GpspiState, cs_gpios),
     DEFINE_PROP_END_OF_LIST(),
 };
 

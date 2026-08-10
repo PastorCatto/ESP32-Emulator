@@ -17,6 +17,7 @@
 #pragma once
 
 #include "qemu/osdep.h"
+#include "qemu/timer.h"
 
 /* Larger than any single SPI transaction the hardware can express. */
 #define ESP_VPB_MAX_PAYLOAD (64 * 1024)
@@ -35,6 +36,28 @@ typedef struct EspVpbClient {
     bool gave_up;
 
     uint64_t next_id;
+
+    /*
+     * Pending write-only SPI bytes, held back so a run of small transfers
+     * becomes one frame. Arduino display drivers push pixels through the
+     * 64-byte register FIFO rather than by DMA, so one screen is tens of
+     * thousands of tiny transfers, and a header, a syscall and a wakeup each
+     * is most of the cost of drawing.
+     */
+    uint8_t *pending;
+    uint32_t pending_len;
+    uint8_t pending_controller;
+    uint8_t pending_cs;
+    int pending_dc;
+    bool has_pending;
+
+    /* Sends whatever is buffered once the guest stops drawing. */
+    QEMUTimer *flush_timer;
+
+    /* Time the guest has spent stopped waiting for a device to answer. */
+    uint64_t wait_ns;
+    uint64_t wait_count;
+    uint64_t wait_worst_ns;
 } EspVpbClient;
 
 /**
@@ -48,6 +71,14 @@ typedef struct EspVpbClient {
 bool esp_vpb_spi_transfer(EspVpbClient *c, uint8_t controller, uint8_t cs,
                           int dc, const uint8_t *mosi, uint32_t len,
                           uint8_t *miso, uint32_t read_len);
+
+/**
+ * Send anything held back by coalescing.
+ *
+ * Ordering is why this is public: a caller about to do something the buffered
+ * bytes must precede has to push them out first.
+ */
+void esp_vpb_flush(EspVpbClient *c);
 
 /**
  * Forward one I2C write and wait for the acknowledgement.

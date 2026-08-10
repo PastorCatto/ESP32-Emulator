@@ -752,6 +752,112 @@ replace_once "hw/dma/esp_gdma.c" \
               : FIELD_EX32(s->ch_conf[dir][i].link, GDMA_OUT_LINK, START))) {" \
   'GDMA_IN_LINK, START)'
 
+# --- Routing when the driver drives chip select itself ----------------------
+#
+# ESP-IDF enables one hardware CS line and the controller register says which
+# device a transfer is for. Arduino's TFT_eSPI disables all of them and toggles
+# the CS pin with a GPIO write, so the only evidence of the selected device is
+# the pin level. Give the controller the board's CS pins so it can watch them.
+
+insert_after "include/hw/ssi/esp32s3_gpspi.h" \
+  "    int32_t dc_gpio;" \
+  "
+    /*
+     * Which GPIO carries each chip select, indexed by CS line, -1 when the
+     * board does not use that line. Only consulted when the driver has
+     * disabled the hardware CS lines and is driving the pin itself.
+     */
+    int32_t cs_sel_gpio[ESP32S3_GPSPI_CS_COUNT];
+
+    /* Level of each of those pins. Chip select is active low. */
+    uint8_t cs_sel_level[ESP32S3_GPSPI_CS_COUNT];
+
+    /* Whether the board named any CS pin at all. */
+    bool cs_sel_named;
+
+    /* The board's pin list, colon separated by CS line, parsed at init. */
+    char *cs_gpios;" \
+  'cs_sel_gpio[ESP32S3_GPSPI_CS_COUNT];'
+
+insert_after "include/hw/ssi/esp32s3_gpspi.h" \
+  "#define ESP32S3_GPSPI_CS_COUNT   6" \
+  "
+/* Highest GPIO number an ESP32-S3 has, for validating the board's pin list. */
+#define ESP32S3_GPSPI_CS_PIN_LIMIT 49" \
+  'ESP32S3_GPSPI_CS_PIN_LIMIT'
+
+# The D/C pin is wired by walking the controllers and fanning one GPIO out to
+# everyone who asked for it. Chip select needs the same, once per CS line.
+
+replace_once "hw/xtensa/esp32s3.c" \
+  "        Esp32s3GpspiState *const gpspi[] = { &ss->gpspi2, &ss->gpspi3 };" \
+  "        Esp32s3GpspiState *const gpspi[] = { &ss->gpspi2, &ss->gpspi3 };
+        for (unsigned line = 0; line < ESP32S3_GPSPI_CS_COUNT; line++) {
+            for (unsigned i = 0; i < ARRAY_SIZE(gpspi); i++) {
+                const int32_t pin = gpspi[i]->cs_sel_gpio[line];
+                if (pin < 0 || pin >= ESP32_GPIO_PIN_COUNT) {
+                    continue;
+                }
+
+                qemu_irq listeners[ARRAY_SIZE(gpspi)];
+                unsigned n = 0;
+                for (unsigned j = i; j < ARRAY_SIZE(gpspi); j++) {
+                    if (gpspi[j]->cs_sel_gpio[line] == pin) {
+                        listeners[n++] = qdev_get_gpio_in_named(
+                            DEVICE(gpspi[j]), \"cs-sel\", line);
+                        gpspi[j]->cs_sel_gpio[line] = pin;
+                    }
+                }
+
+                DeviceState *split = qdev_new(TYPE_SPLIT_IRQ);
+                qdev_prop_set_uint32(split, \"num-lines\", n);
+                qdev_realize_and_unref(split, NULL, &error_fatal);
+                for (unsigned k = 0; k < n; k++) {
+                    qdev_connect_gpio_out(split, k, listeners[k]);
+                }
+                qdev_connect_gpio_out(DEVICE(&ss->gpio), pin,
+                                      qdev_get_gpio_in(split, 0));
+                break;
+            }
+        }" \
+  'gpspi[i]->cs_sel_gpio[line]'
+
+# --- Dummy cycles on a multi-line flash read --------------------------------
+#
+# The controller converts the dummy cycle count to bytes by dividing by 8, as
+# though every cycle carried a single bit. That only holds for single-line SPI.
+# Quad I/O moves four bits per cycle and dual moves two, so the same cycle
+# count occupies fewer bytes on the wire.
+#
+# A quad read (0xeb) asks for 6 dummy cycles. Divided by 8 that is 1 byte,
+# where the flash is waiting for 3. The controller therefore stops clocking two
+# bytes early and the flash never emits the last two bytes of the burst: a
+# 64-byte read returns 62, a 32-byte read returns 30. The caller keeps whatever
+# its buffer already held in the gap, so the damage is silent and depends on
+# what was read previously.
+#
+# It goes unnoticed for code, which the cache reads over a different path, and
+# for the erased tail of most partitions, where the missing bytes were 0xff
+# anyway. It is fatal to a filesystem: littlefs puts its commit checksum in the
+# last four bytes of a 64-byte metadata commit, so the checksum never matches
+# and a perfectly good volume reads as a corrupt dir pair. Dual reads are
+# unaffected, which is why firmware configured for DIO mounts and the same
+# firmware in QIO does not.
+
+replace_once "hw/ssi/esp32s3_spi.c" \
+  "    *len = (dummy_count + 7) / 8;" \
+  "    uint32_t lines = 1;
+    if (FIELD_EX32(s->mem_ctrl, SPI_MEM_CTRL, FREAD_QIO) ||
+        FIELD_EX32(s->mem_ctrl, SPI_MEM_CTRL, FREAD_QUAD)) {
+        lines = 4;
+    } else if (FIELD_EX32(s->mem_ctrl, SPI_MEM_CTRL, FREAD_DIO) ||
+               FIELD_EX32(s->mem_ctrl, SPI_MEM_CTRL, FREAD_DUAL)) {
+        lines = 2;
+    }
+
+    *len = (dummy_count * lines + 7) / 8;" \
+  'uint32_t lines = 1;'
+
 # --- USB Serial/JTAG console ------------------------------------------------
 #
 # The stock device is a stub: reads return zero, writes are dropped. Firmware

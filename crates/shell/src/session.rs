@@ -181,6 +181,10 @@ pub struct Session {
     /// Cleared whenever the firmware is reloaded, because that rewrites the
     /// image from its source.
     pub patches: Vec<flashimg::patch::Applied>,
+    /// What was done to make the firmware's filesystem partition mountable.
+    /// Worth surfacing: an empty volume is not the assets the firmware shipped
+    /// with, so a missing file later on traces back to here.
+    pub storage: Vec<flashimg::provision::Action>,
     /// Every serial byte, teed to a file when ESP32_SERIAL_LOG is set. Reopened
     /// per boot so a run is measurable on its own.
     serial_log: Option<std::fs::File>,
@@ -199,6 +203,7 @@ impl Session {
             sd_image: None,
             symbols: None,
             patches: Vec::new(),
+            storage: Vec::new(),
             serial_log: None,
             hardware: None,
         }
@@ -256,9 +261,14 @@ impl Session {
         }
 
         let image = FlashImage::assemble(&dropped, &raw, size, None)?;
+        // A filesystem partition that was never flashed is erased, and no
+        // firmware mounts erased flash. Give it an empty volume so the boot
+        // gets past the mount instead of stopping on a black screen.
+        let mut bytes = image.as_bytes().to_vec();
+        let provisioned = flashimg::provision::prepare(&mut bytes);
         std::fs::create_dir_all(run_dir)?;
         let flash_path = run_dir.join("flash.bin");
-        std::fs::write(&flash_path, image.as_bytes())?;
+        std::fs::write(&flash_path, &bytes)?;
 
         let kind = match &dropped {
             Dropped::MergedFlash(_) => "merged flash image",
@@ -290,6 +300,7 @@ impl Session {
         });
         // The image was just rewritten from source, so any patches are gone.
         self.patches.clear();
+        self.storage = provisioned;
         self.flash_path = Some(flash_path);
         Ok(())
     }
@@ -391,6 +402,7 @@ impl Session {
         config.psram = self.board.qemu_psram();
         config.vpb_port = Some(hardware.port);
         config.display_dc_gpio = self.board.display_dc_gpio();
+        config.spi_cs_gpios = self.board.spi_cs_gpios();
         config.serial_count = SerialBuffer::PORTS;
 
         // Extra QEMU flags, whitespace separated. Exists so a boot can be
