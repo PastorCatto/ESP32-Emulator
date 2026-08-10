@@ -495,6 +495,30 @@ static uint64_t esp32s3_gpspi_read(void *opaque, hwaddr addr, unsigned int size)
         return 0;
     }
 
+    /*
+     * A driver watching SPI_CMD for its transfer to finish gets the answer
+     * now rather than after the timer.
+     *
+     * The bytes have already moved; the delay exists only so completion is
+     * not visible inside the guest's store to SPI_CMD, where an ISR could
+     * re-enter a driver mid-bookkeeping. A separate later read is past that
+     * point, and with no interrupt armed there is no ISR to re-enter at all.
+     *
+     * It matters because the wait is spent spinning. TFT_eSPI polls this
+     * register in a tight loop, and virtual time only advances as the host
+     * executes, so a few microseconds of modelled transfer becomes thousands
+     * of MMIO exits -- each one a fault out of the guest and back. Multiplied
+     * by the ~127,000 transfers a screen redraw takes, that is most of what
+     * the emulator was doing while drawing.
+     *
+     * ESP-IDF is unaffected: it arms the completion interrupt, so this is
+     * skipped and the deferred path it depends on stays exactly as it was.
+     */
+    if (reg == A_GPSPI_CMD && s->busy && s->regs[R_GPSPI_DMA_INT_ENA] == 0) {
+        timer_del(s->done_timer);
+        esp32s3_gpspi_done(s);
+    }
+
     switch (reg) {
     case A_GPSPI_DATE:
         return ESP32S3_GPSPI_DATE_VALUE;
