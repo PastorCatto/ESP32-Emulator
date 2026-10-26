@@ -4,6 +4,9 @@ use crate::error::{c_str, Error, Reader, Result};
 use std::fmt;
 
 pub const TABLE_OFFSET: u32 = 0x8000;
+/// Where a table may sit. `CONFIG_PARTITION_TABLE_OFFSET` moves it up from
+/// 0x8000 when the bootloader outgrows its 32 KiB; PURR OS's does.
+pub const TABLE_OFFSETS: [u32; 2] = [TABLE_OFFSET, 0xa000];
 /// ESP-IDF reserves 3 KiB for the table regardless of how many entries it holds.
 pub const TABLE_MAX_LEN: usize = 0xc00;
 pub const ENTRY_LEN: usize = 32;
@@ -134,6 +137,14 @@ impl PartitionTable {
     /// Does a partition table plausibly start here?
     pub fn probe(buf: &[u8]) -> bool {
         buf.len() >= 2 && u16::from_le_bytes([buf[0], buf[1]]) == ENTRY_MAGIC
+    }
+
+    /// Where a whole flash image keeps its table, when it has one at any of
+    /// the offsets a table is allowed to be at.
+    pub fn locate(flash: &[u8]) -> Option<u32> {
+        TABLE_OFFSETS
+            .into_iter()
+            .find(|&at| flash.get(at as usize..).is_some_and(Self::probe))
     }
 
     /// The partition the bootloader will run by default.

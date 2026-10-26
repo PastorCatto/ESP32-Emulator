@@ -96,7 +96,8 @@ fn free_tail(table: &PartitionTable, flash: u32) -> Option<(u32, u32)> {
 /// run over every image.
 pub fn prepare(flash: &mut Vec<u8>) -> Vec<Action> {
     let flash_size = flash.len() as u32;
-    let Some(table_bytes) = flash.get(TABLE_OFFSET as usize..) else {
+    let table_at = PartitionTable::locate(flash).unwrap_or(TABLE_OFFSET);
+    let Some(table_bytes) = flash.get(table_at as usize..) else {
         return Vec::new();
     };
     let Ok(table) = PartitionTable::parse(table_bytes) else {
@@ -111,7 +112,7 @@ pub fn prepare(flash: &mut Vec<u8>) -> Vec<Action> {
 
     let declared = filesystems(&table);
     if declared.is_empty() {
-        return match invent(flash, &table, flash_size) {
+        return match invent(flash, &table, table_at, flash_size) {
             Ok(action) | Err(action) => vec![action],
         };
     }
@@ -150,7 +151,7 @@ pub fn prepare(flash: &mut Vec<u8>) -> Vec<Action> {
 /// ```
 ///
 /// which costs the app every partition, including the one it boots from.
-fn invent(flash: &mut [u8], table: &PartitionTable, flash_size: u32) -> Result<Action, Action> {
+fn invent(flash: &mut [u8], table: &PartitionTable, table_at: u32, flash_size: u32) -> Result<Action, Action> {
     let Some((offset, size)) = free_tail(table, flash_size) else {
         return Err(Action::Declined { reason: "no room left in flash".into() });
     };
@@ -169,7 +170,7 @@ fn invent(flash: &mut [u8], table: &PartitionTable, flash_size: u32) -> Result<A
 
     // serialize() appends the MD5 record itself.
     let serialized = grown.serialize();
-    let at = TABLE_OFFSET as usize;
+    let at = table_at as usize;
     // The table lives in one sector and must not run into what follows.
     if serialized.len() + ENTRY_LEN > SECTOR as usize {
         return Err(Action::Declined { reason: "partition table is full".into() });

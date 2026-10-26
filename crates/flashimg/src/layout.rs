@@ -45,35 +45,34 @@ impl Dropped {
             return Dropped::Elf;
         }
 
-        // A merged image is the only thing with a partition table at 0x8000.
-        if let Some(tbl_region) = buf.get(TABLE_OFFSET as usize..) {
-            if PartitionTable::probe(tbl_region) {
-                let table_len = tbl_region.len().min(TABLE_MAX_LEN);
-                if let Ok(table) = PartitionTable::parse(&tbl_region[..table_len]) {
-                    // The bootloader sits at 0x0 or 0x1000 depending on the part.
-                    for &off in &[0usize, 0x1000] {
-                        let Some(region) = buf.get(off..) else { continue };
-                        if !AppImage::looks_like_image(region) {
-                            continue;
-                        }
-                        let Ok(bootloader) = AppImage::parse(region) else {
-                            continue;
-                        };
-                        if bootloader.header.chip.bootloader_offset() as usize != off {
-                            continue;
-                        }
-                        let chip = bootloader.header.chip;
-                        let app = table
-                            .default_app()
-                            .and_then(|p| buf.get(p.offset as usize..))
-                            .and_then(|r| AppImage::parse(r).ok());
-                        return Dropped::MergedFlash(Box::new(MergedFlash {
-                            chip,
-                            bootloader,
-                            table,
-                            app,
-                        }));
+        // A merged image is the only thing with a partition table, at 0x8000
+        // or wherever the bootloader's build moved it.
+        if let Some(tbl_region) = PartitionTable::locate(buf).and_then(|at| buf.get(at as usize..)) {
+            let table_len = tbl_region.len().min(TABLE_MAX_LEN);
+            if let Ok(table) = PartitionTable::parse(&tbl_region[..table_len]) {
+                // The bootloader sits at 0x0 or 0x1000 depending on the part.
+                for &off in &[0usize, 0x1000] {
+                    let Some(region) = buf.get(off..) else { continue };
+                    if !AppImage::looks_like_image(region) {
+                        continue;
                     }
+                    let Ok(bootloader) = AppImage::parse(region) else {
+                        continue;
+                    };
+                    if bootloader.header.chip.bootloader_offset() as usize != off {
+                        continue;
+                    }
+                    let chip = bootloader.header.chip;
+                    let app = table
+                        .default_app()
+                        .and_then(|p| buf.get(p.offset as usize..))
+                        .and_then(|r| AppImage::parse(r).ok());
+                    return Dropped::MergedFlash(Box::new(MergedFlash {
+                        chip,
+                        bootloader,
+                        table,
+                        app,
+                    }));
                 }
             }
         }

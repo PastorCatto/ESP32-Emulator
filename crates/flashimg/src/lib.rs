@@ -31,7 +31,7 @@ pub use image::{
 };
 pub use layout::{Dropped, FlashImage, MergedFlash};
 pub use partition::{
-    Partition, PartitionTable, PartitionType, ENTRY_LEN, TABLE_MAX_LEN, TABLE_OFFSET,
+    Partition, PartitionTable, PartitionType, ENTRY_LEN, TABLE_MAX_LEN, TABLE_OFFSET, TABLE_OFFSETS,
 };
 
 #[cfg(test)]
@@ -218,6 +218,33 @@ mod tests {
         // Everything past the supplied content must stay erased.
         assert!(flash.as_bytes()[merged.len()..].iter().all(|&b| b == 0xff));
         assert_eq!(&flash.as_bytes()[app_off..app_off + app.len()], &app[..]);
+    }
+
+    #[test]
+    fn identifies_a_merged_image_whose_table_was_moved_up() {
+        // A bootloader past 32 KiB (PURR OS's) moves the table to 0xA000 with
+        // CONFIG_PARTITION_TABLE_OFFSET. Treating that as a bare bootloader
+        // meant the emulator never attached a display to it.
+        let chip = Chip::Esp32S3;
+        let bootloader = synth_app(chip, false, 0x1000);
+        let app = synth_app(chip, true, 0x2000);
+        let table = PartitionTable::single_factory(FlashSize::MB16, app.len() as u32);
+        let app_off = table.default_app().unwrap().offset as usize;
+        let table_at = TABLE_OFFSETS[1] as usize;
+
+        let mut merged = vec![0xffu8; app_off + app.len()];
+        let bl_off = chip.bootloader_offset() as usize;
+        merged[bl_off..bl_off + bootloader.len()].copy_from_slice(&bootloader);
+        let tbl = table.serialize();
+        merged[table_at..table_at + tbl.len()].copy_from_slice(&tbl);
+        merged[app_off..app_off + app.len()].copy_from_slice(&app);
+
+        assert_eq!(PartitionTable::locate(&merged), Some(TABLE_OFFSETS[1]));
+        let dropped = Dropped::identify(&merged);
+        let Dropped::MergedFlash(m) = &dropped else {
+            panic!("expected a merged image, got {dropped:?}");
+        };
+        assert!(m.app.is_some(), "app should be located via the moved table");
     }
 
     #[test]
