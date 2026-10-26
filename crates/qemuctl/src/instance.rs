@@ -136,11 +136,17 @@ impl Instance {
         thread::Builder::new()
             .name("qemu-stderr".into())
             .spawn(move || {
+                // Published as it arrives, not at EOF: the interesting
+                // warnings are the ones from a machine that is still running.
                 let mut reader = stderr_pipe;
-                let mut text = String::new();
-                let _ = reader.read_to_string(&mut text);
-                if let Ok(mut guard) = stderr_sink.lock() {
-                    guard.push_str(&text);
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = reader.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    if let Ok(mut guard) = stderr_sink.lock() {
+                        guard.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    }
                 }
             })
             .map_err(QemuError::Io)?;

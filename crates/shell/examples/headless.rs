@@ -59,10 +59,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Serial has to be drained or the pipe fills and the guest blocks on its
     // console -- which looks like a hang somewhere much more interesting.
-    let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
+    let started = std::time::Instant::now();
+    let deadline = started + Duration::from_secs(seconds);
     let mut traced = 0usize;
+
+    // HEADLESS_KEY=w HEADLESS_KEY_AT=30 types one key into the emulated
+    // keyboard after 30 seconds, so a single run can show a menu reacting.
+    let key = std::env::var("HEADLESS_KEY").ok().and_then(|k| k.chars().next());
+    let key_at: u64 = std::env::var("HEADLESS_KEY_AT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut key_sent = false;
+
     while std::time::Instant::now() < deadline {
         sess.pump();
+        if let (Some(ch), false) = (key, key_sent) {
+            if started.elapsed() >= Duration::from_secs(key_at) {
+                if let Some(keys) = sess.hardware.as_ref().and_then(|h| h.keys.clone()) {
+                    devices::TdeckKeyboard::press(&keys, ch);
+                }
+                key_sent = true;
+            }
+        }
         // The channel is unbounded and a traced boot fills it fast, so this
         // has to drain whether or not anything is printed.
         if let Some(hw) = &sess.hardware {
@@ -108,6 +127,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{name}: {} bytes", counts.get(i).copied().unwrap_or(0));
     }
     print!("{}", sess.serial.view(None).text());
+
+    // QEMU's own warnings (a model reporting something it does not support)
+    // are the first place to look when the guest misbehaves without crashing.
+    if let Some(inst) = &sess.instance {
+        let stderr = inst.stderr();
+        if !stderr.trim().is_empty() {
+            println!("--- QEMU stderr ---\n{}", stderr.trim_end());
+        }
+    }
     sess.stop();
     Ok(())
 }
