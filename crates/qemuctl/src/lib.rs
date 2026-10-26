@@ -225,6 +225,39 @@ pub struct Psram {
     pub octal: bool,
 }
 
+/// The pins a bit-banged SPI device hangs off, for firmware that drives them
+/// with plain GPIO writes instead of a SPI controller.
+///
+/// A bootloader cannot assume any controller is set up, so PURR OS's boot menu
+/// clocks the display by hand. Nothing in the machine sees a transaction then,
+/// only pins changing, so the emulator has to be told which pins to read as a
+/// bus. `controller` and `cs_line` are what the traffic is labelled as, so the
+/// device model answers exactly as it would to a real controller's bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpioSpi {
+    pub sclk: u8,
+    pub mosi: u8,
+    /// Absent when the device's chip select is tied low.
+    pub cs: Option<u8>,
+    /// The data/command line, for devices that have one.
+    pub dc: Option<u8>,
+    pub controller: u8,
+    pub cs_line: u8,
+}
+
+/// The pins of an I2C bus that firmware drives with plain GPIO writes.
+///
+/// The boot menu polls the keyboard by hand, open-drain, so no controller ever
+/// sees a transaction. Told these pins, the emulator follows the bus itself and
+/// answers for whatever the board puts on it. `controller` is what the traffic
+/// is labelled as, so the device model sees what a real controller would send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpioI2c {
+    pub sda: u8,
+    pub scl: u8,
+    pub controller: u8,
+}
+
 /// How to start the machine.
 #[derive(Debug, Clone)]
 pub struct LaunchConfig {
@@ -263,6 +296,10 @@ pub struct LaunchConfig {
     /// GPIO carrying each SPI chip select, as `(cs_line, gpio)`. Lets the
     /// controller route a transfer when the driver drives CS itself.
     pub spi_cs_gpios: Vec<(u8, u8)>,
+    /// Pins to read as a bit-banged SPI bus, from the board file.
+    pub gpio_spi: Option<GpioSpi>,
+    /// Pins to follow as a bit-banged I2C bus, from the board file.
+    pub gpio_i2c: Option<GpioI2c>,
     /// Expose a QMP control socket on this TCP port.
     pub qmp_port: Option<u16>,
     /// Expose a GDB stub on this TCP port.
@@ -284,6 +321,8 @@ impl LaunchConfig {
             vpb_port: None,
             display_dc_gpio: None,
             spi_cs_gpios: Vec::new(),
+            gpio_spi: None,
+            gpio_i2c: None,
             data_dir: None,
             graphics: false,
             qmp_port: None,
@@ -371,6 +410,35 @@ impl LaunchConfig {
                 args.push("-global".into());
                 args.push(format!("driver={driver},property=vpb-port,value={port}"));
             }
+        }
+        // Needs somewhere to send the bytes, so without a server there is
+        // nothing to configure and the decoder stays idle.
+        if let (Some(pins), Some(port)) = (self.gpio_spi, self.vpb_port) {
+            let mut set = |property: &str, value: u32| {
+                args.push("-global".into());
+                args.push(format!("driver=esp.gpio-spi,property={property},value={value}"));
+            };
+            set("vpb-port", u32::from(port));
+            set("vpb-controller", u32::from(pins.controller));
+            set("cs-line", u32::from(pins.cs_line));
+            set("sclk-gpio", u32::from(pins.sclk));
+            set("mosi-gpio", u32::from(pins.mosi));
+            if let Some(cs) = pins.cs {
+                set("cs-gpio", u32::from(cs));
+            }
+            if let Some(dc) = pins.dc {
+                set("dc-gpio", u32::from(dc));
+            }
+        }
+        if let (Some(pins), Some(port)) = (self.gpio_i2c, self.vpb_port) {
+            let mut set = |property: &str, value: u32| {
+                args.push("-global".into());
+                args.push(format!("driver=esp.gpio-i2c,property={property},value={value}"));
+            };
+            set("vpb-port", u32::from(port));
+            set("vpb-controller", u32::from(pins.controller));
+            set("sda-gpio", u32::from(pins.sda));
+            set("scl-gpio", u32::from(pins.scl));
         }
         if let Some(pin) = self.display_dc_gpio {
             args.push("-global".into());
@@ -470,6 +538,75 @@ mod tests {
             ),
             "{args:?}"
         );
+    }
+
+    #[test]
+    fn bit_banged_spi_pins_are_passed_to_the_decoder() {
+        let mut c = cfg();
+        c.vpb_port = Some(5559);
+        c.gpio_spi = Some(GpioSpi {
+            sclk: 40,
+            mosi: 41,
+            cs: Some(12),
+            dc: Some(11),
+            controller: 2,
+            cs_line: 0,
+        });
+        let args = c.to_args().unwrap();
+
+        for want in [
+            "driver=esp.gpio-spi,property=vpb-port,value=5559",
+            "driver=esp.gpio-spi,property=vpb-controller,value=2",
+            "driver=esp.gpio-spi,property=cs-line,value=0",
+            "driver=esp.gpio-spi,property=sclk-gpio,value=40",
+            "driver=esp.gpio-spi,property=mosi-gpio,value=41",
+            "driver=esp.gpio-spi,property=cs-gpio,value=12",
+            "driver=esp.gpio-spi,property=dc-gpio,value=11",
+        ] {
+            assert!(args.contains(&want.to_string()), "missing {want}: {args:?}");
+        }
+    }
+
+    #[test]
+    fn bit_banged_i2c_pins_are_passed_to_the_decoder() {
+        let mut c = cfg();
+        c.vpb_port = Some(5559);
+        c.gpio_i2c = Some(GpioI2c { sda: 18, scl: 8, controller: 0 });
+        let args = c.to_args().unwrap();
+
+        for want in [
+            "driver=esp.gpio-i2c,property=vpb-port,value=5559",
+            "driver=esp.gpio-i2c,property=vpb-controller,value=0",
+            "driver=esp.gpio-i2c,property=sda-gpio,value=18",
+            "driver=esp.gpio-i2c,property=scl-gpio,value=8",
+        ] {
+            assert!(args.contains(&want.to_string()), "missing {want}: {args:?}");
+        }
+    }
+
+    #[test]
+    fn bit_banged_i2c_with_no_bridge_is_left_idle() {
+        let mut c = cfg();
+        c.gpio_i2c = Some(GpioI2c { sda: 18, scl: 8, controller: 0 });
+        let args = c.to_args().unwrap();
+        assert!(!args.iter().any(|a| a.contains("esp.gpio-i2c")), "{args:?}");
+    }
+
+    #[test]
+    fn bit_banged_spi_with_no_bridge_is_left_idle() {
+        // With nowhere to send the bytes there is nothing to configure, and a
+        // half-configured decoder would only be a puzzle later.
+        let mut c = cfg();
+        c.gpio_spi = Some(GpioSpi {
+            sclk: 40,
+            mosi: 41,
+            cs: None,
+            dc: None,
+            controller: 2,
+            cs_line: 0,
+        });
+        let args = c.to_args().unwrap();
+        assert!(!args.iter().any(|a| a.contains("esp.gpio-spi")), "{args:?}");
     }
 
     #[test]

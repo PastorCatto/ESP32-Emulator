@@ -213,6 +213,31 @@ impl PeripheralSpec {
     }
 }
 
+/// The wires of an SPI device that firmware may drive with plain GPIO writes.
+/// See [`Board::bitbang_spi`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BitbangSpi {
+    pub sclk: u8,
+    pub mosi: u8,
+    /// The device's chip-select GPIO, when the board file gives one.
+    pub cs: Option<u8>,
+    pub dc: Option<u8>,
+    /// What the bus knows the device by: the controller, and the select line
+    /// on it. Not the GPIO -- see the note on [`Claim::Spi`] routing.
+    pub controller: u8,
+    pub cs_line: u8,
+}
+
+/// The wires of an I2C bus that firmware may drive with plain GPIO writes.
+/// See [`Board::bitbang_i2c`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BitbangI2c {
+    pub sda: u8,
+    pub scl: u8,
+    /// What the bus knows its devices by.
+    pub controller: u8,
+}
+
 #[derive(Debug, Clone)]
 pub struct Board {
     pub id: String,
@@ -473,6 +498,55 @@ impl Board {
         out
     }
 
+    /// The pins of the display, for firmware that clocks it by hand.
+    ///
+    /// A bootloader cannot assume any SPI controller is set up, so PURR OS's
+    /// boot menu drives the panel with single-pin GPIO writes. Those never
+    /// reach a controller model, so the emulator has to read the pins as a bus
+    /// itself, and it needs the same four lines the schematic gives: the bus's
+    /// clock and data, and the device's select and data/command.
+    ///
+    /// Same choice as [`Board::display_dc_gpio`]: the first enabled SPI device
+    /// that declares a `dc` pin.
+    pub fn bitbang_spi(&self) -> Option<BitbangSpi> {
+        for p in self.peripherals.iter().filter(|p| p.enabled) {
+            let Ok(Some(Claim::Spi { controller, cs: cs_line })) = p.claim() else { continue };
+            let Ok(Some(dc)) = p.params.opt_u8("dc") else { continue };
+            let Some(bus) = p.bus.as_deref().and_then(|id| self.bus(id)) else { continue };
+            let (Some(&sclk), Some(&mosi)) = (bus.pins.get("sck"), bus.pins.get("mosi")) else {
+                continue;
+            };
+            return Some(BitbangSpi {
+                sclk,
+                mosi,
+                cs: p.params.opt_u8("cs").ok().flatten(),
+                dc: Some(dc),
+                controller,
+                cs_line,
+            });
+        }
+        None
+    }
+
+    /// The pins of the first I2C bus, for firmware that polls it by hand.
+    ///
+    /// PURR OS's boot menu reads the keyboard this way: it cannot assume an I2C
+    /// controller is set up, so it lets go of SDA and SCL for a 1 and drives
+    /// them low for a 0. The emulator reads the same pins as a bus and answers
+    /// for whatever the board file puts on it.
+    pub fn bitbang_i2c(&self) -> Option<BitbangI2c> {
+        self.buses.iter().find_map(|b| {
+            if !matches!(b.kind, BusKind::I2c) {
+                return None;
+            }
+            Some(BitbangI2c {
+                sda: *b.pins.get("sda")?,
+                scl: *b.pins.get("scl")?,
+                controller: b.controller,
+            })
+        })
+    }
+
     pub fn bus(&self, id: &str) -> Option<&Bus> {
         self.buses.iter().find(|b| b.id == id)
     }
@@ -529,6 +603,46 @@ mod tests {
         // No `cs_line` recorded for the radio yet, so this still falls back to
         // its GPIO -- and will not match the bus until it is measured.
         assert_eq!(claims["sx1262"], Claim::Spi { controller: 2, cs: 9 });
+    }
+
+    #[test]
+    fn reports_the_display_pins_for_bit_banged_spi() {
+        // The boot menu clocks the panel by hand on the same pins the SPI
+        // controller would use, labelled the way the bus knows the device.
+        let b = Board::from_toml(T_DECK).unwrap();
+        assert_eq!(
+            b.bitbang_spi(),
+            Some(BitbangSpi {
+                sclk: 40,
+                mosi: 41,
+                cs: Some(12),
+                dc: Some(11),
+                controller: 2,
+                cs_line: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn reports_the_i2c_pins_for_bit_banged_polling() {
+        // The boot menu polls the keyboard on these pins by hand.
+        let b = Board::from_toml(T_DECK).unwrap();
+        assert_eq!(
+            b.bitbang_i2c(),
+            Some(BitbangI2c { sda: 18, scl: 8, controller: 0 })
+        );
+    }
+
+    #[test]
+    fn a_board_with_no_i2c_bus_has_nothing_to_poll() {
+        let b = Board::from_toml(GENERIC).unwrap();
+        assert_eq!(b.bitbang_i2c(), None);
+    }
+
+    #[test]
+    fn a_board_with_no_display_has_nothing_to_bit_bang() {
+        let b = Board::from_toml(GENERIC).unwrap();
+        assert_eq!(b.bitbang_spi(), None);
     }
 
     #[test]

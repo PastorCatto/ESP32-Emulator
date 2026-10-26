@@ -403,6 +403,19 @@ impl Session {
         config.vpb_port = Some(hardware.port);
         config.display_dc_gpio = self.board.display_dc_gpio();
         config.spi_cs_gpios = self.board.spi_cs_gpios();
+        config.gpio_spi = self.board.bitbang_spi().map(|p| qemuctl::GpioSpi {
+            sclk: p.sclk,
+            mosi: p.mosi,
+            cs: p.cs,
+            dc: p.dc,
+            controller: p.controller,
+            cs_line: p.cs_line,
+        });
+        config.gpio_i2c = self.board.bitbang_i2c().map(|p| qemuctl::GpioI2c {
+            sda: p.sda,
+            scl: p.scl,
+            controller: p.controller,
+        });
         config.serial_count = SerialBuffer::PORTS;
 
         // Extra QEMU flags, whitespace separated. Exists so a boot can be
