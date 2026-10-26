@@ -18,7 +18,9 @@ struct Snapshot {
     generation: u64,
     on: bool,
     inverted: bool,
-    bgr: bool,
+    /// Red and blue exchanged on the way to the screen. Not the register's BGR
+    /// bit on its own: see `Screen::panel_bgr`.
+    swapped: bool,
     pixels: Vec<u16>,
 }
 
@@ -37,7 +39,7 @@ impl Snapshot {
             let mid = (mid << 2) | (mid >> 4);
             let lo = (lo << 3) | (lo >> 2);
 
-            if self.bgr {
+            if self.swapped {
                 out.extend_from_slice(&[lo, mid, hi]);
             } else {
                 out.extend_from_slice(&[hi, mid, lo]);
@@ -134,7 +136,7 @@ impl ScreenView {
                 generation: guard.generation,
                 on: guard.on,
                 inverted: guard.shows_inverted(),
-                bgr: guard.bgr,
+                swapped: guard.shows_swapped(),
                 pixels: guard.pixels.clone(),
             }
         };

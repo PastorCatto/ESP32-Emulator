@@ -123,7 +123,24 @@ fn build(
             let height = spec.params.u16_or("height", 240).map_err(|e| e.to_string())?;
             // `invert` describes the glass, not the controller's register.
             let inverts = spec.params.bool_or("invert", false).map_err(|e| e.to_string())?;
-            let screen = Screen::handle(width, height, inverts);
+            // Likewise `color_order` is how the glass is wired, not what the
+            // driver writes to MADCTL: a BGR-wired panel with the BGR bit set
+            // is the correct setup, and shows red as red.
+            let glass_bgr = match spec
+                .params
+                .string_or("color_order", "rgb")
+                .map_err(|e| e.to_string())?
+                .as_str()
+            {
+                "rgb" => false,
+                "bgr" => true,
+                other => {
+                    return Err(format!(
+                        "st7789 color_order must be \"rgb\" or \"bgr\", not \"{other}\""
+                    ))
+                }
+            };
+            let screen = Screen::handle_for_glass(width, height, inverts, glass_bgr);
             let panel = devices::St7789::new(claim, screen.clone());
             Ok(Some(Built::new(Box::new(panel)).screen(screen)))
         }

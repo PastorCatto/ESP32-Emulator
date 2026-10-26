@@ -92,6 +92,7 @@ width = 320
 height = 240
 rotation = 90
 invert = true           # the glass is wired inverted, not the register
+color_order = "bgr"     # "rgb" (default) or "bgr": how the glass is wired
 enabled = true          # default true
 ```
 

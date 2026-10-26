@@ -61,7 +61,10 @@ width = 320
 height = 240
 # ST7789 silicon has a 240x320 frame buffer; the T-Deck mounts it sideways.
 rotation = 90
-color_order = "rgb"
+# How the glass is wired, not what a driver writes to MADCTL. This panel is
+# wired BGR, which is why PURR OS sets MADCTL's BGR bit for it ("without this
+# red and blue are swapped") and why its boot menu's orange is orange.
+color_order = "bgr"
 invert = true
 
 [[peripheral]]

@@ -48,6 +48,15 @@ pub struct Screen {
     /// photo negative of a correctly driven display, which reads as a bug in
     /// the colour conversion and is not one.
     pub panel_inverts: bool,
+    /// Whether the glass is wired blue-first, from the board file's
+    /// `color_order = "bgr"`.
+    ///
+    /// The same shape of problem as `panel_inverts`. MADCTL's BGR bit does not
+    /// say which way the data is ordered, it says which way the glass expects
+    /// it, so what appears on screen depends on both. A T-Deck's glass is wired
+    /// BGR, which is why its drivers set the bit and, with it set, see red as
+    /// red. Reading the bit alone as "swap" turns the boot menu's orange blue.
+    pub panel_bgr: bool,
 }
 
 pub type ScreenHandle = Arc<Mutex<Screen>>;
@@ -64,11 +73,37 @@ impl Screen {
             bgr: false,
             inverted: false,
             panel_inverts,
+            panel_bgr: false,
         }
+    }
+
+    /// Say the glass is wired blue-first. See [`Screen::panel_bgr`].
+    pub fn with_panel_bgr(mut self, panel_bgr: bool) -> Self {
+        self.panel_bgr = panel_bgr;
+        self
     }
 
     pub fn handle(width: u16, height: u16, panel_inverts: bool) -> ScreenHandle {
         Arc::new(Mutex::new(Self::new(width, height, panel_inverts)))
+    }
+
+    /// As [`Screen::handle`], for a panel whose colour order is also known.
+    pub fn handle_for_glass(
+        width: u16,
+        height: u16,
+        panel_inverts: bool,
+        panel_bgr: bool,
+    ) -> ScreenHandle {
+        Arc::new(Mutex::new(
+            Self::new(width, height, panel_inverts).with_panel_bgr(panel_bgr),
+        ))
+    }
+
+    /// Are red and blue exchanged between what the driver wrote and what is
+    /// shown? Only when the register and the glass disagree: a BGR-wired panel
+    /// with the BGR bit set is the correct configuration, not a swap.
+    pub fn shows_swapped(&self) -> bool {
+        self.bgr != self.panel_bgr
     }
 
     /// What the glass actually shows: the controller's inversion applied on
@@ -97,7 +132,7 @@ impl Screen {
             let mid = (mid << 2) | (mid >> 4);
             let lo = (lo << 3) | (lo >> 2);
 
-            if self.bgr {
+            if self.shows_swapped() {
                 out.extend_from_slice(&[lo, mid, hi]);
             } else {
                 out.extend_from_slice(&[hi, mid, lo]);
