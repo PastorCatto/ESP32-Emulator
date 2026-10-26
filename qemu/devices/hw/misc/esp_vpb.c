@@ -15,6 +15,11 @@
 #include "io/channel-socket.h"
 #include "hw/misc/esp_vpb.h"
 
+/* Winsock spells close() differently; everywhere else a socket is a plain fd. */
+#ifndef _WIN32
+#define closesocket(fd) close(fd)
+#endif
+
 /*
  * How long to wait for a device to answer a read.
  *

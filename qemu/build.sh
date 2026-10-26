@@ -40,7 +40,14 @@ bash "$HERE/apply.sh" "$SRC"
 # (glib resolved both shared and static). Configure only when there is no
 # build.ninja, and use --clean after changing the installed packages.
 if [ ! -f "$BUILD/build.ninja" ]; then
-  echo "Configuring"
+  # User-mode networking (DHCP, DNS, NAT with no host privileges) is what the
+  # virtual network adapters sit on. It stays off on Windows, where MSYS2's
+  # static-only libslirp drags in a second glib (see qemu/README.md).
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) SLIRP_FLAG=--disable-slirp ;;
+    *)                    SLIRP_FLAG=--enable-slirp ;;
+  esac
+  echo "Configuring (${SLIRP_FLAG})"
   mkdir -p "$BUILD"
   (cd "$BUILD" && ../configure \
       --target-list=xtensa-softmmu \
@@ -53,7 +60,7 @@ if [ ! -f "$BUILD/build.ninja" ]; then
       --disable-spice \
       --disable-opengl \
       --disable-capstone \
-      --disable-slirp)
+      "$SLIRP_FLAG")
 fi
 
 echo "Building"
