@@ -63,9 +63,11 @@ insert_after() {
 
   # awk rather than sed: the inserted text contains slashes and quotes, and
   # escaping those for sed is a reliable source of silent corruption.
-  awk -v anchor="$anchor" -v ins="$text" '
+  # The text goes through the environment, not -v: BSD awk (macOS) rejects a
+  # newline inside a -v value, and the inserted blocks are multi-line.
+  AWK_ANCHOR="$anchor" AWK_INS="$text" awk '
     { print }
-    index($0, anchor) { print ins }
+    index($0, ENVIRON["AWK_ANCHOR"]) { print ENVIRON["AWK_INS"] }
   ' "$path" > "$path.tmp"
   mv "$path.tmp" "$path"
   echo "  ~ $file += $marker"
@@ -188,12 +190,8 @@ insert_after "hw/xtensa/esp32s3.c" \
   '    object_initialize_child(obj, "ana_mst", &s->ana_mst, TYPE_ESP32S3_ANA_MST);' \
   'TYPE_ESP32S3_ANA_MST);'
 
-insert_after "hw/xtensa/esp32s3.c" \
-  "    esp32s3_soc_add_periph_device(sys_mem, &s->i2c1, DR_REG_I2C1_EXT_BASE);" \
-  "
-    sysbus_realize(SYS_BUS_DEVICE(&s->ana_mst), &error_fatal);
-    esp32s3_soc_add_periph_device(sys_mem, &s->ana_mst, DR_REG_I2C_ANA_MST_BASE);" \
-  "DR_REG_I2C_ANA_MST_BASE"
+# Realized after the I2C block below: it anchors on the I2C1 mapping line, which
+# only exists once that block has been applied.
 
 # Not in the vendored register map, and not in ESP-IDF's public reg_base.h
 # either -- IDF hardcodes the individual addresses in regi2c_defs.h.
@@ -249,6 +247,13 @@ insert_after "hw/xtensa/esp32s3.c" \
                        qdev_get_gpio_in(intmatrix_dev, ETS_I2C_EXT1_INTR_SOURCE));" \
   "DR_REG_I2C_EXT_BASE"
 
+insert_after "hw/xtensa/esp32s3.c" \
+  "    esp32s3_soc_add_periph_device(sys_mem, &s->i2c1, DR_REG_I2C1_EXT_BASE);" \
+  "
+    sysbus_realize(SYS_BUS_DEVICE(&s->ana_mst), &error_fatal);
+    esp32s3_soc_add_periph_device(sys_mem, &s->ana_mst, DR_REG_I2C_ANA_MST_BASE);" \
+  "DR_REG_I2C_ANA_MST_BASE"
+
 # --- SD over SPI -----------------------------------------------------------
 #
 # The T-Deck's microSD shares the display's SPI bus. Without a card, SD init
@@ -295,11 +300,12 @@ replace_once() {
 
   # index/substr rather than sub(), which takes a regex and would silently
   # fail to match anything containing parentheses or dots.
-  awk -v old="$old" -v new="$new" '
+  AWK_OLD="$old" AWK_NEW="$new" awk '
     !done {
+      old = ENVIRON["AWK_OLD"]
       p = index($0, old)
       if (p > 0) {
-        $0 = substr($0, 1, p - 1) new substr($0, p + length(old))
+        $0 = substr($0, 1, p - 1) ENVIRON["AWK_NEW"] substr($0, p + length(old))
         done = 1
       }
     }
@@ -326,10 +332,10 @@ replace_range() {
     exit 1
   fi
 
-  awk -v start="$start" -v end="$end" -v new="$new" '
-    !done && !inrange && index($0, start) { inrange = 1 }
+  AWK_START="$start" AWK_END="$end" AWK_NEW="$new" awk '
+    !done && !inrange && index($0, ENVIRON["AWK_START"]) { inrange = 1 }
     inrange {
-      if ($0 == end) { print new; inrange = 0; done = 1 }
+      if ($0 == ENVIRON["AWK_END"]) { print ENVIRON["AWK_NEW"]; inrange = 0; done = 1 }
       next
     }
     { print }
@@ -374,7 +380,10 @@ REG32(GPIO_IN,           0x003c)
 REG32(GPIO_IN1,          0x0040)
 
 /* Two 32-bit banks. The S3 wires 0..48, the ESP32 0..39. */
-#define ESP32_GPIO_PIN_COUNT 64" \
+#define ESP32_GPIO_PIN_COUNT 64
+
+/* How many bit-bang decoders can watch the pins at once. */
+#define ESP32_GPIO_MAX_TAPS 4" \
   'ESP32_GPIO_PIN_COUNT'
 
 replace_once "include/hw/gpio/esp32_gpio.h" \
@@ -391,12 +400,23 @@ replace_once "include/hw/gpio/esp32_gpio.h" \
 replace_range "hw/gpio/esp32_gpio.c" \
   "static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)" \
   "}" \
-  '/* Drive the lines for every pin whose level actually changed. */
+  '/* Tell the watchers something moved, with both whole words. */
+static void esp32_gpio_notify(Esp32GpioState *s)
+{
+    for (unsigned i = 0; i < s->tap_count; i++) {
+        s->taps[i](s->tap_opaque[i], s->out, s->enable);
+    }
+}
+
+/* Drive the lines for every pin whose level actually changed. */
 static void esp32_gpio_set_out(Esp32GpioState *s, uint64_t value)
 {
     uint64_t changed = value ^ s->out;
 
     s->out = value;
+    if (changed != 0) {
+        esp32_gpio_notify(s);
+    }
     while (changed != 0) {
         const int pin = ctz64(changed);
         changed &= changed - 1;
@@ -407,8 +427,12 @@ static void esp32_gpio_set_out(Esp32GpioState *s, uint64_t value)
 static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)
 {
     Esp32GpioState *s = ESP32_GPIO(opaque);
-    /* Driven pins read their own latch; the rest read high, see apply.sh. */
-    const uint64_t in = s->out | ~s->enable;
+    /*
+     * Driven pins read their own latch; the rest read high, see apply.sh.
+     * A line something outside the chip holds low reads low whatever the
+     * chip drives, which is how a device acknowledges on an open-drain bus.
+     */
+    const uint64_t in = (s->out | ~s->enable) & ~s->ext_low;
     uint64_t r = 0;
 
     switch (addr) {
@@ -451,6 +475,7 @@ replace_range "hw/gpio/esp32_gpio.c" \
     Esp32GpioState *s = ESP32_GPIO(opaque);
     const uint64_t low = value & 0xffffffff;
     const uint64_t high = low << 32;
+    const uint64_t old_enable = s->enable;
 
     switch (addr) {
     case A_GPIO_OUT:
@@ -494,6 +519,11 @@ replace_range "hw/gpio/esp32_gpio.c" \
 
     default:
         break;
+    }
+
+    /* An open-drain bus moves by letting go and driving, not by the latch. */
+    if (s->enable != old_enable) {
+        esp32_gpio_notify(s);
     }
 }' \
   'esp32_gpio_set_out(s, s->out | low);'
@@ -945,6 +975,159 @@ else
   echo "warning: slirp guard anchor not found in meson.build; skipping" >&2
 fi
 
+# --- IRAM is DRAM ---------------------------------------------------------------
+#
+# On the S3 the instruction-bus and data-bus views of internal SRAM are the same
+# memory, a fixed offset apart (ESP-IDF's SOC_I_D_OFFSET, 0x6F0000). The fork
+# creates IRAM and DRAM as two independent RAM blocks, so code written through
+# the data view never appears at the instruction view. PURR OS's bootloader does
+# exactly that: it copies the boot menu to the data view and jumps to the
+# instruction view, and under the unmodified model the first instruction fetched
+# is zeros -- an IllegalInstruction on the very first call.
+#
+# IRAM becomes an alias of the start of DRAM. DRAM is created in the machine
+# init and IRAM in the SoC realize, which runs after it, so the alias is made
+# in the machine init and the SoC's own IRAM block is removed.
+replace_range "hw/xtensa/esp32s3.c" \
+  '    memory_region_init_ram(iram, NULL, "esp32s3.iram",' \
+  '    memory_region_add_subregion(sys_mem, memmap[ESP32S3_MEMREGION_IRAM].base, iram);' \
+  "    /* IRAM is an alias of DRAM, made in esp32s3_machine_init. */
+    (void)iram;" \
+  "(void)iram;"
+
+insert_after "hw/xtensa/esp32s3.c" \
+  "    memory_region_add_subregion(sys_mem, memmap[ESP32S3_MEMREGION_DRAM].base, dram);" \
+  "
+    /* Same SRAM as DRAM, seen through the instruction bus (SOC_I_D_OFFSET). */
+    MemoryRegion *iram_alias = g_new(MemoryRegion, 1);
+    memory_region_init_alias(iram_alias, NULL, \"esp32s3.iram\", dram, 0,
+                             memmap[ESP32S3_MEMREGION_IRAM].size);
+    memory_region_add_subregion(sys_mem, memmap[ESP32S3_MEMREGION_IRAM].base, iram_alias);" \
+  "iram_alias"
+
+# --- SPI bit-banged over GPIO ---------------------------------------------------
+#
+# Firmware with no peripheral to lean on drives SPI by hand. PURR OS's boot menu
+# does: a bootloader cannot assume any controller is set up, so it clocks the
+# ST7789 with single-pin GPIO writes. No controller model ever sees a
+# transaction, so the screen stays blank however well the panel is modelled.
+#
+# esp_gpio_spi watches the pins, reassembles the bytes, and sends them down the
+# same path as a controller's traffic. It is told which pins by the board file
+# (see qemuctl) and does nothing when it is not.
+#
+# The same goes for I2C: the boot menu polls the keyboard by hand, open-drain,
+# and "keyboard not answering" is nothing answering. esp_gpio_i2c is the slave
+# side of that: it follows START, address and clock, acknowledges and shifts a
+# byte out by pulling SDA low through the GPIO model's input read.
+#
+# Both read the whole pin state through a tap in the GPIO model rather than one
+# irq line per pin: the pins they need are also wired to the controllers' D/C
+# and chip-select listeners, and a line can only be connected to one place
+# without a splitter. The tap fires for direction changes as well as output
+# ones, because an open-drain line moves by letting go and driving.
+insert_after "hw/misc/meson.build" \
+  "  'esp_vpb.c'," \
+  "  'esp_gpio_spi.c'," \
+  "'esp_gpio_spi.c',"
+
+insert_after "hw/misc/meson.build" \
+  "  'esp_gpio_spi.c'," \
+  "  'esp_gpio_i2c.c'," \
+  "'esp_gpio_i2c.c',"
+
+insert_after "include/hw/gpio/esp32_gpio.h" \
+  "    qemu_irq out_lines[ESP32_GPIO_PIN_COUNT];" \
+  "    /*
+     * Watchers of the pins, called after any write that moved an output or a
+     * direction, with both whole words.
+     */
+    void (*taps[ESP32_GPIO_MAX_TAPS])(void *opaque, uint64_t out, uint64_t enable);
+    void *tap_opaque[ESP32_GPIO_MAX_TAPS];
+    unsigned tap_count;
+    /*
+     * Lines something outside the chip is holding low, such as an I2C slave's
+     * acknowledge. GPIO_IN reads them as 0 whatever the chip drives.
+     */
+    uint64_t ext_low;" \
+  "uint64_t ext_low;"
+
+insert_after "include/hw/gpio/esp32_gpio.h" \
+  "} Esp32GpioState;" \
+  "
+static inline void esp32_gpio_add_tap(Esp32GpioState *s,
+                                      void (*fn)(void *, uint64_t, uint64_t),
+                                      void *opaque)
+{
+    assert(s->tap_count < ESP32_GPIO_MAX_TAPS);
+    s->taps[s->tap_count] = fn;
+    s->tap_opaque[s->tap_count++] = opaque;
+}
+
+/* Hold a line low from outside the chip, or let go of it. */
+static inline void esp32_gpio_set_ext_low(Esp32GpioState *s, int pin, bool low)
+{
+    if (low) {
+        s->ext_low |= 1ULL << pin;
+    } else {
+        s->ext_low &= ~(1ULL << pin);
+    }
+}" \
+  "esp32_gpio_add_tap"
+
+insert_after "hw/xtensa/esp32s3.c" \
+  '#include "hw/gpio/esp32s3_gpio.h"' \
+  '#include "hw/misc/esp_gpio_spi.h"' \
+  'hw/misc/esp_gpio_spi.h'
+
+insert_after "hw/xtensa/esp32s3.c" \
+  '#include "hw/misc/esp_gpio_spi.h"' \
+  '#include "hw/misc/esp_gpio_i2c.h"' \
+  'hw/misc/esp_gpio_i2c.h'
+
+replace_once "hw/xtensa/esp32s3.c" \
+  "    /* GDMA Realization */" \
+  "    /* SPI and I2C bit-banged over GPIO: each listens only when the board names its pins. */
+    {
+        Esp32GpioState *gpio = ESP32_GPIO(&ss->gpio);
+
+        DeviceState *spi = qdev_new(TYPE_ESP_GPIO_SPI);
+        qdev_realize_and_unref(spi, NULL, &error_fatal);
+        if (esp_gpio_spi_active(ESP_GPIO_SPI(spi))) {
+            esp32_gpio_add_tap(gpio, esp_gpio_spi_out_changed, spi);
+        }
+
+        DeviceState *i2c = qdev_new(TYPE_ESP_GPIO_I2C);
+        qdev_realize_and_unref(i2c, NULL, &error_fatal);
+        if (esp_gpio_i2c_active(ESP_GPIO_I2C(i2c))) {
+            ESP_GPIO_I2C(i2c)->gpio = gpio;
+            esp32_gpio_add_tap(gpio, esp_gpio_i2c_changed, i2c);
+        }
+    }
+
+    /* GDMA Realization */" \
+  "esp_gpio_i2c_changed"
+
+# --- SPI1 chip-select default ---------------------------------------------------
+#
+# SPI_MEM_MISC resets with CS1_DIS set: only CS0 (the flash) is driven unless
+# firmware says otherwise (ESP-IDF's spi_mem_reg.h documents the default as
+# 1'b1, and the PSRAM driver clears it itself when it needs CS1). The SPI1
+# model does not implement the reset value, so MISC starts at zero and every
+# flash transaction also selects the PSRAM on CS1.
+#
+# ssi_transfer() returns the OR of every selected peripheral, so whatever the
+# PSRAM model answered was OR'd into the flash data. It only answers when its
+# own state machine happens to line up with the command and address bytes, so
+# the damage is sparse and periodic: one 16-byte read in 4,096 of a slot, always
+# at an address ending ...4040. That surfaces as a "bad-hash" on a valid image
+# and, in principle, as corrupt data anywhere flash is read through SPI1.
+insert_after "hw/ssi/esp32s3_spi.c" \
+  "    s->mem_user2 = FIELD_DP32(s->mem_user2, SPI_MEM_USER2, USR_COMMAND_BITLEN, 7);" \
+  "
+    s->misc = FIELD_DP32(s->misc, SPI_MEM_MISC, CS1_DIS, 1);" \
+  "SPI_MEM_MISC, CS1_DIS, 1);"
+
 # --- Windows build fix -----------------------------------------------------
 #
 # QEMU's install-tree step uses os.symlink, which Windows refuses without
@@ -953,8 +1136,9 @@ fi
 # to build.
 SYMLINK_SCRIPT="$SRC/scripts/symlink-install-tree.py"
 if [ -f "$SYMLINK_SCRIPT" ] && ! grep -q "import shutil" "$SYMLINK_SCRIPT"; then
+  # The `try:` that opens this block is already printed by the awk below, before
+  # it reaches the os.symlink line, so the replacement must not repeat it.
   python_fix=$(cat <<'PYFIX'
-    try:
         os.symlink(source, bundle_dest)
     except BaseException as e:
         if isinstance(e, OSError) and e.errno == errno.EEXIST:
@@ -973,10 +1157,10 @@ if [ -f "$SYMLINK_SCRIPT" ] && ! grep -q "import shutil" "$SYMLINK_SCRIPT"; then
             raise e
 PYFIX
 )
-  awk -v fix="$python_fix" '
+  AWK_FIX="$python_fix" awk '
     /^import shlex$/ { print; print "import shutil"; next }
     /^    try:$/ && !done { intry = 1 }
-    intry && /os\.symlink\(source, bundle_dest\)/ { print fix; skipping = 1; done = 1; next }
+    intry && /os\.symlink\(source, bundle_dest\)/ { print ENVIRON["AWK_FIX"]; skipping = 1; done = 1; next }
     skipping && /^$/ { skipping = 0; next }
     skipping { next }
     { print }
