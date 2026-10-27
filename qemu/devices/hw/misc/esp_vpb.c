@@ -358,8 +358,21 @@ bool esp_vpb_spi_transfer(EspVpbClient *c, uint8_t controller, uint8_t cs,
             c->flush_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                           esp_vpb_flush_timeout, c);
         }
-        timer_mod(c->flush_timer,
-                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + ESP_VPB_COALESCE_MS);
+        /*
+         * Armed once per batch, not on every transfer. Moving a timer that is
+         * already the earliest wakes the main loop each time, and the main loop
+         * takes QEMU's global lock to find it has nothing to do. A redraw is tens
+         * of thousands of transfers, so that was the lock contention core 0 spent
+         * most of its busy time waiting on, not the work of the call itself.
+         *
+         * The hold is now measured from the first buffered byte, so a long stream
+         * is cut into frames every COALESCE_MS instead of only at the size limit.
+         * Order is unaffected, and the panel model carries a stream across frames.
+         */
+        if (!timer_pending(c->flush_timer)) {
+            timer_mod(c->flush_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + ESP_VPB_COALESCE_MS);
+        }
         return true;
     }
 

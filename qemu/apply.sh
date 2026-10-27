@@ -165,6 +165,14 @@ insert_after "hw/xtensa/esp32s3.c" \
         ss->gpspi3.gdma_periph = GDMA_SPI3;" \
   "gpspi2.gdma = ESP_GDMA"
 
+# SPI3 reports itself as controller 3. The property defaults to 2, which was
+# right while only SPI2 carried device models; a second bus with a device on it
+# (the VM's Ethernet controller) has to be told apart from the display's.
+insert_after "hw/xtensa/esp32s3.c" \
+  "        ss->gpspi3.gdma_periph = GDMA_SPI3;" \
+  "        ss->gpspi3.vpb_controller = 3;" \
+  "gpspi3.vpb_controller = 3;"
+
 # --- analog master (regi2c) -------------------------------------------------
 #
 # Unmapped, so it reads zero, so the PHY's readiness poll never completes and
@@ -1127,6 +1135,117 @@ insert_after "hw/ssi/esp32s3_spi.c" \
   "
     s->misc = FIELD_DP32(s->misc, SPI_MEM_MISC, CS1_DIS, 1);" \
   "SPI_MEM_MISC, CS1_DIS, 1);"
+
+# --- The app CPU starts held in reset -------------------------------------------
+#
+# On the silicon the second core does not run until firmware releases it.
+# SYSTEM_CORE_1_CONTROL_0 resets with RESETING set and the clock gated, and
+# ESP-IDF's start_other_core() clears the stall, sets the clock gate, and pulses
+# the reset. The model ignored that register, so core 1 ran from power-on and sat
+# in the ROM's wait loop reading the boot-address register as fast as it could.
+#
+# Every memory-mapped access takes QEMU's global lock, so that loop contended with
+# core 0 for it. Core 0 was the one drawing the boot menu one GPIO write at a time
+# (about 24 per byte), and a sample of the process showed it waiting on the lock
+# for roughly a quarter of its time, in the boot package, the menu and anything
+# else that is access-heavy.
+#
+# The register now holds its bits and the machine stalls core 1 until they say
+# run: clock enabled, no stall, not in reset. The RTC's SW stall is still ignored
+# on purpose: ESP-IDF uses it to freeze the other core around flash operations,
+# and with a flash model that is never mid-operation there is nothing to freeze.
+insert_after "include/hw/xtensa/esp32s3_clk.h" \
+  "    uint32_t app_cpu_addr;" \
+  "
+    /* SYSTEM_CORE_1_CONTROL_0: RUNSTALL bit 0, CLKGATE_EN bit 1, RESETING bit 2. */
+    uint32_t core1_ctrl;
+    /* How the machine stalls or releases the app CPU. */
+    void (*core1_stall)(void *opaque, bool stall);
+    void *core1_opaque;" \
+  "core1_opaque;"
+
+replace_once "hw/xtensa/esp32s3_clk.c" \
+  "static uint64_t esp32s3_clock_read(void *opaque, hwaddr addr, unsigned int size)" \
+  "/* SYSTEM_CORE_1_CONTROL_0 bits, as ESP-IDF's system_reg.h names them. */
+#define CORE1_RUNSTALL   (1u << 0)
+#define CORE1_CLKGATE_EN (1u << 1)
+#define CORE1_RESETING   (1u << 2)
+
+/* Out of reset the app CPU is held in reset with its clock gated. */
+#define CORE1_CTRL_DEFAULT CORE1_RESETING
+
+static void esp32s3_clock_core1_update(ESP32S3ClockState *s)
+{
+    const bool run = (s->core1_ctrl & CORE1_CLKGATE_EN) &&
+                     !(s->core1_ctrl & (CORE1_RUNSTALL | CORE1_RESETING));
+
+    if (s->core1_stall) {
+        s->core1_stall(s->core1_opaque, !run);
+    }
+}
+
+static uint64_t esp32s3_clock_read(void *opaque, hwaddr addr, unsigned int size)" \
+  "esp32s3_clock_core1_update"
+
+replace_once "hw/xtensa/esp32s3_clk.c" \
+  "                r = s->app_cpu_addr;" \
+  "                r = s->app_cpu_addr;
+            break;
+        case A_SYSTEM_CORE_1_CONTROL_0_REG:
+                r = s->core1_ctrl;" \
+  "r = s->core1_ctrl;"
+
+replace_once "hw/xtensa/esp32s3_clk.c" \
+  "                s->app_cpu_addr = (uint32_t)value;" \
+  "                s->app_cpu_addr = (uint32_t)value;
+            break;
+        case A_SYSTEM_CORE_1_CONTROL_0_REG:
+                s->core1_ctrl = (uint32_t)value & 7;
+                esp32s3_clock_core1_update(s);" \
+  "s->core1_ctrl = (uint32_t)value & 7;"
+
+replace_once "hw/xtensa/esp32s3_clk.c" \
+  "    /* Initialize the IRQs */" \
+  "    /* The app CPU is held in reset until firmware releases it. */
+    s->core1_ctrl = CORE1_CTRL_DEFAULT;
+    esp32s3_clock_core1_update(s);
+
+    /* Initialize the IRQs */" \
+  "s->core1_ctrl = CORE1_CTRL_DEFAULT;"
+
+replace_once "hw/xtensa/esp32s3.c" \
+  "static void esp32s3_cpu_stall(void* opaque, int n, int level)" \
+  "/*
+ * Stall or release the app CPU on behalf of SYSTEM_CORE_1_CONTROL_0.
+ *
+ * xtensa_runstall(true) both sets the halted flag and queues a halt request for
+ * the CPU thread to act on. A CPU stalled before it has ever run is already idle,
+ * so its thread never gets to that request, and releasing it only clears the
+ * flag: the stale request is still pending when the thread wakes, and it halts
+ * again at once. The release has to drop it.
+ */
+static void esp32s3_core1_stall(void *opaque, bool stall)
+{
+    Esp32s3SocState *s = opaque;
+
+    if (ESP32S3_CPU_COUNT > 1) {
+        if (!stall) {
+            cpu_reset_interrupt(CPU(&s->cpu[1]), CPU_INTERRUPT_HALT);
+        }
+        xtensa_runstall(&s->cpu[1].env, stall);
+    }
+}
+
+static void esp32s3_cpu_stall(void* opaque, int n, int level)" \
+  "esp32s3_core1_stall(void"
+
+insert_after "hw/xtensa/esp32s3.c" \
+  "        memory_region_add_subregion_overlap(sys_mem, DR_REG_SYSTEM_BASE, mr, 0);" \
+  "        /* Hold the app CPU in reset until the guest releases it, as on silicon. */
+        ss->clock.core1_stall = esp32s3_core1_stall;
+        ss->clock.core1_opaque = ss;
+        esp32s3_core1_stall(ss, true);" \
+  "ss->clock.core1_opaque = ss;"
 
 # --- Windows build fix -----------------------------------------------------
 #

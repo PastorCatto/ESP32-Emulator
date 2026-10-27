@@ -23,6 +23,9 @@
 #include "qom/object.h"
 #include "hw/misc/esp_vpb.h"
 
+/* How many decoded bytes are held back before they are sent. */
+#define ESP_GPIO_SPI_BATCH 4096
+
 #define TYPE_ESP_GPIO_SPI "esp.gpio-spi"
 OBJECT_DECLARE_SIMPLE_TYPE(EspGpioSpiState, ESP_GPIO_SPI)
 
@@ -51,6 +54,19 @@ struct EspGpioSpiState {
     /* The byte being assembled. */
     uint8_t shift;
     uint8_t bits;
+
+    /*
+     * Finished bytes waiting to be sent, all at one data/command level. They go
+     * out as a single transfer rather than one each. Every transfer re-arms the
+     * client's flush timer, which wakes QEMU's main loop, which takes the global
+     * lock the guest CPU needs for its next GPIO write; at 24 writes a byte and
+     * 150,000 bytes a screen that was the largest cost left in drawing one.
+     */
+    uint8_t batch[ESP_GPIO_SPI_BATCH];
+    uint32_t batch_len;
+    bool batch_dc;
+    /* Sends a partial batch once the guest stops drawing. */
+    QEMUTimer *flush_timer;
 };
 
 /** Is there anything to do: a bus to send to and the two pins that carry data. */

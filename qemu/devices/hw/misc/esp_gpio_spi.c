@@ -17,6 +17,28 @@ bool esp_gpio_spi_active(EspGpioSpiState *s)
     return s->vpb.port != 0 && s->sclk_gpio >= 0 && s->mosi_gpio >= 0;
 }
 
+/* Send what has been decoded, as one transfer. */
+static void flush_batch(EspGpioSpiState *s)
+{
+    const uint32_t n = s->batch_len;
+
+    if (n == 0) {
+        return;
+    }
+    s->batch_len = 0;
+    if (s->flush_timer) {
+        timer_del(s->flush_timer);
+    }
+    esp_vpb_spi_transfer(&s->vpb, s->vpb_controller, s->cs_line,
+                         s->dc_gpio >= 0 ? (s->batch_dc ? 1 : 0) : -1,
+                         s->batch, n, NULL, 0);
+}
+
+static void flush_timeout(void *opaque)
+{
+    flush_batch(opaque);
+}
+
 void esp_gpio_spi_out_changed(void *opaque, uint64_t out, uint64_t enable)
 {
     EspGpioSpiState *s = opaque;
@@ -34,6 +56,8 @@ void esp_gpio_spi_out_changed(void *opaque, uint64_t out, uint64_t enable)
     if (cs != s->cs) {
         s->bits = 0;
         s->shift = 0;
+        /* A transaction ended or began: what came before it is complete. */
+        flush_batch(s);
     }
 
     /*
@@ -50,14 +74,28 @@ void esp_gpio_spi_out_changed(void *opaque, uint64_t out, uint64_t enable)
             s->bits = 0;
             s->shift = 0;
             /*
-             * One byte at a time is deliberate. The client already merges a
-             * run of bytes for the same device and data/command level into
-             * one frame and flushes it when the guest stops drawing, so a
-             * 150 KiB screen still crosses the socket as a handful of frames.
+             * Held back and sent together, see the header. A change of
+             * data/command level must not share a transfer with the bytes
+             * before it, since the level is what tells the panel a command
+             * from pixels. The timer sends a partial batch once drawing
+             * stops, for firmware that never raises chip select.
              */
-            esp_vpb_spi_transfer(&s->vpb, s->vpb_controller, s->cs_line,
-                                 s->dc_gpio >= 0 ? (dc ? 1 : 0) : -1,
-                                 &byte, 1, NULL, 0);
+            if (s->batch_len != 0 && s->batch_dc != dc) {
+                flush_batch(s);
+            }
+            if (s->batch_len == 0) {
+                s->batch_dc = dc;
+                if (!s->flush_timer) {
+                    s->flush_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                                  flush_timeout, s);
+                }
+                timer_mod(s->flush_timer,
+                          qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 2);
+            }
+            s->batch[s->batch_len++] = byte;
+            if (s->batch_len == ESP_GPIO_SPI_BATCH) {
+                flush_batch(s);
+            }
         }
     }
 
@@ -87,6 +125,7 @@ static void esp_gpio_spi_reset(Object *obj, ResetType type)
     s->cs = true;
     s->bits = 0;
     s->shift = 0;
+    s->batch_len = 0;
 }
 
 static void esp_gpio_spi_class_init(ObjectClass *klass, void *data)
