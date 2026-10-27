@@ -258,6 +258,10 @@ pub struct GpioI2c {
     pub controller: u8,
 }
 
+/// Bytes in an ESP32-S3 eFuse backing file: BLOCK0 and BLOCK1 are six words
+/// each and the other nine blocks eight, all unburned (zero) when new.
+pub const EFUSE_IMAGE_LEN: usize = (6 + 6 + 9 * 8) * 4;
+
 /// How to start the machine.
 #[derive(Debug, Clone)]
 pub struct LaunchConfig {
@@ -296,6 +300,16 @@ pub struct LaunchConfig {
     /// GPIO carrying each SPI chip select, as `(cs_line, gpio)`. Lets the
     /// controller route a transfer when the driver drives CS itself.
     pub spi_cs_gpios: Vec<(u8, u8)>,
+    /// `(controller, chip-select line)` pairs whose device is sent the
+    /// controller's command and address phases as the start of each transfer.
+    pub spi_framed_cs: Vec<(u8, u8)>,
+    /// Join QEMU's user-mode network to a wired NIC model outside QEMU:
+    /// `(qemu_local_port, peer_port)`, one UDP datagram per Ethernet frame.
+    pub net_bridge: Option<(u16, u16)>,
+    /// A file backing the eFuses, so burns persist between runs ("soft
+    /// burn"): the OS and bootloader read it, and programming writes it back.
+    /// It must be the size of the chip's eFuse blocks ([`EFUSE_IMAGE_LEN`]).
+    pub efuse_image: Option<PathBuf>,
     /// Pins to read as a bit-banged SPI bus, from the board file.
     pub gpio_spi: Option<GpioSpi>,
     /// Pins to follow as a bit-banged I2C bus, from the board file.
@@ -321,6 +335,9 @@ impl LaunchConfig {
             vpb_port: None,
             display_dc_gpio: None,
             spi_cs_gpios: Vec::new(),
+            spi_framed_cs: Vec::new(),
+            net_bridge: None,
+            efuse_image: None,
             gpio_spi: None,
             gpio_i2c: None,
             data_dir: None,
@@ -445,6 +462,34 @@ impl LaunchConfig {
             args.push(format!(
                 "driver=ssi.esp32s3.gpspi,property=dc-gpio,value={pin}"
             ));
+        }
+        if let Some(path) = &self.efuse_image {
+            args.push("-drive".into());
+            args.push(format!("file={},if=none,format=raw,id=efuse", path.display()));
+            args.push("-global".into());
+            args.push("driver=nvram.esp32s3.efuse,property=drive,value=efuse".into());
+        }
+        if let Some((local, peer)) = self.net_bridge {
+            // Slirp supplies DHCP, DNS and NAT. A hub joins it to the socket
+            // the NIC model reads, because a netdev with no frontend device
+            // would otherwise drop everything it receives.
+            args.push("-netdev".into());
+            args.push("user,id=purr-user".into());
+            args.push("-netdev".into());
+            args.push(format!(
+                "dgram,id=purr-nic,local.type=inet,local.host=127.0.0.1,local.port={local},\
+                 remote.type=inet,remote.host=127.0.0.1,remote.port={peer}"
+            ));
+            args.push("-netdev".into());
+            args.push("hubport,id=purr-hub-nic,hubid=0,netdev=purr-nic".into());
+            args.push("-netdev".into());
+            args.push("hubport,id=purr-hub-user,hubid=0,netdev=purr-user".into());
+        }
+        if !self.spi_framed_cs.is_empty() {
+            // One bit per controller and line: controller * 8 + line.
+            let mask = self.spi_framed_cs.iter().fold(0u32, |m, (c, line)| m | 1 << (u32::from(*c) * 8 + u32::from(*line)));
+            args.push("-global".into());
+            args.push(format!("driver=ssi.esp32s3.gpspi,property=vpb-framed-cs,value={mask}"));
         }
         if !self.spi_cs_gpios.is_empty() {
             // One entry per CS line, highest line first so the list length

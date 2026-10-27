@@ -29,6 +29,18 @@ pub mod keyboard;
 #[cfg(feature = "tdeck-keyboard")]
 pub use keyboard::TdeckKeyboard;
 
+#[cfg(feature = "w5500")]
+pub mod w5500;
+
+#[cfg(feature = "w5500")]
+pub use w5500::W5500;
+
+#[cfg(feature = "vm-info")]
+pub mod vminfo;
+
+#[cfg(feature = "vm-info")]
+pub use vminfo::VmInfo;
+
 pub mod png;
 
 #[cfg(all(test, feature = "gt911", feature = "tdeck-keyboard"))]

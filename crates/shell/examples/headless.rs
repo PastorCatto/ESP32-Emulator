@@ -29,7 +29,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sd_image = args.next().map(PathBuf::from);
     let out = args.next().unwrap_or_else(|| "screen.png".into());
 
-    let board = boards::Board::from_toml(T_DECK)?;
+    // BOARD_TOML names another board file, such as boards/t-deck-plus-vm.toml.
+    let board_src = match std::env::var("BOARD_TOML") {
+        Ok(path) => std::fs::read_to_string(path)?,
+        Err(_) => T_DECK.to_string(),
+    };
+    let board = boards::Board::from_toml(&board_src)?;
     let mut sess = session::Session::new(board);
     sess.sd_image = sd_image;
 
@@ -72,6 +77,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(0);
     let mut key_sent = false;
 
+    // HEADLESS_TYPE='name\npassword\n' types a whole string, one key every
+    // 150 ms, starting at HEADLESS_TYPE_AT seconds (default 20). `\n` is Enter.
+    let typed: Vec<char> = std::env::var("HEADLESS_TYPE")
+        .map(|s| s.replace("\\n", "\r").chars().collect())
+        .unwrap_or_default();
+    let type_at: u64 = std::env::var("HEADLESS_TYPE_AT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    let mut typed_count = 0usize;
+
+    // HEADLESS_SERIAL='net\n' sends text to a serial console (the port is
+    // HEADLESS_SERIAL_PORT, default 0) at HEADLESS_SERIAL_AT seconds.
+    // Several lines can be separated with `\n`; each goes out 3 seconds
+    // after the last, so a slow command finishes before the next starts.
+    let serial_lines: Vec<String> = std::env::var("HEADLESS_SERIAL")
+        .map(|s| s.split("\\n").filter(|l| !l.is_empty()).map(|l| format!("{l}\r")).collect())
+        .unwrap_or_default();
+    let serial_at: u64 = std::env::var("HEADLESS_SERIAL_AT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let serial_port: usize = std::env::var("HEADLESS_SERIAL_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let serial_gap: u64 = std::env::var("HEADLESS_SERIAL_GAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let mut serial_sent = 0usize;
+
     while std::time::Instant::now() < deadline {
         sess.pump();
         if let (Some(ch), false) = (key, key_sent) {
@@ -81,6 +118,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 key_sent = true;
             }
+        }
+        if typed_count < typed.len()
+            && started.elapsed() >= Duration::from_millis(type_at * 1000 + typed_count as u64 * 150)
+        {
+            if let Some(keys) = sess.hardware.as_ref().and_then(|h| h.keys.clone()) {
+                devices::TdeckKeyboard::press(&keys, typed[typed_count]);
+            }
+            typed_count += 1;
+        }
+        if serial_sent < serial_lines.len()
+            && started.elapsed() >= Duration::from_secs(serial_at + serial_sent as u64 * serial_gap)
+        {
+            sess.send_serial(serial_port, &serial_lines[serial_sent]);
+            serial_sent += 1;
         }
         // The channel is unbounded and a traced boot fills it fast, so this
         // has to drain whether or not anything is printed.

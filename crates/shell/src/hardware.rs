@@ -35,6 +35,9 @@ pub struct Hardware {
     pub touch: Option<TouchHandle>,
     /// The keyboard's pending-key queue, for the UI to type into.
     pub keys: Option<KeyQueue>,
+    /// UDP ports joining a wired NIC to QEMU's network, as
+    /// `(qemu_local, ours)`, when the board has one this build can model.
+    pub net: Option<(u16, u16)>,
     /// Kinds that were attached, in board order.
     pub attached: Vec<String>,
     /// Kinds named by the board that this build has no model for.
@@ -80,11 +83,17 @@ struct Built {
     screen: Option<ScreenHandle>,
     touch: Option<TouchHandle>,
     keys: Option<KeyQueue>,
+    net: Option<(u16, u16)>,
 }
 
 impl Built {
     fn new(device: Box<dyn Peripheral>) -> Self {
-        Built { device, screen: None, touch: None, keys: None }
+        Built { device, screen: None, touch: None, keys: None, net: None }
+    }
+
+    fn net(mut self, ports: (u16, u16)) -> Self {
+        self.net = Some(ports);
+        self
     }
 
     fn screen(mut self, handle: ScreenHandle) -> Self {
@@ -183,8 +192,50 @@ fn build(
             let card = devices::SdCard::open(path, claim).map_err(|e| e.to_string())?;
             Ok(Some(Built::new(Box::new(card))))
         }
+        "vm-info" => {
+            if claims.is_empty() {
+                return Err("vm-info needs a bus and an address".into());
+            }
+            // The Ethernet controller's own bus, when the board gives it one.
+            let nic = if spec.params.contains("nic_host") {
+                let get = |k: &str| spec.params.u8(k).map_err(|e| e.to_string());
+                Some(devices::vminfo::NicBus {
+                    host: get("nic_host")?,
+                    sclk: get("nic_sclk")?,
+                    mosi: get("nic_mosi")?,
+                    miso: get("nic_miso")?,
+                    cs: get("nic_cs")?,
+                })
+            } else {
+                None
+            };
+            Ok(Some(Built::new(Box::new(devices::VmInfo::new(claims, nic)))))
+        }
+        "w5500" => {
+            let claim = claim.ok_or("w5500 needs a bus and a chip select")?;
+            let (link, ports) = open_link().map_err(|e| format!("w5500 network: {e}"))?;
+            let chip = devices::W5500::new(claim, Some(link));
+            Ok(Some(Built::new(Box::new(chip)).net(ports)))
+        }
         _ => Ok(None),
     }
+}
+
+/// Open the UDP socket a wired NIC talks to QEMU over.
+///
+/// QEMU's `dgram` netdev needs a fixed local port, so one is found by binding
+/// and releasing a socket. Another process could take it in the gap; the
+/// consequence is QEMU failing to start with a clear message, not a silent
+/// wrong answer.
+fn open_link() -> std::io::Result<(devices::w5500::Link, (u16, u16))> {
+    let ours = std::net::UdpSocket::bind(("127.0.0.1", 0))?;
+    let our_port = ours.local_addr()?.port();
+    let qemu_port = {
+        let probe = std::net::UdpSocket::bind(("127.0.0.1", 0))?;
+        probe.local_addr()?.port()
+    };
+    let peer = std::net::SocketAddr::from(([127, 0, 0, 1], qemu_port));
+    Ok((devices::w5500::Link::new(ours, peer)?, (qemu_port, our_port)))
 }
 
 /// Attach a board's devices and start serving them on a background thread.
@@ -196,6 +247,7 @@ pub fn start(board: &Board, sd_image: Option<PathBuf>) -> std::io::Result<Hardwa
     let mut screen = None;
     let mut touch = None;
     let mut keys = None;
+    let mut net = None;
     let mut attached = Vec::new();
     let mut unmodelled = Vec::new();
 
@@ -206,6 +258,7 @@ pub fn start(board: &Board, sd_image: Option<PathBuf>) -> std::io::Result<Hardwa
                 screen = built.screen.or(screen);
                 touch = built.touch.or(touch);
                 keys = built.keys.or(keys);
+                net = built.net.or(net);
                 match registry.register(built.device) {
                     Ok(_) => attached.push(spec.kind.clone()),
                     // A refused claim means two devices want the same address,
@@ -245,6 +298,7 @@ pub fn start(board: &Board, sd_image: Option<PathBuf>) -> std::io::Result<Hardwa
         screen,
         touch,
         keys,
+        net,
         attached,
         unmodelled,
         events,

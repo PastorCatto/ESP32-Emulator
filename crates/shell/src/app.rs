@@ -13,6 +13,7 @@ use vpb::trace::TraceConfig;
 /// without hunting for files. Dropping a `.toml` adds to this at runtime.
 const BUILTIN_BOARDS: &[(&str, &str)] = &[
     ("t-deck-plus", include_str!("../../../boards/t-deck-plus.toml")),
+    ("t-deck-plus-vm", include_str!("../../../boards/t-deck-plus-vm.toml")),
     ("cyd-esp32-2432s028r", include_str!("../../../boards/cyd-esp32-2432s028r.toml")),
     ("cyd-s024c", include_str!("../../../boards/cyd-s024c.toml")),
     ("cyd-s028r", include_str!("../../../boards/cyd-s028r.toml")),

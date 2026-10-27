@@ -179,6 +179,20 @@ typedef struct Esp32s3GpspiState {
     uint8_t vpb_controller;
 
     /*
+     * CS lines (bit controller*8 + line) whose device frames each transaction with the
+     * command and address phases: a W5500's 16-bit address and control byte
+     * are clocked there, not in the data phase. For these lines the phases
+     * are forwarded as the first bytes of the transfer, and every transfer
+     * is sent on its own and waits for an answer, because the device cannot
+     * tell where one transaction ends and the next begins from a merged run.
+     * Other lines see the data phase alone, as before.
+     */
+    uint32_t vpb_framed_cs;
+    /* The command, address and dummy bytes of the transfer in progress. */
+    uint8_t vpb_prefix[16];
+    unsigned vpb_prefix_len;
+
+    /*
      * Set when the guest writes W0..W15, cleared when a transfer consumes
      * them. Distinguishes a programmed-I/O transfer from a DMA one.
      */

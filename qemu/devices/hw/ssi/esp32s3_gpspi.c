@@ -223,6 +223,34 @@ static bool esp32s3_gpspi_via_vpb(Esp32s3GpspiState *s, uint8_t *buf,
 {
     int cs = esp32s3_gpspi_active_cs(s);
 
+    if (s->vpb_prefix_len) {
+        /*
+         * A framed device: the command and address bytes lead the transfer,
+         * and the whole thing goes out as one frame that is always answered.
+         * Waiting even for a write keeps the device's view of the order
+         * exact, and is how a W5500 sees a register write finish before the
+         * read that follows it.
+         */
+        uint8_t whole[ESP32S3_GPSPI_DMA_MAX + sizeof(s->vpb_prefix)];
+        unsigned head = s->vpb_prefix_len;
+        bool ok;
+
+        s->vpb_prefix_len = 0;
+        if (bytes > ESP32S3_GPSPI_DMA_MAX) {
+            return false;
+        }
+        memcpy(whole, s->vpb_prefix, head);
+        memcpy(whole + head, buf, bytes);
+        esp_vpb_flush(&s->vpb);
+        ok = esp_vpb_spi_transfer(&s->vpb, s->vpb_controller, (uint8_t)cs,
+                                  s->dc_level, whole, head + bytes,
+                                  whole, head + bytes);
+        if (ok && want_miso) {
+            memcpy(buf, whole + head, bytes);
+        }
+        return ok;
+    }
+
     return esp_vpb_spi_transfer(&s->vpb, s->vpb_controller, (uint8_t)cs,
                                 s->dc_level, buf, bytes,
                                 buf, want_miso ? bytes : 0);
@@ -297,7 +325,17 @@ static unsigned esp32s3_gpspi_dma_data(Esp32s3GpspiState *s, unsigned bytes,
                       "gpspi: dma tx %u bytes found=%d chan=%u moved=%d\n",
                       bytes, found, found ? chan : 0, moved);
         if (!moved) {
-            return 0;
+            /*
+             * A receive-only transaction still has USR_MOSI set (ESP-IDF
+             * leaves the controller full duplex), and with no TX buffer
+             * queued there is nothing to pull. Clock idle zeros out and carry
+             * on; giving up here would make every short register read of a
+             * framed device, such as a W5500's VERSIONR, silently vanish.
+             */
+            if (!rx) {
+                return 0;
+            }
+            memset(s->dma_buf, 0x00, bytes);
         }
     }
 
@@ -313,13 +351,35 @@ static unsigned esp32s3_gpspi_dma_data(Esp32s3GpspiState *s, unsigned bytes,
         if (!esp_gdma_get_channel_periph(s->gdma, s->gdma_periph,
                                          ESP_GDMA_IN_IDX, &chan) ||
             !esp_gdma_write_channel(s->gdma, chan, s->dma_buf, bytes)) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "%s: DMA RX enabled but no usable in channel\n",
-                          __func__);
+            /*
+             * No receive descriptor queued: the driver asked for a short read
+             * into the register buffer (SPI_TRANS_USE_RXDATA), and reads the
+             * answer from W0.. rather than from memory.
+             */
+            for (unsigned i = 0; i < bytes && i < ESP32S3_GPSPI_BUF_BYTES; i++) {
+                esp32s3_gpspi_buf_write(s, i, s->dma_buf[i]);
+            }
         }
     }
 
     return bytes;
+}
+
+/*
+ * One byte of the command, address or dummy phase. A framed device gets it as
+ * part of the transfer it is about to receive; anything else sees it clocked
+ * over the in-QEMU bus, as it always has.
+ */
+static void esp32s3_gpspi_phase_byte(Esp32s3GpspiState *s, bool framed,
+                                     uint8_t value, bool attached)
+{
+    if (framed) {
+        if (s->vpb_prefix_len < sizeof(s->vpb_prefix)) {
+            s->vpb_prefix[s->vpb_prefix_len++] = value;
+        }
+        return;
+    }
+    esp32s3_gpspi_xfer_byte(s, value, attached);
 }
 
 static void esp32s3_gpspi_transfer(Esp32s3GpspiState *s)
@@ -339,25 +399,36 @@ static void esp32s3_gpspi_transfer(Esp32s3GpspiState *s)
         qemu_set_irq(s->cs_gpio[cs], 0);
     }
 
+    /* A framed device gets these phases forwarded rather than clocked here. */
+    bool framed = cs >= 0 && s->vpb.port != 0 &&
+                  (s->vpb_framed_cs & (1u << (s->vpb_controller * 8 + cs)));
+    s->vpb_prefix_len = 0;
+
     /* Command phase: up to 16 bits, most significant byte first. */
     if (FIELD_EX32(user, GPSPI_USER, USR_COMMAND)) {
         uint32_t value = FIELD_EX32(s->regs[R_GPSPI_USER2], GPSPI_USER2,
                                     USR_COMMAND_VALUE);
         unsigned bits = FIELD_EX32(s->regs[R_GPSPI_USER2], GPSPI_USER2,
                                    USR_COMMAND_BITLEN) + 1;
-        for (int shift = ((bits + 7) / 8) * 8 - 8; shift >= 0; shift -= 8) {
-            esp32s3_gpspi_xfer_byte(s, (value >> shift) & 0xff, attached);
+        /*
+         * The field is the command swapped by the driver (see ESP-IDF's
+         * spi_ll_set_command): the byte to send first is the low one.
+         */
+        for (unsigned i = 0; i < (bits + 7) / 8; i++) {
+            esp32s3_gpspi_phase_byte(s, framed, (value >> (8 * i)) & 0xff,
+                                     attached);
             total_bytes++;
         }
     }
 
-    /* Address phase, likewise most significant byte first. */
+    /* Address phase: the top bits of the register, most significant first. */
     if (FIELD_EX32(user, GPSPI_USER, USR_ADDR)) {
         uint32_t addr = s->regs[R_GPSPI_ADDR];
         unsigned bits = FIELD_EX32(s->regs[R_GPSPI_USER1], GPSPI_USER1,
                                    USR_ADDR_BITLEN) + 1;
-        for (int shift = ((bits + 7) / 8) * 8 - 8; shift >= 0; shift -= 8) {
-            esp32s3_gpspi_xfer_byte(s, (addr >> shift) & 0xff, attached);
+        for (unsigned i = 0; i < (bits + 7) / 8; i++) {
+            esp32s3_gpspi_phase_byte(s, framed, (addr >> (24 - 8 * i)) & 0xff,
+                                     attached);
             total_bytes++;
         }
     }
@@ -367,7 +438,7 @@ static void esp32s3_gpspi_transfer(Esp32s3GpspiState *s)
         unsigned cycles = FIELD_EX32(s->regs[R_GPSPI_USER1], GPSPI_USER1,
                                      USR_DUMMY_CYCLELEN) + 1;
         for (unsigned i = 0; i < cycles / 8; i++) {
-            esp32s3_gpspi_xfer_byte(s, 0xff, attached);
+            esp32s3_gpspi_phase_byte(s, framed, 0xff, attached);
             total_bytes++;
         }
     }
@@ -680,6 +751,8 @@ static Property esp32s3_gpspi_properties[] = {
     /* Board wiring: which GPIO the machine should connect to "dc". */
     DEFINE_PROP_INT32("dc-gpio", Esp32s3GpspiState, dc_gpio, -1),
     DEFINE_PROP_STRING("cs-gpios", Esp32s3GpspiState, cs_gpios),
+    /* Lines whose device wants the command and address phases: bit controller*8+line. */
+    DEFINE_PROP_UINT32("vpb-framed-cs", Esp32s3GpspiState, vpb_framed_cs, 0),
     DEFINE_PROP_END_OF_LIST(),
 };
 

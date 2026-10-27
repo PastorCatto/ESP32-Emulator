@@ -1,0 +1,183 @@
+# T-Deck Plus, VM flavor: a W5500 Ethernet controller instead of Wi-Fi.
+#
+# Everything else is the T-Deck Plus. The LoRa module's chip-select slot
+# (GPIO 9) carries the W5500, which is what PURR OS's VM build is configured
+# for (PURR_ETH_CS_GPIO). Frames reach QEMU's user-mode network over UDP.
+#
+# Derived from t-deck-plus.toml; the pin facts below are that board's.
+#
+# Pin assignments verified against LilyGO's own `utilities.h`:
+# https://github.com/Xinyuan-LilyGO/T-Deck/blob/master/examples/UnitTest/utilities.h
+#
+# One caveat: `utilities.h` names the trackball lines TBOX_G01..G04 without
+# saying which is which direction, and reuses GPIO0 (the boot strap pin) for
+# the click. The direction mapping below follows Meshtastic's T-Deck port and
+# is the only thing here not confirmed by a primary source.
+
+[board]
+id = "t-deck-plus-vm"
+name = "T-Deck Plus VM (wired Ethernet, no radios)"
+chip = "esp32s3"
+flash_size = "16MB"
+
+[board.psram]
+kind = "octal"
+size = "8MB"
+
+# The T-Deck hangs display, SD, and LoRa off one shared SPI bus, distinguished
+# only by chip select. Getting CS routing right is what makes the bus work.
+[[bus]]
+id = "fspi"
+kind = "spi"
+controller = 2          # SPI2 / FSPI
+sck = 40
+mosi = 41
+miso = 38
+
+# The virtual Ethernet controller gets a bus of its own. Sharing the display's
+# bus is what the real T-Deck does for its LoRa module, but the emulated SPI
+# controller loses a completion interrupt when a polling device and the
+# display's queued transfers interleave, and the guest then stalls (plan4.md).
+# The guest learns about this bus from the vm-info device below.
+[[bus]]
+id = "spi3"
+kind = "spi"
+controller = 3          # SPI3 / HSPI
+sck = 47
+mosi = 48
+miso = 21
+
+[[bus]]
+id = "i2c0"
+kind = "i2c"
+controller = 0
+# The panel and keyboard hang off these pins, and the GPIO matrix lets either
+# I2C peripheral drive them. PURR OS opens I2C0; the Arduino Launcher opens
+# I2C1. Both are correct on hardware, so answer on both here.
+controllers = [0, 1]
+sda = 18
+scl = 8
+
+[[bus]]
+id = "gps_uart"
+kind = "uart"
+controller = 1
+tx = 43
+rx = 44
+
+[[peripheral]]
+kind = "st7789"
+label = "2.8in LCD"
+bus = "fspi"
+cs = 12
+# The controller's CS line, not the GPIO. ESP-IDF allocates these at runtime
+# through the GPIO matrix, so they are not derivable from the schematic --
+# these come from a bus trace of the real driver.
+cs_line = 0
+dc = 11
+backlight = 42
+width = 320
+height = 240
+# ST7789 silicon has a 240x320 frame buffer; the T-Deck mounts it sideways.
+rotation = 90
+# How the glass is wired, not what a driver writes to MADCTL. This panel is
+# wired BGR, which is why PURR OS sets MADCTL's BGR bit for it ("without this
+# red and blue are swapped") and why its boot menu's orange is orange.
+color_order = "bgr"
+invert = true
+
+[[peripheral]]
+kind = "gt911"
+label = "capacitive touch"
+bus = "i2c0"
+address = 0x5d
+alt_address = 0x14
+irq = 16
+# What the chip advertises at X_RESOLUTION.
+width = 320
+height = 240
+# What its point registers actually report, which is not the same thing. The
+# glass is mounted a quarter turn from the display, and the raw fields span
+# 0..=311 by 0..=235 rather than the display's 320x240 -- measured on a real
+# T-Deck, and the numbers PURR OS's own driver divides by. Emitting display
+# coordinates here instead swaps the axes and flips Y, which leaves the centre
+# of the screen roughly correct and everywhere else wrong.
+point_width = 312
+point_height = 236
+rotation = 270
+
+[[peripheral]]
+kind = "tdeck-keyboard"
+label = "BlackBerry QWERTY (ESP32-C3 co-processor)"
+bus = "i2c0"
+address = 0x55
+irq = 46
+
+# The trackball is wired as four plain GPIO quadrature lines plus a click,
+# not as a bus device.
+[[peripheral]]
+kind = "trackball"
+label = "trackball"
+up = 3
+down = 15
+left = 1
+right = 2
+click = 0
+
+[[peripheral]]
+kind = "sdcard"
+label = "microSD"
+bus = "fspi"
+cs = 39
+cs_line = 5
+
+# Tells the guest it is in a VM, and where the Ethernet controller is.
+[[peripheral]]
+kind = "vm-info"
+label = "VM info"
+bus = "i2c0"
+address = 0x6e
+nic_host = 3
+nic_sclk = 47
+nic_mosi = 48
+nic_miso = 21
+nic_cs = 9
+
+[[peripheral]]
+kind = "w5500"
+label = "W5500 Ethernet"
+bus = "spi3"
+cs = 9
+# The only device on SPI3, so the driver gives it the controller's first line.
+cs_line = 0
+# The chip's 16-bit address and control byte are clocked in the controller's
+# command and address phases, so the model needs them forwarded.
+framed = true
+
+[[peripheral]]
+kind = "gnss"
+label = "MIA-M10Q GPS"
+bus = "gps_uart"
+baud = 38400
+
+[[peripheral]]
+kind = "es7210"
+label = "microphone array"
+bus = "i2s"
+mclk = 48
+lrck = 21
+sck = 47
+din = 14
+
+[[peripheral]]
+kind = "power-hold"
+label = "peripheral power rail"
+gpio = 10
+active_high = true
+
+# Emulation status, surfaced in the UI so the state of each device is honest
+# rather than silently missing.
+[support]
+implemented = []
+planned = ["st7789", "gt911", "tdeck-keyboard", "sdcard", "trackball"]
+stubbed = ["gnss", "es7210", "power-hold"]

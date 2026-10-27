@@ -498,6 +498,25 @@ impl Board {
         out
     }
 
+    /// SPI chip-select lines whose device wants the controller's command and
+    /// address phases forwarded to it (`framed = true` in the board file), as
+    /// `(controller, line)`: each SPI controller numbers its lines from zero.
+    ///
+    /// A W5500 clocks its 16-bit register address and control byte in those
+    /// phases, so without them it cannot tell what a transfer is for. Most
+    /// devices put everything in the data phase and are left as they were.
+    pub fn spi_framed_lines(&self) -> Vec<(u8, u8)> {
+        let mut out: Vec<(u8, u8)> = Vec::new();
+        for p in self.peripherals.iter().filter(|p| p.enabled) {
+            let Ok(Some(Claim::Spi { controller, cs })) = p.claim() else { continue };
+            if p.params.bool_or("framed", false).unwrap_or(false) && !out.contains(&(controller, cs)) {
+                out.push((controller, cs));
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
     /// The pins of the display, for firmware that clocks it by hand.
     ///
     /// A bootloader cannot assume any SPI controller is set up, so PURR OS's
@@ -572,6 +591,7 @@ mod tests {
     use super::*;
 
     const T_DECK: &str = include_str!("../../../boards/t-deck-plus.toml");
+    const T_DECK_VM: &str = include_str!("../../../boards/t-deck-plus-vm.toml");
     const GENERIC: &str = include_str!("../../../boards/generic-esp32s3.toml");
     const CYD: &str = include_str!("../../../boards/cyd-esp32-2432s028r.toml");
     const CYD_S024C: &str = include_str!("../../../boards/cyd-s024c.toml");
@@ -738,6 +758,13 @@ mod tests {
     }
 
     #[test]
+    fn the_vm_board_marks_its_ethernet_chip_as_framed() {
+        let b = Board::from_toml(T_DECK_VM).unwrap();
+        assert_eq!(b.spi_framed_lines(), vec![(3, 0)]);
+        assert!(Board::from_toml(T_DECK).unwrap().spi_framed_lines().is_empty());
+    }
+
+    #[test]
     fn a_board_without_psram_asks_qemu_for_none() {
         let b = Board::from_toml(GENERIC).unwrap();
         assert_eq!(b.qemu_psram(), None);
@@ -748,6 +775,7 @@ mod tests {
         // Board files are data, and data with no test is data that rots.
         for (name, src) in [
             ("t-deck-plus", T_DECK),
+            ("t-deck-plus-vm", T_DECK_VM),
             ("generic-esp32s3", GENERIC),
             ("cyd-esp32-2432s028r", CYD),
             ("cyd-s024c", CYD_S024C),

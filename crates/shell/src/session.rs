@@ -403,6 +403,8 @@ impl Session {
         config.vpb_port = Some(hardware.port);
         config.display_dc_gpio = self.board.display_dc_gpio();
         config.spi_cs_gpios = self.board.spi_cs_gpios();
+        config.spi_framed_cs = self.board.spi_framed_lines();
+        config.net_bridge = hardware.net;
         config.gpio_spi = self.board.bitbang_spi().map(|p| qemuctl::GpioSpi {
             sclk: p.sclk,
             mosi: p.mosi,
@@ -417,6 +419,15 @@ impl Session {
             controller: p.controller,
         });
         config.serial_count = SerialBuffer::PORTS;
+
+        // ESP32_EFUSE=path backs the eFuses with a file, so burns persist
+        // between runs. A missing file is created blank (nothing burned).
+        if let Some(path) = std::env::var_os("ESP32_EFUSE").map(PathBuf::from) {
+            if !path.exists() {
+                std::fs::write(&path, vec![0u8; qemuctl::EFUSE_IMAGE_LEN])?;
+            }
+            config.efuse_image = Some(path);
+        }
 
         // Extra QEMU flags, whitespace separated. Exists so a boot can be
         // traced without leaving the window -- `-d unimp -D some\file.log`
