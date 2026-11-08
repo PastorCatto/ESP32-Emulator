@@ -27,3 +27,6 @@ Thumbs.db
 esp32-emulator-9d1b10e.exe
 esp32-emulator-7ff8ee3.exe
 dist/
+
+# Coordination notes between working sessions; not part of the project.
+/OS handoff.md
