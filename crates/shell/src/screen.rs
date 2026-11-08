@@ -49,9 +49,33 @@ impl Snapshot {
     }
 }
 
+/// How the panel is scaled to the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScaleMode {
+    /// Whole-number factors wherever they fit, nearest-neighbour sampling.
+    /// Keeps pixel art sharp, at the cost of black borders between factors.
+    #[default]
+    Crisp,
+    /// Any factor, linear sampling. Always fills the window, a little soft.
+    Smooth,
+}
+
+impl ScaleMode {
+    fn options(self) -> TextureOptions {
+        match self {
+            ScaleMode::Crisp => TextureOptions::NEAREST,
+            ScaleMode::Smooth => TextureOptions::LINEAR,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct ScreenView {
     texture: Option<TextureHandle>,
+    pub mode: ScaleMode,
+    /// The mode the uploaded texture was made for. The filter is a property
+    /// of the texture, so changing mode has to upload again.
+    shown_mode: ScaleMode,
     /// Write counter of the frame currently uploaded.
     shown: u64,
     /// Size of the uploaded frame, so a board change forces a new texture.
@@ -75,7 +99,10 @@ impl ScreenView {
         // Whole-number scaling wherever it fits: these are small panels shown
         // large, and a fractional factor turns crisp pixel art into mush.
         let fit = (available.x / f32::from(w)).min(available.y / f32::from(h));
-        let scale = if fit >= 1.0 { fit.floor() } else { fit };
+        let scale = match self.mode {
+            ScaleMode::Crisp if fit >= 1.0 => fit.floor(),
+            _ => fit,
+        };
         let size = egui::vec2(f32::from(w) * scale, f32::from(h) * scale);
 
         // Centred by hand, and allocated before painting, for two reasons.
@@ -94,8 +121,7 @@ impl ScreenView {
         let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
         egui::Image::new(texture)
-            // Nearest, for the same reason as the integer scale.
-            .texture_options(TextureOptions::NEAREST)
+            .texture_options(self.mode.options())
             .paint_at(ui, rect);
 
         response
@@ -124,8 +150,10 @@ impl ScreenView {
             };
 
             let size = (guard.width, guard.height);
-            let unchanged =
-                self.texture.is_some() && self.shown == guard.generation && self.size == size;
+            let unchanged = self.texture.is_some()
+                && self.shown == guard.generation
+                && self.size == size
+                && self.shown_mode == self.mode;
             if unchanged {
                 return;
             }
@@ -154,13 +182,15 @@ impl ScreenView {
         };
         self.shown = snapshot.generation;
         self.size = snapshot.size;
+        self.shown_mode = self.mode;
+        let options = self.mode.options();
 
         match &mut self.texture {
             Some(texture) if texture.size() == dims => {
-                texture.set(image, TextureOptions::NEAREST);
+                texture.set(image, options);
             }
             slot => {
-                *slot = Some(ctx.load_texture("panel", image, TextureOptions::NEAREST));
+                *slot = Some(ctx.load_texture("panel", image, options));
             }
         }
     }

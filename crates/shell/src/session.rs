@@ -62,6 +62,8 @@ pub enum SessionError {
     Unrecognised(PathBuf),
     /// A bare app image arrived with no bootloader to pair it with.
     NeedsBootloader,
+    /// A custom flash image that cannot be placed as asked.
+    BadImage(String),
 }
 
 impl std::fmt::Display for SessionError {
@@ -83,6 +85,7 @@ impl std::fmt::Display for SessionError {
                 "this is a bare app image with no bootloader. Drop a merged image \
                  (esptool merge_bin) instead, or the project's .factory.bin"
             ),
+            SessionError::BadImage(why) => write!(f, "{why}"),
         }
     }
 }
@@ -118,6 +121,19 @@ pub struct LoadedFirmware {
     /// Digest of the ELF this image was built from, as recorded by the build.
     /// `None` when the descriptor left it zeroed, which some builds do.
     pub elf_sha256: Option<[u8; 32]>,
+}
+
+/// A raw image written into flash at a fixed offset when the machine boots.
+///
+/// This is `esptool write_flash <offset> <file>` without the serial port. It is
+/// what lets the emulator run something that is not a merged image: a
+/// bootloader, a partition table and an app laid out by hand, or someone
+/// else's firmware.
+#[derive(Debug, Clone)]
+pub struct ExtraImage {
+    pub path: PathBuf,
+    pub offset: u32,
+    pub size: usize,
 }
 
 /// A symbol table for the firmware, loaded from its `.elf`.
@@ -185,6 +201,11 @@ pub struct Session {
     /// Worth surfacing: an empty volume is not the assets the firmware shipped
     /// with, so a missing file later on traces back to here.
     pub storage: Vec<flashimg::provision::Action>,
+    /// Images laid over the flash at boot, sorted by offset. Kept apart from
+    /// the assembled image so removing one puts the original bytes back.
+    pub extra_images: Vec<ExtraImage>,
+    /// Where the assembled flash and any boot-time copy of it are written.
+    pub run_dir: PathBuf,
     /// Every serial byte, teed to a file when ESP32_SERIAL_LOG is set. Reopened
     /// per boot so a run is measurable on its own.
     serial_log: Option<std::fs::File>,
@@ -204,6 +225,8 @@ impl Session {
             symbols: None,
             patches: Vec::new(),
             storage: Vec::new(),
+            extra_images: Vec::new(),
+            run_dir: PathBuf::from("run"),
             serial_log: None,
             hardware: None,
         }
@@ -380,15 +403,98 @@ impl Session {
         Ok(n)
     }
 
+    /// Is there anything to boot: an assembled firmware, or custom images?
+    pub fn can_boot(&self) -> bool {
+        self.flash_path.is_some() || !self.extra_images.is_empty()
+    }
+
+    /// Place a raw image at a flash offset.
+    ///
+    /// Refuses an overlap rather than letting the later write silently win:
+    /// two images on the same sectors is nearly always a mistyped offset.
+    pub fn add_image(&mut self, path: &Path, offset: u32) -> Result<(), SessionError> {
+        let size = std::fs::metadata(path)?.len() as usize;
+        if size == 0 {
+            return Err(SessionError::BadImage(format!("{} is empty", path.display())));
+        }
+        let end = offset as usize + size;
+        // Flash is addressed in 4 KiB sectors; an unaligned start is erased
+        // from the sector below on hardware, so say so instead of guessing.
+        if offset % 0x1000 != 0 {
+            return Err(SessionError::BadImage(format!(
+                "offset {offset:#x} is not on a 4 KiB boundary"
+            )));
+        }
+        if end > 256 * 1024 * 1024 {
+            return Err(SessionError::BadImage(format!(
+                "{:#x}..{end:#x} is past anything a flash chip holds",
+                offset
+            )));
+        }
+        if let Some(other) = self.extra_images.iter().find(|i| {
+            offset < (i.offset as usize + i.size) as u32 && i.offset < end as u32
+        }) {
+            return Err(SessionError::BadImage(format!(
+                "overlaps {} at {:#x}",
+                other.path.display(),
+                other.offset
+            )));
+        }
+        self.extra_images.push(ExtraImage { path: path.to_path_buf(), offset, size });
+        self.extra_images.sort_by_key(|i| i.offset);
+        Ok(())
+    }
+
+    pub fn remove_image(&mut self, index: usize) {
+        if index < self.extra_images.len() {
+            self.extra_images.remove(index);
+        }
+    }
+
+    /// The chip to run and the flash file to hand it.
+    ///
+    /// With no custom images this is the assembled image as it stands, patches
+    /// included. With some, it is a copy with the images laid over it -- over
+    /// blank flash when nothing was dropped, which is what makes the
+    /// emulator usable on its own. The copy keeps `flash.bin` untouched, so a
+    /// removed image does not leave its bytes behind.
+    fn boot_flash(&self) -> Result<(Chip, PathBuf), SessionError> {
+        let chip = self.firmware.as_ref().map_or(self.board.chip, |f| f.chip);
+        if self.extra_images.is_empty() {
+            return match &self.flash_path {
+                Some(p) => Ok((chip, p.clone())),
+                None => Err(SessionError::BadImage("nothing to boot".into())),
+            };
+        }
+
+        let mut bytes = match &self.flash_path {
+            Some(p) => std::fs::read(p)?,
+            None => vec![0xff; self.board.flash_size.bytes() as usize],
+        };
+        for image in &self.extra_images {
+            let data = std::fs::read(&image.path)?;
+            let end = image.offset as usize + data.len();
+            if end > bytes.len() {
+                // QEMU wants a power-of-two flash; grow with erased bytes.
+                bytes.resize(end.next_power_of_two(), 0xff);
+            }
+            bytes[image.offset as usize..end].copy_from_slice(&data);
+        }
+        std::fs::create_dir_all(&self.run_dir)?;
+        let path = self.run_dir.join("flash-custom.bin");
+        std::fs::write(&path, &bytes)?;
+        Ok((chip, path))
+    }
+
     /// Start the machine. Replaces any currently running one.
     pub fn boot(&mut self) -> Result<(), SessionError> {
-        // Copy what we need before stopping, which needs &mut self.
-        let (Some(chip), Some(flash)) = (
-            self.firmware.as_ref().map(|f| f.chip),
-            self.flash_path.clone(),
-        ) else {
+        if !self.can_boot() {
             return Ok(());
-        };
+        }
+        let (chip, flash) = self.boot_flash()?;
+        if chip.qemu_machine().is_none() {
+            return Err(SessionError::UnsupportedChip(chip));
+        }
         self.stop();
         self.serial.clear();
         self.open_serial_log();
@@ -809,5 +915,89 @@ mod tests {
         }
         assert!(b.trimmed > 0, "buffer should have been trimmed");
         assert!(b.text().len() <= SerialBuffer::LIMIT);
+    }
+
+    /// A scratch directory of our own, so tests never touch `run/`.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("esp32-shell-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn blank_session(dir: &Path) -> Session {
+        let mut s = Session::new(Board::from_toml(include_str!("../../../boards/generic-esp32s3.toml")).unwrap());
+        s.run_dir = dir.to_path_buf();
+        s
+    }
+
+    #[test]
+    fn images_that_overlap_or_start_off_a_sector_are_refused() {
+        let dir = scratch("overlap");
+        std::fs::write(dir.join("a.bin"), vec![1u8; 0x2000]).unwrap();
+        std::fs::write(dir.join("b.bin"), vec![2u8; 0x100]).unwrap();
+        let mut s = blank_session(&dir);
+
+        s.add_image(&dir.join("a.bin"), 0x10000).unwrap();
+        assert!(s.add_image(&dir.join("b.bin"), 0x11000).is_err(), "inside a.bin");
+        assert!(s.add_image(&dir.join("b.bin"), 0x10800).is_err(), "not on a 4 KiB boundary");
+        s.add_image(&dir.join("b.bin"), 0x12000).unwrap();
+
+        let offsets: Vec<u32> = s.extra_images.iter().map(|i| i.offset).collect();
+        assert_eq!(offsets, [0x10000, 0x12000], "kept in offset order");
+    }
+
+    #[test]
+    fn custom_images_boot_from_blank_flash_without_a_firmware() {
+        let dir = scratch("standalone");
+        std::fs::write(dir.join("boot.bin"), [0xe9u8, 1, 2, 3]).unwrap();
+        let mut s = blank_session(&dir);
+        assert!(!s.can_boot());
+
+        s.add_image(&dir.join("boot.bin"), 0x0).unwrap();
+        assert!(s.can_boot());
+        let (chip, path) = s.boot_flash().unwrap();
+        assert_eq!(chip, s.board.chip);
+
+        let flash = std::fs::read(path).unwrap();
+        assert_eq!(flash.len(), s.board.flash_size.bytes() as usize);
+        assert_eq!(&flash[..4], &[0xe9, 1, 2, 3]);
+        assert!(flash[4..].iter().all(|&b| b == 0xff), "the rest stays erased");
+    }
+
+    #[test]
+    fn removing_an_image_puts_the_assembled_flash_back_untouched() {
+        let dir = scratch("remove");
+        let flash_path = dir.join("flash.bin");
+        std::fs::write(&flash_path, vec![0xaau8; 0x4000]).unwrap();
+        std::fs::write(dir.join("patch.bin"), [0x55u8; 16]).unwrap();
+        let mut s = blank_session(&dir);
+        s.flash_path = Some(flash_path.clone());
+
+        s.add_image(&dir.join("patch.bin"), 0x1000).unwrap();
+        let (_, laid) = s.boot_flash().unwrap();
+        let laid = std::fs::read(laid).unwrap();
+        assert_eq!(&laid[0x1000..0x1010], &[0x55; 16]);
+        assert_eq!(laid[0xfff], 0xaa);
+        assert_eq!(std::fs::read(&flash_path).unwrap(), vec![0xaau8; 0x4000], "flash.bin itself is not rewritten");
+
+        s.remove_image(0);
+        let (_, path) = s.boot_flash().unwrap();
+        assert_eq!(path, flash_path, "with no images the assembled flash is used directly");
+    }
+
+    #[test]
+    fn an_image_past_the_end_grows_flash_to_a_power_of_two() {
+        let dir = scratch("grow");
+        std::fs::write(dir.join("big.bin"), vec![7u8; 0x1000]).unwrap();
+        let mut s = blank_session(&dir);
+        let size = s.board.flash_size.bytes();
+
+        s.add_image(&dir.join("big.bin"), size).unwrap();
+        let (_, path) = s.boot_flash().unwrap();
+        let flash = std::fs::read(path).unwrap();
+        assert!(flash.len().is_power_of_two());
+        assert_eq!(flash.len(), (size as usize + 0x1000).next_power_of_two());
+        assert_eq!(flash[size as usize], 7);
     }
 }

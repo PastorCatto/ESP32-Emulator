@@ -7,6 +7,7 @@
 mod app;
 mod dump;
 mod hardware;
+mod metro;
 mod screen;
 mod terminal;
 mod session;
@@ -18,12 +19,20 @@ mod session;
 /// that wants to reproduce a run.
 ///
 /// Usage: esp32-emulator [firmware.bin] [card.img] [board.toml] [--run] [--bypass]
+///                       [--accent RRGGBB]
 fn main() -> eframe::Result<()> {
     let mut paths = Vec::new();
     let mut autostart = false;
     let mut bypass = false;
-    for arg in std::env::args().skip(1) {
+    // The SDK's theme colour, so the emulator can match the rest of the tools.
+    let mut accent = std::env::var("ESP32_ACCENT").ok().and_then(|v| metro::parse_accent(&v));
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--accent" => match args.next().as_deref().and_then(metro::parse_accent) {
+                Some(colour) => accent = Some(colour),
+                None => eprintln!("--accent wants a colour like 1ba1e2"),
+            },
             "--run" => autostart = true,
             // What the "Bypass + boot" button does, so a scripted run and a
             // clicked one exercise the same path.
@@ -37,8 +46,8 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 720.0])
-            .with_min_inner_size([720.0, 480.0])
+            .with_inner_size([680.0, 580.0])
+            .with_min_inner_size([360.0, 300.0])
             .with_title("ESP32 Emulator"),
         ..Default::default()
     };
@@ -46,6 +55,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "ESP32 Emulator",
         options,
-        Box::new(move |cc| Ok(Box::new(app::App::with_files(cc, &paths, autostart, bypass)))),
+        Box::new(move |cc| Ok(Box::new(app::App::with_files(cc, &paths, autostart, bypass, accent)))),
     )
 }

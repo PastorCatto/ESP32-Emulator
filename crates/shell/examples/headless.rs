@@ -109,6 +109,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(3);
     let mut serial_sent = 0usize;
 
+    // HEADLESS_SHOTS=20,40 writes a screenshot at each of those seconds, next to the final one
+    // (<out>-20.png, <out>-40.png), so a run can show a screen changing over time.
+    let mut shots: Vec<u64> = std::env::var("HEADLESS_SHOTS")
+        .map(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect())
+        .unwrap_or_default();
+    shots.sort_unstable();
+    let mut next_shot = 0usize;
+
     while std::time::Instant::now() < deadline {
         sess.pump();
         if let (Some(ch), false) = (key, key_sent) {
@@ -132,6 +140,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             sess.send_serial(serial_port, &serial_lines[serial_sent]);
             serial_sent += 1;
+        }
+        while next_shot < shots.len() && started.elapsed() >= Duration::from_secs(shots[next_shot]) {
+            if let Some(screen) = sess.screen() {
+                let s = screen.lock().expect("screen");
+                let png = devices::png::encode_rgb(s.width.into(), s.height.into(), &s.rgb888());
+                let stem = out.trim_end_matches(".png");
+                let _ = std::fs::write(format!("{stem}-{}.png", shots[next_shot]), png);
+            }
+            next_shot += 1;
         }
         // The channel is unbounded and a traced boot fills it fast, so this
         // has to drain whether or not anything is printed.

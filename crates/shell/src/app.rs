@@ -1,7 +1,8 @@
 //! The emulator window.
 
+use crate::metro::{self, Icon};
+use crate::screen::{ScaleMode, ScreenView};
 use crate::session::{classify, DropKind, Session, SessionError};
-use crate::screen::ScreenView;
 use crate::terminal::Terminal;
 use boards::Board;
 use egui::{Color32, RichText};
@@ -33,8 +34,28 @@ struct Note {
     error: bool,
 }
 
+/// The headings of the log window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogTab {
+    Log,
+    Serial,
+    Images,
+}
+
 pub struct App {
     session: Session,
+    accent: Color32,
+    /// The application bar is showing labels and the `···` menu.
+    bar_open: bool,
+    /// Measured each frame, so the menu can sit exactly above the bar.
+    bar_height: f32,
+    log_open: bool,
+    log_tab: LogTab,
+    /// The add-an-image form on the firmware images tab.
+    image_path: String,
+    image_offset: String,
+    /// The title last sent to the window, so it is only sent when it changes.
+    shown_title: String,
     /// Board definitions available to pick from, including any dropped in.
     boards: Vec<Board>,
     selected_board: usize,
@@ -59,7 +80,7 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        metro::apply(&cc.egui_ctx, metro::CYAN);
 
         let mut boards = Vec::new();
         for &(name, src) in BUILTIN_BOARDS {
@@ -76,8 +97,20 @@ impl App {
             .unwrap_or_else(|| Board::from_toml(GENERIC).expect("generic board must parse"));
         let device_enabled = board.peripherals.iter().map(|p| p.enabled).collect();
 
+        let run_dir = std::env::current_dir().unwrap_or_default().join("run");
+        let mut session = Session::new(board);
+        session.run_dir = run_dir.clone();
+
         App {
-            session: Session::new(board),
+            session,
+            accent: metro::CYAN,
+            bar_open: false,
+            bar_height: 62.0,
+            log_open: false,
+            log_tab: LogTab::Log,
+            image_path: String::new(),
+            image_offset: String::new(),
+            shown_title: String::new(),
             boards,
             selected_board: 0,
             notes: vec![Note {
@@ -86,7 +119,7 @@ impl App {
             }],
             trace: TraceConfig::default(),
             device_enabled,
-            run_dir: std::env::current_dir().unwrap_or_default().join("run"),
+            run_dir,
             autoscroll: true,
             terminal: Terminal::default(),
             screen_view: ScreenView::default(),
@@ -110,8 +143,13 @@ impl App {
         paths: &[PathBuf],
         autostart: bool,
         bypass: bool,
+        accent: Option<Color32>,
     ) -> Self {
         let mut app = App::new(cc);
+        if let Some(accent) = accent {
+            app.accent = accent;
+            metro::apply(&cc.egui_ctx, accent);
+        }
 
         let is_board = |p: &PathBuf| {
             matches!(classify(p, &read_head(p, 64)), DropKind::BoardDefinition)
@@ -126,7 +164,7 @@ impl App {
         if bypass && app.session.can_patch() {
             app.patch_radio();
         }
-        if autostart && app.session.firmware.is_some() {
+        if autostart && app.session.can_boot() {
             app.boot();
         }
         app
@@ -399,374 +437,302 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(delay));
         }
 
-        self.top_bar(ui, running);
-        self.status_bar(ui);
-        self.side_panel(ui);
-        self.display_panel(ui);
+        self.update_title(&ctx, running);
+        self.app_bar(ui, running);
+        self.docked_terminal(ui);
+        self.stage(ui, running);
         self.mimic_keyboard(&ctx);
-        self.serial_console(ui);
         self.draw_drop_overlay(&ctx);
 
-        // The detached terminal is its own OS window.
+        // The detached terminal and the log are their own OS windows.
         self.terminal.show(&ctx, &mut self.session);
+        self.log_window(&ctx);
     }
 }
 // QEMU is shut down when the App drops, via Instance's Drop impl.
 
 impl App {
-    fn top_bar(&mut self, ui: &mut egui::Ui, running: bool) {
-        egui::Panel::top("top").show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                let names: Vec<String> = self.boards.iter().map(|b| b.name.clone()).collect();
-                let mut pick = self.selected_board;
-                egui::ComboBox::from_id_salt("board")
-                    .selected_text(
-                        names
-                            .get(self.selected_board)
-                            .cloned()
-                            .unwrap_or_else(|| "—".into()),
-                    )
-                    .show_ui(ui, |ui| {
-                        for (i, n) in names.iter().enumerate() {
-                            ui.selectable_value(&mut pick, i, n);
-                        }
-                    });
-                if pick != self.selected_board {
-                    self.select_board(pick);
-                }
+    /// The window title carries the state, so it shows in a taskbar too.
+    fn update_title(&mut self, ctx: &egui::Context, running: bool) {
+        let state = if running {
+            "running"
+        } else if self.session.can_boot() {
+            "ready"
+        } else {
+            "no firmware"
+        };
+        let title = format!("ESP32 Emulator — {} · {state}", self.session.board.name);
+        if title != self.shown_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.shown_title = title;
+        }
+    }
 
-                ui.separator();
+    /// The application bar along the bottom: the four things you do all the
+    /// time, and `···` for everything else.
+    fn app_bar(&mut self, ui: &mut egui::Ui, running: bool) {
+        let accent = self.accent;
+        let can_boot = self.session.can_boot();
+        let labels = self.bar_open;
 
-                let have_fw = self.session.firmware.is_some();
-                if ui
-                    .add_enabled(have_fw && !running, egui::Button::new("▶ Boot"))
-                    .clicked()
-                {
-                    self.boot();
-                }
-                if ui.add_enabled(running, egui::Button::new("⟳ Reset")).clicked() {
-                    self.boot();
-                }
-                if ui.add_enabled(running, egui::Button::new("■ Stop")).clicked() {
-                    self.session.stop();
-                    self.note("Stopped");
-                }
-
-                ui.separator();
-
-                // Patching and booting are separate buttons as well as a
-                // combined one, so the one-shot path is convenient without
-                // making the two-step path harder to reach.
-                let can_patch = self.session.can_patch();
-                let patched = !self.session.patches.is_empty();
-                let patch_hint = if patched {
-                    "Already patched; reload the firmware to start over"
-                } else if self.session.symbols.is_none() {
-                    "Drop the firmware's .elf first — patches are located by symbol"
-                } else if !have_fw {
-                    "Load firmware first"
-                } else {
-                    "Replace the radio entry points so the boot completes"
-                };
-                if ui
-                    .add_enabled(can_patch, egui::Button::new("Bypass radio"))
-                    .on_hover_text(patch_hint)
-                    .on_disabled_hover_text(patch_hint)
-                    .clicked()
-                {
-                    self.patch_radio();
-                }
-                if ui
-                    .add_enabled(can_patch && !running, egui::Button::new("Bypass + boot"))
-                    .on_hover_text("Patch, then start")
-                    .clicked()
-                {
-                    self.patch_radio();
-                    if !self.session.patches.is_empty() {
+        let bar = egui::Panel::bottom("appbar")
+            .frame(
+                egui::Frame::NONE
+                    .fill(metro::BAR)
+                    .inner_margin(egui::Margin::symmetric(10, 6)),
+            )
+            .show_separator_line(false)
+            .resizable(false)
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    if metro::bar_button(ui, Icon::Play, "boot", can_boot && !running, labels, accent)
+                        .clicked()
+                    {
                         self.boot();
                     }
-                }
-                if patched {
-                    ui.label(
-                        RichText::new(format!("⚑ {} patched", self.session.patches.len()))
-                            .small()
-                            .color(Color32::from_rgb(230, 180, 100)),
-                    )
-                    .on_hover_text(
-                        "This image no longer runs the code hardware would run",
-                    );
-                }
-
-                ui.separator();
-                // The serial backdoor: a real terminal in its own window, for
-                // driving a firmware shell rather than just watching a boot.
-                let label = if self.terminal.open {
-                    "Serial terminal ✓"
-                } else {
-                    "Serial terminal"
-                };
-                if ui
-                    .button(label)
-                    .on_hover_text("Open a detached serial terminal window")
-                    .clicked()
-                {
-                    self.terminal.open = !self.terminal.open;
-                }
-
-                ui.separator();
-                if running {
-                    ui.colored_label(Color32::from_rgb(120, 220, 120), "● running");
-                } else if have_fw {
-                    ui.colored_label(Color32::GRAY, "○ ready");
-                } else {
-                    ui.colored_label(Color32::GRAY, "○ no firmware");
-                }
-            });
-        });
-    }
-
-    fn side_panel(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::left("side").default_size(290.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.heading("Firmware");
-                match &self.session.firmware {
-                    None => {
-                        ui.label(RichText::new("Nothing loaded").italics().weak());
+                    if metro::bar_button(ui, Icon::Reset, "reset", running, labels, accent).clicked() {
+                        self.boot();
                     }
-                    Some(fw) => {
-                        egui::Grid::new("fw").num_columns(2).striped(true).show(ui, |ui| {
-                            let mut row = |k: &str, v: String| {
-                                ui.label(RichText::new(k).weak());
-                                ui.label(v);
-                                ui.end_row();
-                            };
-                            row("File", name_of(&fw.path));
-                            row("Chip", fw.chip.to_string());
-                            row("Kind", fw.kind.to_string());
-                            if let Some(p) = &fw.project {
-                                row("Project", p.clone());
-                            }
-                            if let Some(v) = &fw.version {
-                                row("Version", v.clone());
-                            }
-                            if let Some(v) = &fw.idf_version {
-                                row("IDF", v.clone());
-                            }
-                            row("Size", format!("{:.1} KiB", fw.size as f32 / 1024.0));
-                        });
+                    if metro::bar_button(ui, Icon::Stop, "stop", running, labels, accent).clicked() {
+                        self.session.stop();
+                        self.note("Stopped");
                     }
-                }
-
-                ui.add_space(12.0);
-                ui.heading("Patches");
-                match &self.session.symbols {
-                    Some(s) => {
-                        ui.label(
-                            RichText::new(format!(
-                                "symbols: {} ({})",
-                                name_of(&s.path),
-                                s.count
-                            ))
-                            .small()
-                            .weak(),
-                        );
-                        // Say which build these came from when it is not this
-                        // one. Greying the button out without a reason sends
-                        // people looking for the wrong problem.
-                        match self.session.symbol_match() {
-                            crate::session::SymbolMatch::Mismatch => {
-                                ui.colored_label(
-                                    Color32::from_rgb(235, 130, 120),
-                                    RichText::new(
-                                        "these symbols are from a different build — \
-                                         drop this image's own .elf",
-                                    )
-                                    .small(),
-                                );
-                            }
-                            crate::session::SymbolMatch::Unverifiable => {
-                                ui.label(
-                                    RichText::new(
-                                        "image records no ELF digest, so the pair \
-                                         cannot be checked",
-                                    )
-                                    .small()
-                                    .weak(),
-                                );
-                            }
-                            _ => {}
+                    if metro::bar_button(ui, Icon::Log, "log", true, labels, accent).clicked() {
+                        self.log_open = !self.log_open;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                        if metro::dots_button(ui, accent).clicked() {
+                            self.bar_open = !self.bar_open;
                         }
-                    }
-                    None => {
-                        ui.label(
-                            RichText::new(
-                                "No .elf: patching falls back to byte signatures. \
-                                 Drop the matching .elf for exact addresses.",
-                            )
-                            .small()
-                            .weak(),
-                        );
-                    }
-                }
-                if self.session.patches.is_empty() {
-                    ui.label(RichText::new("none applied").small().weak());
-                } else {
-                    ui.colored_label(
-                        Color32::from_rgb(230, 180, 100),
-                        RichText::new("not what hardware would run").small(),
-                    );
-                    for p in &self.session.patches {
-                        ui.label(
-                            RichText::new(format!("{} @ {:#010x}", p.symbol, p.address))
-                                .small()
-                                .monospace(),
-                        );
-                    }
-                }
-
-                ui.add_space(12.0);
-                ui.heading("Devices");
-                if self.session.board.peripherals.is_empty() {
-                    ui.label(RichText::new("This board declares no peripherals.").italics().weak());
-                }
-                // Which of these are real is only known once a bus is running,
-                // because it depends on what models this build carries and on
-                // whether an SD image was supplied. Before that, say nothing
-                // rather than guess.
-                let attached: Vec<&str> = self
-                    .session
-                    .hardware
-                    .as_ref()
-                    .map(|h| h.attached.iter().map(String::as_str).collect())
-                    .unwrap_or_default();
-                let running = self.session.hardware.is_some();
-
-                for (i, p) in self.session.board.peripherals.iter().enumerate() {
-                    if let Some(on) = self.device_enabled.get_mut(i) {
-                        ui.horizontal(|ui| {
-                            ui.checkbox(on, p.display_name());
-                            if running {
-                                if attached.contains(&p.kind.as_str()) {
-                                    ui.label(RichText::new("on the bus").small().weak());
-                                } else {
-                                    ui.label(RichText::new("not modelled").small().weak());
-                                }
-                            }
-                        });
-                    }
-                }
-
-                ui.add_space(12.0);
-                ui.heading("Bus tracer");
-                ui.label(
-                    RichText::new("Logs every transaction on the selected buses.")
-                        .small()
-                        .weak(),
-                );
-                let mut changed = false;
-                changed |= ui.checkbox(&mut self.trace.i2c, "I²C").changed();
-                changed |= ui.checkbox(&mut self.trace.spi, "SPI").changed();
-                changed |= ui.checkbox(&mut self.trace.uart, "UART").changed();
-                changed |= ui.checkbox(&mut self.trace.gpio, "GPIO").changed();
-                changed |= ui.checkbox(&mut self.trace.decode, "Decode commands").changed();
-                changed |= ui
-                    .add(
-                        egui::Slider::new(&mut self.trace.max_bytes, 8..=512)
-                            .text("max bytes")
-                            .logarithmic(true),
-                    )
-                    .changed();
-                if changed {
-                    // The registry lives on the bus thread, so this is handed
-                    // over and applied between transactions.
-                    if let Some(hw) = &self.session.hardware {
-                        hw.set_trace(self.trace);
-                    }
-                }
-                ui.label(
-                    RichText::new(format!("{} lines captured", self.bus_log.len()))
-                        .small()
-                        .weak(),
-                );
-
-                if !self.session.board.warnings.is_empty() {
-                    ui.add_space(12.0);
-                    ui.heading("Board warnings");
-                    for w in &self.session.board.warnings {
-                        ui.colored_label(Color32::from_rgb(230, 180, 100), w);
-                    }
-                }
-            });
-        });
-    }
-
-    fn status_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::bottom("status")
-            .default_size(110.0)
-            .resizable(true)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Log");
-                    if ui.small_button("clear").clicked() {
-                        self.notes.clear();
-                    }
-                    // Whether the emulator has actually reached the peripheral
-                    // server. A boot that never connects looks identical to one
-                    // whose devices are all silent, and this tells them apart.
-                    if let Some(hw) = &self.session.hardware {
-                        let (text, colour) = if hw.is_connected() {
-                            ("bus connected", Color32::from_rgb(120, 200, 130))
-                        } else {
-                            ("bus waiting", Color32::from_rgb(230, 180, 100))
-                        };
-                        ui.label(RichText::new(text).small().color(colour));
-                    }
+                    });
                 });
-                egui::ScrollArea::vertical()
-                    .stick_to_bottom(true)
-                    .auto_shrink([false, false])
+            });
+        self.bar_height = bar.response.rect.height();
+
+        if self.bar_open {
+            if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.bar_open = false;
+            } else {
+                self.bar_menu(ui.ctx(), running);
+            }
+        }
+    }
+
+    /// What `···` opens: a flat list over the screen, so showing it does not
+    /// change the shape the screen is fitted to.
+    fn bar_menu(&mut self, ctx: &egui::Context, running: bool) {
+        let max_height = (ctx.content_rect().height() - self.bar_height - 24.0).max(120.0);
+        egui::Area::new(egui::Id::new("bar-menu"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::RIGHT_BOTTOM, [0.0, -self.bar_height])
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(metro::BAR)
+                    .inner_margin(egui::Margin::symmetric(18, 12))
                     .show(ui, |ui| {
-                        for n in &self.notes {
-                            if n.error {
-                                ui.colored_label(Color32::from_rgb(240, 120, 120), &n.text);
-                            } else {
-                                ui.label(&n.text);
-                            }
-                        }
+                        ui.set_width(270.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(max_height)
+                            .show(ui, |ui| self.menu_items(ui, running));
                     });
             });
     }
 
-    /// The emulated panel. Absent entirely on a board with no display this
-    /// build can model, rather than showing an empty frame that looks broken.
-    fn display_panel(&mut self, ui: &mut egui::Ui) {
-        let Some(screen) = self.session.screen().cloned() else {
-            return;
-        };
-        let (w, h) = {
-            let s = screen.lock().expect("screen");
-            (s.width, s.height)
-        };
-
-        egui::Panel::right("display")
-            .default_size(f32::from(w) + 24.0)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Display");
-                    ui.label(RichText::new(format!("{w}x{h}")).small().weak());
-                });
-                ui.separator();
-                let response = self.screen_view.show(ui, &screen);
-                self.mimic_touch(ui, &response);
-
-                if self.session.hardware.as_ref().is_some_and(|h| h.touch.is_some()) {
-                    ui.label(
-                        RichText::new("click to touch · type to use the keyboard")
-                            .small()
-                            .weak(),
-                    );
+    fn menu_items(&mut self, ui: &mut egui::Ui, running: bool) {
+        // Board.
+        menu_heading(ui, "board");
+        let names: Vec<String> = self.boards.iter().map(|b| b.name.clone()).collect();
+        let mut pick = self.selected_board;
+        egui::ComboBox::from_id_salt("board")
+            .selected_text(names.get(self.selected_board).cloned().unwrap_or_else(|| "—".into()))
+            .width(230.0)
+            .show_ui(ui, |ui| {
+                for (i, n) in names.iter().enumerate() {
+                    ui.selectable_value(&mut pick, i, n);
                 }
             });
+        if pick != self.selected_board {
+            self.select_board(pick);
+        }
+
+        // How the panel is scaled to the window.
+        menu_heading(ui, "screen");
+        ui.radio_value(&mut self.screen_view.mode, ScaleMode::Crisp, "crisp pixels")
+            .on_hover_text("Whole-number scaling, sharp pixels, black borders between sizes");
+        ui.radio_value(&mut self.screen_view.mode, ScaleMode::Smooth, "smooth")
+            .on_hover_text("Any size, always fills the window, slightly soft");
+
+        // The serial terminal, in its own window or inside this one.
+        menu_heading(ui, "serial terminal");
+        if menu_row(ui, true, if self.terminal.open { "close terminal" } else { "open terminal" })
+            .clicked()
+        {
+            self.terminal.open = !self.terminal.open;
+        }
+        ui.radio_value(&mut self.terminal.docked, false, "separate window");
+        ui.radio_value(&mut self.terminal.docked, true, "docked in this window");
+
+        // Patching, kept as visible steps rather than part of booting.
+        menu_heading(ui, "radio bypass");
+        let have_fw = self.session.firmware.is_some();
+        let can_patch = self.session.can_patch();
+        let patched = !self.session.patches.is_empty();
+        let hint = if patched {
+            "Already patched; reload the firmware to start over"
+        } else if self.session.symbols.is_none() {
+            "Drop the firmware's .elf first — patches are located by symbol"
+        } else if !have_fw {
+            "Load firmware first"
+        } else {
+            "Replace the radio entry points so the boot completes"
+        };
+        if menu_row(ui, can_patch, "bypass radio").on_hover_text(hint).on_disabled_hover_text(hint).clicked() {
+            self.patch_radio();
+        }
+        if menu_row(ui, can_patch && !running, "bypass + boot").clicked() {
+            self.patch_radio();
+            if !self.session.patches.is_empty() {
+                self.boot();
+            }
+        }
+        if patched {
+            ui.label(
+                RichText::new(format!("⚑ {} patched — not what hardware would run", self.session.patches.len()))
+                    .small()
+                    .color(metro::WARN),
+            );
+        }
+
+        egui::CollapsingHeader::new(RichText::new("devices").size(13.0).color(metro::DIM))
+            .show(ui, |ui| self.devices_section(ui));
+        egui::CollapsingHeader::new(RichText::new("bus tracer").size(13.0).color(metro::DIM))
+            .show(ui, |ui| self.tracer_section(ui));
+
+        if !self.session.board.warnings.is_empty() {
+            menu_heading(ui, "board warnings");
+            for w in &self.session.board.warnings {
+                ui.label(RichText::new(w).small().color(metro::WARN));
+            }
+        }
+
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("drop a .bin, .elf, .img or board .toml anywhere on the window")
+                .small()
+                .color(metro::DIM),
+        );
+    }
+
+    fn devices_section(&mut self, ui: &mut egui::Ui) {
+        if self.session.board.peripherals.is_empty() {
+            ui.label(RichText::new("This board declares no peripherals.").italics().weak());
+        }
+        // Which of these are real is only known once a bus is running,
+        // because it depends on what models this build carries and on
+        // whether an SD image was supplied. Before that, say nothing
+        // rather than guess.
+        let attached: Vec<&str> = self
+            .session
+            .hardware
+            .as_ref()
+            .map(|h| h.attached.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        let running = self.session.hardware.is_some();
+
+        for (i, p) in self.session.board.peripherals.iter().enumerate() {
+            if let Some(on) = self.device_enabled.get_mut(i) {
+                ui.horizontal(|ui| {
+                    ui.checkbox(on, p.display_name());
+                    if running {
+                        if attached.contains(&p.kind.as_str()) {
+                            ui.label(RichText::new("on the bus").small().weak());
+                        } else {
+                            ui.label(RichText::new("not modelled").small().weak());
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    fn tracer_section(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Logs every transaction on the selected buses.").small().weak());
+        let mut changed = false;
+        changed |= ui.checkbox(&mut self.trace.i2c, "I²C").changed();
+        changed |= ui.checkbox(&mut self.trace.spi, "SPI").changed();
+        changed |= ui.checkbox(&mut self.trace.uart, "UART").changed();
+        changed |= ui.checkbox(&mut self.trace.gpio, "GPIO").changed();
+        changed |= ui.checkbox(&mut self.trace.decode, "Decode commands").changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.trace.max_bytes, 8..=512)
+                    .text("max bytes")
+                    .logarithmic(true),
+            )
+            .changed();
+        if changed {
+            // The registry lives on the bus thread, so this is handed
+            // over and applied between transactions.
+            if let Some(hw) = &self.session.hardware {
+                hw.set_trace(self.trace);
+            }
+        }
+        ui.label(RichText::new(format!("{} lines captured", self.bus_log.len())).small().weak());
+    }
+
+    /// The terminal as a panel of this window, when it is set to dock.
+    fn docked_terminal(&mut self, ui: &mut egui::Ui) {
+        if !(self.terminal.open && self.terminal.docked) {
+            return;
+        }
+        egui::Panel::bottom("terminal-dock")
+            .resizable(true)
+            .default_size(230.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("serial terminal").size(18.0));
+                    if ui.small_button("pop out").clicked() {
+                        self.terminal.docked = false;
+                    }
+                    if ui.small_button("close").clicked() {
+                        self.terminal.open = false;
+                    }
+                });
+                self.terminal.show_docked(ui, &mut self.session);
+            });
+    }
+
+    /// The emulated panel, scaled to whatever the window gives it. Everything
+    /// else on this screen is chrome; this takes the rest.
+    fn stage(&mut self, ui: &mut egui::Ui, running: bool) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(Color32::BLACK))
+            .show(ui, |ui| {
+                if let Some(screen) = self.session.screen().cloned() {
+                    let response = self.screen_view.show(ui, &screen);
+                    self.mimic_touch(ui, &response);
+                } else {
+                    self.idle_stage(ui, running);
+                }
+            });
+    }
+
+    /// What fills the window before there is a panel to show.
+    fn idle_stage(&mut self, ui: &mut egui::Ui, running: bool) {
+        let hint = if running {
+            "this board has no display this build can model"
+        } else if self.session.can_boot() {
+            "press boot"
+        } else {
+            "drop a firmware .bin here, or add images in the log window"
+        };
+        ui.vertical_centered(|ui| {
+            ui.add_space((ui.available_height() / 2.0 - 60.0).max(8.0));
+            metro::kicker(ui, "ESP32 Emulator");
+            ui.label(RichText::new(self.session.board.name.to_lowercase()).size(40.0));
+            ui.label(RichText::new(hint).color(metro::DIM));
+        });
     }
 
     /// Turn mouse activity over the panel into touch events.
@@ -846,89 +812,421 @@ impl App {
         }
     }
 
-    fn serial_console(&mut self, ui: &mut egui::Ui) {
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Serial");
+    /// The log, in its own window: log, serial, and firmware images.
+    fn log_window(&mut self, ctx: &egui::Context) {
+        if !self.log_open {
+            return;
+        }
+        let id = egui::ViewportId::from_hash_of("log-window");
+        let builder = egui::ViewportBuilder::default()
+            .with_title("log — ESP32 Emulator")
+            .with_inner_size([640.0, 540.0])
+            .with_min_inner_size([420.0, 320.0]);
 
-                // Which port to read. The S3 ROM writes its banner to UART0
-                // and the USB console both, so merging shows the boot twice;
-                // the application afterwards splits across them, so one port
-                // shows half. Hence the choice.
-                let names = self.session.serial_port_names();
-                let counts = self.session.serial.counts();
-                let label = match self.serial_view {
-                    Some(p) => names.get(p).copied().unwrap_or("port"),
-                    None => "All ports",
-                };
-                egui::ComboBox::from_id_salt("serial-view")
-                    .selected_text(label)
-                    .width(150.0)
-                    .show_ui(ui, |ui| {
-                        for (i, name) in names.iter().enumerate() {
-                            let bytes = counts.get(i).copied().unwrap_or(0);
-                            let text = if bytes > 0 {
-                                format!("{name} ({} KiB)", bytes / 1024)
-                            } else {
-                                format!("{name} (silent)")
-                            };
-                            ui.selectable_value(&mut self.serial_view, Some(i), text);
-                        }
-                        ui.selectable_value(&mut self.serial_view, None, "All ports (merged)");
-                    });
+        let mut close_requested = false;
+        ctx.show_viewport_immediate(id, builder, |ui, _class| {
+            self.log_contents(ui);
+            if ui.ctx().input(|i| i.viewport().close_requested()) {
+                close_requested = true;
+            }
+        });
+        if close_requested {
+            self.log_open = false;
+        }
+    }
 
-                ui.checkbox(&mut self.autoscroll, "follow");
-                if ui.small_button("clear").clicked() {
-                    self.session.serial.clear();
+    fn log_contents(&mut self, ui: &mut egui::Ui) {
+        // Follow, clear and copy only mean something for the two text panes.
+        if self.log_tab != LogTab::Images {
+            self.log_bar(ui);
+        }
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::NONE
+                    .fill(Color32::BLACK)
+                    .inner_margin(egui::Margin::symmetric(18, 12)),
+            )
+            .show(ui, |ui| {
+                metro::kicker(ui, "ESP32 Emulator");
+                let mut tab = self.log_tab;
+                metro::pivot(
+                    ui,
+                    &mut tab,
+                    &[
+                        (LogTab::Log, "log"),
+                        (LogTab::Serial, "serial"),
+                        (LogTab::Images, "firmware images"),
+                    ],
+                );
+                self.log_tab = tab;
+                ui.add_space(8.0);
+                match self.log_tab {
+                    LogTab::Log => self.log_pane(ui),
+                    LogTab::Serial => self.serial_pane(ui),
+                    LogTab::Images => self.images_pane(ui),
                 }
+            });
+    }
 
-                let view = self.session.serial.view(self.serial_view);
-                if view.trimmed > 0 {
-                    ui.label(
-                        RichText::new(format!("({} KiB trimmed)", view.trimmed / 1024))
-                            .small()
-                            .weak(),
+    fn log_bar(&mut self, ui: &mut egui::Ui) {
+        let accent = self.accent;
+        egui::Panel::bottom("log-bar")
+            .frame(
+                egui::Frame::NONE
+                    .fill(metro::BAR)
+                    .inner_margin(egui::Margin::symmetric(10, 6)),
+            )
+            .show_separator_line(false)
+            .resizable(false)
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    let follow = if self.autoscroll { "follow on" } else { "follow off" };
+                    if metro::bar_button(ui, Icon::Follow, follow, true, true, accent).clicked() {
+                        self.autoscroll = !self.autoscroll;
+                    }
+                    if metro::bar_button(ui, Icon::Clear, "clear", true, true, accent).clicked() {
+                        match self.log_tab {
+                            LogTab::Serial => self.session.serial.clear(),
+                            _ => self.notes.clear(),
+                        }
+                    }
+                    if metro::bar_button(ui, Icon::Copy, "copy", true, true, accent).clicked() {
+                        let text = match self.log_tab {
+                            LogTab::Serial => {
+                                self.session.serial.view(self.serial_view).text().to_string()
+                            }
+                            _ => self
+                                .notes
+                                .iter()
+                                .map(|n| n.text.as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        };
+                        ui.ctx().copy_text(text);
+                    }
+                });
+            });
+    }
+
+    /// The notes the app writes as it works.
+    fn log_pane(&mut self, ui: &mut egui::Ui) {
+        // Whether the emulator has actually reached the peripheral
+        // server. A boot that never connects looks identical to one
+        // whose devices are all silent, and this tells them apart.
+        if let Some(hw) = &self.session.hardware {
+            let (text, colour) = if hw.is_connected() {
+                ("bus connected", metro::OK)
+            } else {
+                ("bus waiting", metro::WARN)
+            };
+            ui.label(RichText::new(text).small().color(colour));
+        }
+        egui::ScrollArea::vertical()
+            .stick_to_bottom(self.autoscroll)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for n in &self.notes {
+                    if n.error {
+                        ui.colored_label(metro::ERROR, &n.text);
+                    } else {
+                        ui.label(&n.text);
+                    }
+                }
+            });
+    }
+
+    /// Serial output, one port or all of them merged.
+    fn serial_pane(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            // Which port to read. The S3 ROM writes its banner to UART0 and
+            // the USB console both, so merging shows the boot twice; the
+            // application afterwards splits across them, so one port shows
+            // half. Hence the choice.
+            let names = self.session.serial_port_names();
+            let counts = self.session.serial.counts();
+            let label = match self.serial_view {
+                Some(p) => names.get(p).copied().unwrap_or("port"),
+                None => "All ports",
+            };
+            egui::ComboBox::from_id_salt("serial-view")
+                .selected_text(label)
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    for (i, name) in names.iter().enumerate() {
+                        let bytes = counts.get(i).copied().unwrap_or(0);
+                        let text = if bytes > 0 {
+                            format!("{name} ({} KiB)", bytes / 1024)
+                        } else {
+                            format!("{name} (silent)")
+                        };
+                        ui.selectable_value(&mut self.serial_view, Some(i), text);
+                    }
+                    ui.selectable_value(&mut self.serial_view, None, "All ports (merged)");
+                });
+
+            let view = self.session.serial.view(self.serial_view);
+            if view.trimmed > 0 {
+                ui.label(RichText::new(format!("({} KiB trimmed)", view.trimmed / 1024)).small().weak());
+            }
+            ui.label(RichText::new("open the serial terminal to send commands").small().weak());
+        });
+
+        // One label per *visible* line, not one label for the whole log.
+        //
+        // Handing the entire buffer to a single wrapped Label makes egui
+        // shape and wrap every glyph in it to build the galley -- on every
+        // frame, at 30fps, for up to half a megabyte, to display the forty
+        // lines that fit on screen. That measured at around half a core
+        // and got worse as the log grew, which is exactly backwards: the
+        // emulator needs that CPU, and the serial pane was starving it.
+        //
+        // `show_rows` needs a uniform row height, so lines extend
+        // horizontally rather than wrapping. That suits log output, which
+        // is already line-oriented, and the horizontal scrollbar is a
+        // better way to read a long line than a reflowed one anyway.
+        let view = self.session.serial.view(self.serial_view);
+        let text = view.text();
+        let lines: Vec<&str> = text.lines().collect();
+        let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+
+        egui::ScrollArea::both()
+            .stick_to_bottom(self.autoscroll)
+            .auto_shrink([false, false])
+            .show_rows(ui, row_height, lines.len(), |ui, rows| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for line in &lines[rows] {
+                    ui.add(
+                        egui::Label::new(RichText::new(*line).monospace())
+                            .selectable(true)
+                            .wrap_mode(egui::TextWrapMode::Extend),
                     );
                 }
+            });
+    }
+
+    /// What is loaded, plus raw images laid into flash at chosen offsets.
+    ///
+    /// The second half is what lets the emulator run on its own: a
+    /// bootloader, a partition table and an app placed by hand, or somebody
+    /// else's firmware, with no merged image required.
+    fn images_pane(&mut self, ui: &mut egui::Ui) {
+        // Images dropped on this window go in here, not into the session.
+        let dropped: Vec<PathBuf> = ui.ctx().input(|i| {
+            i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+        });
+        for path in dropped {
+            let offset = self.suggest_offset(&path);
+            self.add_image(&path, offset);
+        }
+
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            egui::Frame::NONE
+                .fill(Color32::from_rgb(0x3a, 0x2a, 0x00))
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(
+                            "Heads up: this emulator was tailored to the PURR OS project. \
+                             Running your own images is supported, but it may need some \
+                             work before it is fully functional.",
+                        )
+                        .color(metro::WARN),
+                    );
+                });
+            ui.add_space(12.0);
+
+            self.loaded_firmware_section(ui);
+
+            ui.add_space(14.0);
+            ui.label(RichText::new("custom images").size(20.0));
+            ui.label(
+                RichText::new(
+                    "Written into flash at boot, over the loaded firmware if there is \
+                     one and over blank flash if there is not.",
+                )
+                .small()
+                .color(metro::DIM),
+            );
+            ui.add_space(6.0);
+
+            let mut remove = None;
+            for (i, image) in self.session.extra_images.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{:#010x}", image.offset)).monospace());
+                    ui.label(name_of(&image.path));
+                    ui.label(RichText::new(format!("{:.1} KiB", image.size as f32 / 1024.0)).small().weak());
+                    if ui.small_button("remove").clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove {
+                self.session.remove_image(i);
+            }
+            if self.session.extra_images.is_empty() {
+                ui.label(RichText::new("none").italics().weak());
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.image_path)
+                        .hint_text("path to an image file")
+                        .desired_width(240.0),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.image_offset)
+                        .hint_text("offset, e.g. 0x10000")
+                        .desired_width(130.0)
+                        .font(egui::TextStyle::Monospace),
+                );
+                if ui.button("add").clicked() {
+                    self.add_typed_image();
+                }
+            });
+            let chip = self.session.firmware.as_ref().map_or(self.session.board.chip, |f| f.chip);
+            ui.label(
+                RichText::new(format!(
+                    "{chip}: bootloader at {:#x}, partition table at 0x8000, app at 0x10000. \
+                     Drop files on this window to add them at those offsets.",
+                    chip.bootloader_offset()
+                ))
+                .small()
+                .color(metro::DIM),
+            );
+        });
+    }
+
+    /// What the loaded firmware is, and what has been done to it.
+    fn loaded_firmware_section(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("loaded firmware").size(20.0));
+        match &self.session.firmware {
+            None => {
+                ui.label(RichText::new("nothing loaded").italics().weak());
+            }
+            Some(fw) => {
+                egui::Grid::new("fw").num_columns(2).striped(true).show(ui, |ui| {
+                    let mut row = |k: &str, v: String| {
+                        ui.label(RichText::new(k).weak());
+                        ui.label(v);
+                        ui.end_row();
+                    };
+                    row("file", name_of(&fw.path));
+                    row("chip", fw.chip.to_string());
+                    row("kind", fw.kind.to_string());
+                    if let Some(p) = &fw.project {
+                        row("project", p.clone());
+                    }
+                    if let Some(v) = &fw.version {
+                        row("version", v.clone());
+                    }
+                    if let Some(v) = &fw.idf_version {
+                        row("IDF", v.clone());
+                    }
+                    row("size", format!("{:.1} KiB", fw.size as f32 / 1024.0));
+                });
+            }
+        }
+
+        ui.add_space(8.0);
+        match &self.session.symbols {
+            Some(s) => {
                 ui.label(
-                    RichText::new("— open the serial terminal to send commands")
+                    RichText::new(format!("symbols: {} ({})", name_of(&s.path), s.count))
                         .small()
                         .weak(),
                 );
-            });
-
-            // One label per *visible* line, not one label for the whole log.
-            //
-            // Handing the entire buffer to a single wrapped Label makes egui
-            // shape and wrap every glyph in it to build the galley -- on every
-            // frame, at 30fps, for up to half a megabyte, to display the forty
-            // lines that fit on screen. That measured at around half a core
-            // and got worse as the log grew, which is exactly backwards: the
-            // emulator needs that CPU, and the serial pane was starving it.
-            //
-            // `show_rows` needs a uniform row height, so lines extend
-            // horizontally rather than wrapping. That suits log output, which
-            // is already line-oriented, and the horizontal scrollbar is a
-            // better way to read a long line than a reflowed one anyway.
-            let view = self.session.serial.view(self.serial_view);
-            let text = view.text();
-            let lines: Vec<&str> = text.lines().collect();
-            let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
-
-            egui::ScrollArea::both()
-                .stick_to_bottom(self.autoscroll)
-                .auto_shrink([false, false])
-                .show_rows(ui, row_height, lines.len(), |ui, rows| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    for line in &lines[rows] {
-                        ui.add(
-                            egui::Label::new(RichText::new(*line).monospace())
-                                .selectable(true)
-                                .wrap_mode(egui::TextWrapMode::Extend),
+                // Say which build these came from when it is not this one.
+                // Greying the button out without a reason sends people
+                // looking for the wrong problem.
+                match self.session.symbol_match() {
+                    crate::session::SymbolMatch::Mismatch => {
+                        ui.colored_label(
+                            metro::ERROR,
+                            RichText::new(
+                                "these symbols are from a different build — \
+                                 drop this image's own .elf",
+                            )
+                            .small(),
                         );
                     }
-                });
-        });
+                    crate::session::SymbolMatch::Unverifiable => {
+                        ui.label(
+                            RichText::new(
+                                "image records no ELF digest, so the pair cannot be checked",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            None => {
+                ui.label(
+                    RichText::new(
+                        "No .elf: patching falls back to byte signatures. \
+                         Drop the matching .elf for exact addresses.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
+        }
+        if self.session.patches.is_empty() {
+            ui.label(RichText::new("no patches applied").small().weak());
+        } else {
+            ui.colored_label(metro::WARN, RichText::new("patched: not what hardware would run").small());
+            for p in &self.session.patches {
+                ui.label(
+                    RichText::new(format!("{} @ {:#010x}", p.symbol, p.address))
+                        .small()
+                        .monospace(),
+                );
+            }
+        }
+    }
+
+    /// Where a dropped file most likely belongs, from its name.
+    fn suggest_offset(&self, path: &Path) -> u32 {
+        let name = name_of(path).to_lowercase();
+        let chip = self.session.firmware.as_ref().map_or(self.session.board.chip, |f| f.chip);
+        if name.contains("bootloader") {
+            chip.bootloader_offset()
+        } else if name.contains("partition") {
+            0x8000
+        } else {
+            0x10000
+        }
+    }
+
+    fn add_image(&mut self, path: &Path, offset: u32) {
+        match self.session.add_image(path, offset) {
+            Ok(()) => {
+                self.note(format!("Image: {} at {offset:#x}", name_of(path)));
+                if self.session.is_running() {
+                    self.note("Restart to apply it.");
+                }
+            }
+            Err(e) => self.error(format!("{}: {e}", name_of(path))),
+        }
+    }
+
+    fn add_typed_image(&mut self) {
+        let path = PathBuf::from(self.image_path.trim().trim_matches('"'));
+        let text = self.image_offset.trim();
+        let parsed = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => text.parse::<u32>().ok(),
+        };
+        let Some(offset) = parsed.or_else(|| text.is_empty().then(|| self.suggest_offset(&path)))
+        else {
+            return self.error(format!("{text:?} is not an offset; try 0x10000"));
+        };
+        self.add_image(&path, offset);
+        self.image_path.clear();
+        self.image_offset.clear();
     }
 
     /// Visual feedback while a file is hovering over the window.
@@ -950,6 +1248,17 @@ impl App {
             Color32::WHITE,
         );
     }
+}
+
+/// A section label in the `···` menu.
+fn menu_heading(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(10.0);
+    ui.label(RichText::new(text).size(13.0).color(metro::DIM));
+}
+
+/// A flat, left-aligned row in the `···` menu.
+fn menu_row(ui: &mut egui::Ui, enabled: bool, text: &str) -> egui::Response {
+    ui.add_enabled(enabled, egui::Button::selectable(false, RichText::new(text).size(16.0)))
 }
 
 fn name_of(path: &Path) -> String {

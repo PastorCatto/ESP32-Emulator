@@ -52,6 +52,8 @@ impl LineEnding {
 #[derive(Debug)]
 pub struct Terminal {
     pub open: bool,
+    /// Drawn inside the main window instead of in a window of its own.
+    pub docked: bool,
     input: String,
     /// Previously sent lines, newest last.
     history: Vec<String>,
@@ -74,6 +76,7 @@ impl Default for Terminal {
     fn default() -> Self {
         Terminal {
             open: false,
+            docked: false,
             input: String::new(),
             history: Vec::new(),
             history_pos: None,
@@ -95,7 +98,7 @@ impl Terminal {
     ///
     /// Returns false when the user closed the window.
     pub fn show(&mut self, ctx: &egui::Context, session: &mut Session) {
-        if !self.open {
+        if !self.open || self.docked {
             return;
         }
         let viewport_id = egui::ViewportId::from_hash_of("serial-terminal");
@@ -115,6 +118,12 @@ impl Terminal {
         if close_requested {
             self.open = false;
         }
+    }
+
+    /// Draw the terminal inside a panel of the main window.
+    pub fn show_docked(&mut self, ui: &mut egui::Ui, session: &mut Session) {
+        let running = session.is_running();
+        self.contents(ui, session, running);
     }
 
     fn contents(&mut self, ui: &mut egui::Ui, session: &mut Session, running: bool) {
