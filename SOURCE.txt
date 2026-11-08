@@ -1,0 +1,25 @@
+Source code and relinking (written offer)
+=========================================
+
+A built QEMU that comes from this project (for example in the PURR SDK kit) is Espressif's
+QEMU fork plus the changes in this repository, and on macOS it has these libraries linked
+in statically: glib, libintl, libgcrypt, libgpg-error (GNU LGPL 2.1 or later), and pcre2,
+libffi, pixman, libslirp (permissive).
+
+You can get, for any binary you received:
+
+1. QEMU source:  https://github.com/espressif/qemu, tag esp-develop-9.2.2-20260417
+   (also the release asset qemu-esp_develop_9.2.2_20260417-src.tar.xz), unchanged.
+2. Our changes to it: qemu/ in this repository (new files in qemu/devices/, edits applied by
+   qemu/apply.sh), at the commit the binary was built from.
+3. The libraries, with the exact versions and download URLs: scripts/build-macos-deps.sh
+   (glib 2.88.3, gettext-runtime 1.0 for libintl, libgpg-error 1.61, libgcrypt 1.12.4,
+   pcre2 10.48, libffi 3.4.8, pixman 0.46.0, libslirp 4.9.1).
+4. The build steps: docs/14-building-on-macos.md. Following them with a changed library
+   produces a relinked QEMU; that is how the LGPL libraries can be replaced.
+
+If those links are gone, write to the maintainer of this repository
+(https://github.com/PastorCatto/ESP32-Emulator) and the source will be supplied for at least
+three years after the binary was distributed.
+
+Licence texts for every library are in third-party/.

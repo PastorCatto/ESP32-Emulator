@@ -4,7 +4,7 @@ description = "Board definitions loaded from TOML: buses, peripherals, and pin a
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license = "MIT OR Apache-2.0"
 repository.workspace = true
 
 [dependencies]

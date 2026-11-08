@@ -4,7 +4,7 @@ description = "Parsing and assembly of ESP32 flash images, app images, and parti
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license = "MIT OR Apache-2.0"
 repository.workspace = true
 
 # Deliberately dependency-free: this crate is pure binary-format work and is the

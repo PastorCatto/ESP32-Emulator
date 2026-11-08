@@ -4,7 +4,7 @@ description = "Virtual peripheral bus: the contract between the emulated SoC and
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license = "MIT OR Apache-2.0"
 repository.workspace = true
 
 [dependencies]
