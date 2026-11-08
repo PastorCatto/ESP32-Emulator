@@ -155,6 +155,35 @@ The result is copied to `vendor/qemu/bin/`, which is where `Qemu::locate`
 looks first — so the emulator picks up your build without any extra
 configuration.
 
+## The macOS floor
+
+`build.sh` sets `MACOSX_DEPLOYMENT_TARGET` (default 12.0), so the QEMU binary
+itself will start on macOS 12. Its libraries decide the real floor: glib,
+pixman, slirp, gcrypt and the rest come from whatever the build machine has
+installed, and MacPorts and Homebrew both build them for the host's version.
+Linking them leaves the linker warning `built for newer version`, and the
+binary will not start on anything older. `scripts/build-macos-deps.sh` builds
+the libraries (glib, libintl, pcre2, libffi, pixman, libgcrypt, libgpg-error,
+libslirp) as static archives with the same target, in `vendor/deps-macos12`.
+Nothing is installed outside that folder, and the QEMU binary then links only
+system libraries, so there is nothing to ship beside it:
+
+```sh
+scripts/build-macos-deps.sh
+QEMU_DEPS_PREFIX=vendor/deps-macos12 qemu/build.sh
+```
+
+Keep MacPorts and Homebrew off `PATH` when configuring: QEMU also probes for
+`libgcrypt-config` and similar tools by name, and a hit puts a newer library
+back on the link line. `otool -L qemu-system-xtensa` should list only
+`/usr/lib` and `/System/Library`.
+
+Check a build with `otool -l qemu-system-xtensa | grep minos` and
+`nm -m qemu-system-xtensa | grep "weak external"`. Anything weak is a symbol
+newer than the target; the linker accepts it and the program crashes the first
+time it is called. `strchrnul` was one, which is why `apply.sh` stops QEMU
+using it on macOS.
+
 ## Three Windows gotchas
 
 These each cost real time, so they are written down.

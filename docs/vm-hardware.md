@@ -1,9 +1,18 @@
 # VM hardware contract (draft)
 
-Status: **design draft, nothing here is implemented or verified.** Every address
-and register below is a proposal until it has been checked against the ESP32-S3
-memory map and built into QEMU. Scope is the ESP32-S3 only; the interfaces are
-written so another chip could reuse them.
+Status: **a draft, partly overtaken.** Two parts of it were built, the rest was
+not. Built, as of the commit "Add the W5500 Ethernet model and the VM board":
+the Ethernet choice in section 3 went to the **W5500** (a vpb SPI device in
+Rust, `crates/devices/src/w5500.rs`, running ESP-IDF's own `esp_eth` driver
+unchanged), carried over UDP to QEMU's user-mode network; and a small **VM info**
+device on I²C at 0x6e (`crates/devices/src/vminfo.rs`) that tells the guest it is
+in a VM and where the Ethernet controller's SPI bus is. Both are on the board
+`boards/t-deck-plus-vm.toml`. **Not built:** the `vnic` ring device (section 1),
+the Wi-Fi backend and its simulated environment (section 2), and USB host
+(section 4). Every address and register in sections 1 and 2 is still a proposal.
+The board is tried in the emulator by the PURR OS session ([chapter 12](12-purr-run-and-the-sdk-kit.md));
+the W5500 model has unit tests, and has not been checked here against a bus
+trace of the real driver. Scope is the ESP32-S3 only.
 
 The VM cannot emulate the Wi-Fi radio (see [architecture.md](architecture.md),
 section 6). So the PURR OS **VM flavor** replaces the radio stack with a backend

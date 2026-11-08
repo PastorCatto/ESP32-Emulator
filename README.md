@@ -1,163 +1,174 @@
 # ESP32-Emulator
 
-A cross-platform emulator for ESP32-family boards. Drag a firmware image onto
-the window and run it — serial console, display, SD card, and a simulated Wi-Fi
-environment, without the hardware.
+An emulator for ESP32-S3 boards, built to run PURR OS and other ESP32 firmware
+without the hardware. It opens a window with the board's screen, touch panel,
+keyboard and SD card, or runs with no window so a script can press the screen,
+take pictures and read the serial log.
 
-The first target is the LilyGO T-Deck Plus (ESP32-S3), with the Sunton CYD
-family (ESP32) alongside it. Boards are data, so supporting another one is a
-config file rather than a patch.
+It is made of two parts: a patched copy of Espressif's QEMU, which emulates the
+chip, and a Rust program in this repository, which supplies everything the chip
+talks to (display, touch, keyboard, SD card, Ethernet) and the window.
 
-> **Status: early, but it boots.** Real LilyGO T-Deck Plus firmware runs
-> through the ROM, the bootloader, PSRAM init, and into application code, with
-> a working serial console. There is no display yet — see
-> [Where this actually is](#where-this-actually-is).
+> **Status.** The ESP32-S3 boards boot real PURR OS images, with screen, touch,
+> keyboard, SD card and (on the VM board) wired Ethernet. There is no Wi-Fi,
+> Bluetooth or LoRa radio. The plain-ESP32 boards (the CYD family) boot to a
+> serial console, but their screens are not modelled. Every chapter in
+> [docs/](docs/README.md) ends with what is untested. The short list is at
+> [the end of this page](#what-is-untested).
+
+## What it needs
+
+| | |
+|---|---|
+| Rust | 1.82 or newer is declared in `Cargo.toml`. Built here with 1.99.1; 1.82 itself has not been tried |
+| The patched QEMU | `vendor/qemu/bin/qemu-system-xtensa`. Built from Espressif's fork plus the device models in [qemu/](qemu/). Stock QEMU does not work for these boards: it has no S3 SPI or I²C controller |
+| A flash image | A 16 MB whole-flash image of the firmware (bootloader at 0x0). This repository does not ship one |
+| A computer | Developed and tested on a Mac with an Intel processor. Apple Silicon, Linux and Windows are **untested**, see [macOS](docs/14-building-on-macos.md), [Linux](docs/15-building-on-linux.md), [Windows](docs/16-building-on-windows.md) |
+
+## From a clone to a running window (macOS, Intel)
+
+```sh
+git clone https://github.com/PastorCatto/ESP32-Emulator.git
+cd ESP32-Emulator
+
+# 1. The patched QEMU. This is the slow part (tens of minutes; not timed).
+scripts/fetch-qemu-src.sh                   # Espressif's source at the tag we patch
+scripts/build-macos-deps.sh                 # glib, pixman, ... as static libraries, built for macOS 12
+QEMU_DEPS_PREFIX=vendor/deps-macos12 qemu/build.sh
+
+# 2. The program.
+cargo build --release -p shell
+
+# 3. Run it on a flash image and a board file.
+target/release/esp32-emulator my-flash.bin boards/t-deck-plus-vm.toml --run
+```
+
+Step 1 needs `meson`, `ninja`, `pkg-config` and Python 3 on the path, and a C
+compiler (the Xcode command line tools). Details, and what goes wrong, are in
+[docs/14-building-on-macos.md](docs/14-building-on-macos.md).
+
+**Not tested as one run.** Each step has been run on its own in the working
+folder. The sequence above has not been run from a fresh `git clone`, because the
+build files it needs were not yet committed when this page was written.
+
+The emulator works on a copy of the flash image (in its run folder), so the file
+you give it is never changed.
+
+Without a window:
+
+```sh
+BOARD_TOML=boards/t-deck-plus-vm.toml HEADLESS_SHOTS=60 \
+  cargo run --release -p shell --example headless_tap -- my-flash.bin 90 out.png
+```
+
+That boots for 90 seconds and writes `out.png`, plus `out-60.png` at second 60.
+More in [docs/10-headless-and-trace.md](docs/10-headless-and-trace.md).
+
+## The boards
+
+Board files are data: `boards/*.toml` says which chip, which buses, which devices
+sit at which pins. Adding a board is a file, not a patch
+([docs/board-files.md](docs/board-files.md)).
+
+| File | Board | Chip | Notes |
+|---|---|---|---|
+| `t-deck-plus-vm.toml` | LilyGO T-Deck Plus, VM flavour | ESP32-S3 | Wired Ethernet (W5500 model) instead of radios. The board PURR OS's VM image runs on |
+| `t-deck-plus.toml` | LilyGO T-Deck Plus | ESP32-S3 | Screen, touch, keyboard, SD. Radio parts are declared but not modelled |
+| `cyd-*.toml` (three) | Sunton CYD family | ESP32 | Boot to the serial console. Screens not modelled |
+| `generic-esp32s3.toml` | Fallback | ESP32-S3 | |
 
 ## How it works
 
-QEMU emulates the SoC. Everything hanging off the SoC's buses lives in this
-repo instead, on the other side of a socket:
+QEMU emulates the chip. Everything on the chip's buses lives in this repository,
+on the other side of a socket:
 
 ```text
    ┌──────────────────────────┐        ┌────────────────────────────────┐
    │ QEMU (Espressif fork)    │        │ Emulator shell (Rust + egui)   │
    │                          │        │                                │
-   │  Xtensa CPU, RAM, flash  │        │  ┌──────────────────────────┐  │
+   │  Xtensa CPUs, RAM, flash │        │  ┌──────────────────────────┐  │
    │  UART, timers, eFuse     │        │  │ Registry: route by claim │  │
    │                          │        │  └────────────┬─────────────┘  │
    │  ┌────────────────────┐  │  vpb   │      ┌────────┴─────────┐      │
    │  │ SPI/I²C controller │──┼────────┼─────▶│ ST7789   GT911   │      │
    │  │ (we add these)     │  │ socket │      │ SD card  keyboard│      │
-   │  └────────────────────┘  │        │      │ your driver ─────┼──┐   │
-   └──────────────────────────┘        │      └──────────────────┘  │   │
+   │  └────────────────────┘  │        │      │ W5500    your    │      │
+   └──────────────────────────┘        │      │ driver ──────────┼──┐   │
+                                       │      └──────────────────┘  │   │
                                        └────────────────────────────┼───┘
                                                                     │
                                               any language, any process
 ```
 
-Espressif's QEMU fork emulates the CPU, memory, and flash well, but **not** GP
-SPI, I²C, SD/MMC, or Wi-Fi on the S3 — and every T-Deck peripheral hangs off
-SPI or I²C. So we add the *bus controllers* to QEMU and implement the *devices*
-here in Rust, where they can be iterated on without a C rebuild.
-
-That split is also what makes custom hardware cheap: a device is whatever
-answers for a bus address, whether it lives in this repo or in your own process.
+A device is whatever answers for a bus address, so a driver can live in this
+repository or in your own process ([docs/custom-hardware.md](docs/custom-hardware.md)).
+Every transaction passes one place, so a bus tracer sees all of it
+([docs/10-headless-and-trace.md](docs/10-headless-and-trace.md)).
 
 ## Documentation
 
-| | |
+| Chapter | |
 |---|---|
-| [docs/architecture.md](docs/architecture.md) | How it fits together, and why each decision was made |
+| [docs/README.md](docs/README.md) | The index, with what each chapter covers |
+| [docs/architecture.md](docs/architecture.md) | How it fits together and why each decision was made |
 | [docs/board-files.md](docs/board-files.md) | The board TOML format, field by field |
 | [docs/custom-hardware.md](docs/custom-hardware.md) | Three ways to add a device, including a working driver in Python |
-| [qemu/README.md](qemu/README.md) | The device models we add to QEMU, and how to build it |
+| [docs/10-headless-and-trace.md](docs/10-headless-and-trace.md) | Running without a window; the command file; the bus trace |
+| [docs/11-vm-image-layout.md](docs/11-vm-image-layout.md) | What a VM flash image must look like (flash map v2) |
+| [docs/12-purr-run-and-the-sdk-kit.md](docs/12-purr-run-and-the-sdk-kit.md) | How the PURR SDK uses the emulator |
+| [docs/13-the-patched-qemu.md](docs/13-the-patched-qemu.md) | What we add to QEMU and why |
+| [docs/17-licences.md](docs/17-licences.md) | Licences, item by item |
 
-## Modularity
-
-Three levels, documented in [docs/custom-hardware.md](docs/custom-hardware.md):
-
-1. **Board TOML** — panel size, pin assignments, I²C addresses. No rebuild.
-2. **In-tree driver** — implement `Peripheral`, gate it behind a Cargo feature.
-3. **External driver** — speak the wire protocol from any language. No rebuild,
-   nothing of yours in this tree.
-
-Every device is an independent switch: turn one off and the bus behaves as
-though the chip were absent, which is how you find out whether a peripheral is
-what firmware is choking on.
-
-## Bus tracer
-
-Off by default, per-bus toggles. Every transaction routes through one place, so
-tracing sees all of it:
+## Layout of the repository
 
 ```text
-I²C0 → 0x5d gt911     w[81 4e]
-I²C0 ← 0x5d gt911     r[01 78 00 58 00]  · 1 touch point @ (120, 88)
-I²C0 ← 0x77 <unclaimed>
-SPI2 → cs12 st7789    w[2a 00 00 01 3f]  · CASET x=0..319
+crates/flashimg   Firmware image formats: chip IDs, app descriptors, partition
+                  tables, flash assembly, empty LittleFS volumes.
+crates/vpb        The bus contract: claims, transactions, routing, tracing, and
+                  the wire protocol for drivers in other processes.
+crates/boards     Board files: parsing and checking.
+crates/devices    The device models: ST7789, GT911, keyboard, SD card, W5500,
+                  VM info.
+crates/qemuctl    Finding, starting and controlling QEMU.
+crates/shell      The window (esp32-emulator) and the headless runners
+                  (examples/headless, examples/headless_tap).
+boards/           Board definitions.
+qemu/             Our additions to QEMU, and the scripts that apply and build them.
+scripts/          Fetching and building QEMU and its libraries; helpers for runs.
+docs/             The chapters.
+vendor/           Fetched and built QEMU and libraries (not committed).
 ```
 
-Drivers decode their own traffic, so you can confirm the *right* commands went
-out, not just that bytes moved. Large transfers are truncated rather than
-flooding the log.
+## What is untested
 
-## Repository layout
+- A fresh `git clone` followed by the steps above.
+- Any computer except an Intel Mac: Apple Silicon (under Rosetta 2 or native),
+  Linux, Windows.
+- Rust 1.82 (the declared minimum).
+- `qemu/build.sh` with `QEMU_DEPS_PREFIX` run end to end; the static QEMU was
+  built by hand with the same steps.
+- Running the macOS 12 build on a Mac that is not running macOS 26: the file's
+  recorded minimum is 12.0, but only macOS 26 has been available.
+- The Windows build of the patched QEMU: it does not exist as a published
+  binary, see [docs/16-building-on-windows.md](docs/16-building-on-windows.md).
 
-```text
-crates/flashimg   firmware image formats: chip IDs, app descriptor,
-                  partition tables, flash assembly. Zero dependencies.
-crates/vpb        the bus contract: claims, transactions, routing,
-                  tracing, and the external-driver wire protocol.
-boards/           board definitions as TOML.
-docs/             architecture and driver-authoring guides.
-vendor/           fetched QEMU binaries (gitignored).
-```
+## Licence and notices
 
-## Where this actually is
+The licence is per item; [LICENSES.md](LICENSES.md) is the table and
+[docs/17-licences.md](docs/17-licences.md) says what was read and what was not.
 
-Working, with 78 tests and clippy clean:
+- The window program (`crates/shell`) and the QEMU device models (`qemu/devices/`) are
+  **GPL-2.0-or-later**, following QEMU: [LICENSE](LICENSE).
+- The crates `flashimg`, `vpb`, `boards`, `devices` and `qemuctl` are **MIT OR Apache-2.0**:
+  [LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE).
+- A built QEMU (not in this repository) is Espressif's QEMU fork plus our changes, and on macOS has
+  glib, libintl, libgcrypt, libgpg-error, pcre2, libffi, pixman and libslirp linked in statically.
+  Their licence texts and notices are in [third-party/](third-party/); the offer of source and the relink
+  steps are in [SOURCE.txt](SOURCE.txt).
 
-- **Real firmware boots.** A PURR OS T-Deck Plus build gets through the ROM,
-  the second-stage bootloader, our partition table, all seven segment loads,
-  octal PSRAM detection, and into `app_init`.
-- Firmware identification: merged images, bare app images, bootloaders, ELFs.
-  Extracts chip, flash size, project name, version, and IDF version.
-- Flash assembly, with partition tables validated rather than trusted.
-- Launching and controlling QEMU: serial, QMP reset, clean shutdown.
-- The application: drag-and-drop, board picker, serial console, and a detached
-  serial terminal in its own window.
-- The peripheral contract, address routing, external-driver protocol, tracer.
-
-Try it:
-
-```sh
-scripts/fetch-qemu.sh
-cargo run -p shell            # then drop a firmware .bin on the window
-```
-
-Not yet built:
-
-- **GP SPI and I²C controllers in QEMU.** This is the gate on everything
-  visual. Boot currently stops right after eFuse init, where the firmware
-  first talks to the display.
-- Every device driver: display, touch, keyboard, SD card, LoRa, GPS.
-- Wi-Fi.
-
-### What the QEMU work actually involves
-
-Espressif's fork already models `SPI_MEM`, the memory-SPI controller that
-drives flash and PSRAM, and instantiates it as `spi1`. But the S3's
-general-purpose SPI2/SPI3 are a *different peripheral with a different register
-map*, and no GP-SPI model exists in the tree for any chip. So SPI2 has to be
-written against the TRM. The existing models still help: they supply the QEMU
-plumbing — SSI bus integration, chip-select GPIO wiring, MMIO registration —
-which is the fiddly part.
-
-### On Wi-Fi
-
-Espressif's QEMU does not emulate the Wi-Fi radio, and the driver is a closed
-blob (`libnet80211.a`, `libpp.a`) talking to undocumented registers. The one
-serious attempt at register-level emulation
-([esp32-open-mac](https://github.com/esp32-open-mac/qemu)) targets the original
-ESP32, not the S3.
-
-So the plan is not to emulate the radio. Those blobs are *prebuilt binaries
-Espressif ships*, which means `esp_wifi_scan_start` and friends have
-byte-identical machine code in every firmware built with a given IDF version —
-and the app descriptor tells us that version. We locate those entry points and
-trampoline them to emulator-provided implementations, so firmware sees the
-simulated APs without executing a single instruction of the real driver.
-
-Scan first, since it needs no TX path, no crypto, and no association. Unknown
-IDF version means no Wi-Fi and everything else still boots. It sits behind a
-`WifiBackend` trait, so a register-level backend can replace it later without
-disturbing anything above.
-
-## Building
-
-Requires Rust 1.82+, and on Windows the MSVC C++ build tools.
-
-```sh
-cargo test
-cargo clippy --all-targets
-```
+**NOTICE: Espressif ROM images.** QEMU for the ESP32-S3 loads Espressif's boot ROM
+(`esp32s3_rev0_rom.bin`, from the `pc-bios` folder of https://github.com/espressif/qemu at tag
+`esp-develop-9.2.2-20260417`). The ROM is Copyright (c) 2015-2022 Espressif Systems (Shanghai) Co. Ltd.
+and is not open source. Espressif licenses the ROM *ELF* files under Apache-2.0; **the licence of the
+`.bin` file itself is not stated anywhere that was found.** The ROM contains third-party code (Newlib, Xtensa libhal, miniz, Zephyr USB and others), listed in the notice with links to all the Espressif pages. This repository holds no ROM image. Details:
+[third-party/espressif-rom/NOTICE.md](third-party/espressif-rom/NOTICE.md).

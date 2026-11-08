@@ -1288,4 +1288,24 @@ PYFIX
   echo "  ~ scripts/symlink-install-tree.py: copy fallback for Windows"
 fi
 
+# --- strchrnul on macOS ------------------------------------------------------
+#
+# configure finds strchrnul in the newest SDK and uses it. On macOS it only
+# exists from 15.4, so a binary built for an older deployment target links it
+# as a weak import and calls through a null pointer on any older system the
+# first time QEMU parses a comma-separated option (-d, -device, ...). QEMU has
+# its own qemu_strchrnul for hosts without one; make macOS use that.
+MESON="$SRC/meson.build"
+if grep -qF "HAVE_STRCHRNUL', cc.has_function('strchrnul') and host_os != 'darwin'" "$MESON"; then
+  echo "  = meson.build already skips strchrnul on macOS"
+elif [ "$(grep -cF "config_host_data.set('HAVE_STRCHRNUL', cc.has_function('strchrnul'))" "$MESON" || true)" -eq 1 ]; then
+  sed "s|cc.has_function('strchrnul'))|cc.has_function('strchrnul') and host_os != 'darwin')|" \
+    "$MESON" > "$MESON.tmp"
+  mv "$MESON.tmp" "$MESON"
+  echo "  ~ meson.build: no strchrnul on macOS"
+else
+  echo "error: the HAVE_STRCHRNUL line in meson.build has changed; update qemu/apply.sh" >&2
+  exit 1
+fi
+
 echo "Done."

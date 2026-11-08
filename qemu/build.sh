@@ -35,6 +35,21 @@ fi
 
 bash "$HERE/apply.sh" "$SRC"
 
+# The oldest macOS the binary will run on. Apple Silicon Macs run an x86_64
+# build under Rosetta 2, so one low target serves both. Left unset the linker
+# uses the host's version, which makes the binary refuse to start anywhere
+# older. The libraries it links (glib, pixman, ...) set their own floor: see
+# qemu/README.md.
+if [ "$(uname -s)" = Darwin ]; then
+  export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
+  # Libraries built by scripts/build-macos-deps.sh, and nothing else: a .pc file
+  # from MacPorts or Homebrew would bring back a library built for this Mac.
+  if [ -n "${QEMU_DEPS_PREFIX:-}" ]; then
+    export PKG_CONFIG_LIBDIR="$(cd "$QEMU_DEPS_PREFIX" && pwd)/lib/pkgconfig"
+    export PKG_CONFIG_PATH=
+  fi
+fi
+
 # Reconfiguring incrementally after installing a new dependency mixes two
 # different dependency resolutions and produces duplicate-symbol link errors
 # (glib resolved both shared and static). Configure only when there is no

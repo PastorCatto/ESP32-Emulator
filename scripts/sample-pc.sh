@@ -14,7 +14,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-QEMU="$ROOT/vendor/qemu/bin/qemu-system-xtensa.exe"
+QEMU="$ROOT/vendor/qemu/bin/qemu-system-xtensa"
+[ -x "$QEMU" ] || QEMU="$QEMU.exe"      # the Windows build carries the suffix
 
 FLASH="${1:?usage: sample-pc.sh <flash.bin> [settle] [samples] [sd.img]}"
 SETTLE="${2:-40}"
