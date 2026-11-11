@@ -1268,6 +1268,10 @@ if [ -f "$SYMLINK_SCRIPT" ] && ! grep -q "import shutil" "$SYMLINK_SCRIPT"; then
                     shutil.copytree(source, bundle_dest, dirs_exist_ok=True)
                 else:
                     shutil.copy2(source, bundle_dest)
+            except FileNotFoundError:
+                # a build product that does not exist yet at configure time
+                # (libfdt.a, for one): the bundle tree is only a convenience
+                pass
             except BaseException as copy_error:
                 print(f'error copying {source} to {bundle_dest}', file=sys.stderr)
                 raise copy_error
