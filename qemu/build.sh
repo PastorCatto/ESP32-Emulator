@@ -56,10 +56,13 @@ fi
 # build.ninja, and use --clean after changing the installed packages.
 if [ ! -f "$BUILD/build.ninja" ]; then
   # User-mode networking (DHCP, DNS, NAT with no host privileges) is what the
-  # virtual network adapters sit on. It stays off on Windows, where MSYS2's
-  # static-only libslirp drags in a second glib (see qemu/README.md).
+  # virtual network adapters sit on. On Windows it needs MSYS2's UCRT64 (or
+  # CLANG64) environment, whose libslirp package has a DLL; the MINGW64
+  # environment has no libslirp package, and a static-only one drags in a second
+  # glib (see qemu/README.md). So: on if pkg-config can find it, off if not.
   case "$(uname -s)" in
-    MINGW*|MSYS*|CYGWIN*) SLIRP_FLAG=--disable-slirp ;;
+    MINGW*|MSYS*|CYGWIN*)
+      if pkg-config --exists slirp 2>/dev/null; then SLIRP_FLAG=--enable-slirp; else SLIRP_FLAG=--disable-slirp; fi ;;
     *)                    SLIRP_FLAG=--enable-slirp ;;
   esac
   echo "Configuring (${SLIRP_FLAG})"

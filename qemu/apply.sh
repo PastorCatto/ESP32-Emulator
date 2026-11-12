@@ -983,6 +983,36 @@ else
   echo "warning: slirp guard anchor not found in meson.build; skipping" >&2
 fi
 
+# --- link libslirp as a DLL on Windows ---------------------------------------
+#
+# The same block asks for `static: true`. That is right on macOS, where
+# scripts/build-macos-deps.sh builds a static libslirp. On Windows it is the
+# trap described above if the libslirp package is static-only -- but MSYS2's
+# UCRT64 and CLANG64 libslirp packages carry a DLL and an import library too
+# (the MINGW64 environment has no libslirp package at all). Asking for the
+# shared one there avoids the second, static glib.
+SLIRP_STATIC_NEW="static: host_os != 'windows')"
+if grep -qF -- "$SLIRP_STATIC_NEW" "$MESON_BUILD"; then
+  echo "  = meson.build slirp static choice already present"
+elif grep -qF -- "slirp_dep = dependency('slirp'" "$MESON_BUILD"; then
+  awk -v new="$SLIRP_STATIC_NEW" '
+    index($0, "slirp_dep = dependency(\047slirp\047") > 0 { inblock = 1 }
+    inblock {
+      old = "static: true)"
+      p = index($0, old)
+      if (p > 0) {
+        $0 = substr($0, 1, p - 1) new substr($0, p + length(old))
+        inblock = 0
+      }
+    }
+    { print }
+  ' "$MESON_BUILD" > "$MESON_BUILD.tmp"
+  mv "$MESON_BUILD.tmp" "$MESON_BUILD"
+  echo "  ~ meson.build: libslirp is linked as a DLL on Windows"
+else
+  echo "warning: slirp dependency anchor not found in meson.build; skipping" >&2
+fi
+
 # --- IRAM is DRAM ---------------------------------------------------------------
 #
 # On the S3 the instruction-bus and data-bus views of internal SRAM are the same

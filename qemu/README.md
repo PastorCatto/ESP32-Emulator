@@ -232,6 +232,16 @@ Reaching for a clean rebuild first is tempting and does not help — the cause
 is dependency resolution, not stale state. (A clean rebuild *is* needed after
 changing installed packages, but that is a different problem.)
 
+**To get slirp on Windows, build in the UCRT64 environment.** MSYS2's MINGW64
+environment has no libslirp package at all (checked 2026-11-11), but its
+UCRT64 and CLANG64 packages carry a DLL and an import library next to the
+static archive. Install the UCRT64 packages (`mingw-w64-ucrt-x86_64-` plus the
+names in the package list above, with `libslirp`), open a UCRT64 shell and run
+`qemu/build.sh --clean`. `apply.sh` then asks meson for the shared library
+(`static: host_os != 'windows'`, so macOS keeps its static one), and `build.sh`
+turns slirp on whenever `pkg-config --exists slirp` succeeds. The result needs
+`libslirp-0.dll` beside it as well. In a MINGW64 shell slirp stays off, as before.
+
 **3. A build directory can be locked.** If a shell still has it open,
 `rm -rf build` fails with "Device or resource busy", and the next configure
 fails confusingly. `build.sh --clean` moves the directory aside instead of
