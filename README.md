@@ -128,7 +128,7 @@ crates/vpb        The bus contract: claims, transactions, routing, tracing, and
                   the wire protocol for drivers in other processes.
 crates/boards     Board files: parsing and checking.
 crates/devices    The device models: ST7789, GT911, keyboard, SD card, W5500,
-                  VM info.
+                  VM info, MCP23017 game pad, ICM-42670 motion sensor.
 crates/qemuctl    Finding, starting and controlling QEMU.
 crates/shell      The window (esp32-emulator) and the headless runners
                   (examples/headless, examples/headless_tap).

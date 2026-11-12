@@ -162,6 +162,43 @@ driver that registers for the same address at runtime — see
 references resolve, do two devices collide), not whether we happen to ship a
 driver.
 
+### Module slots: hardware that is plugged in and out
+
+Some boards take swappable modules, such as a game pad or a keyboard on the same connector. Give each
+device that can occupy the place a `slot` name, and mark at most one `slot_default = true`:
+
+```toml
+[[peripheral]]
+kind = "gamepad"
+bus = "main_i2c"
+address = 0x20
+slot = "input"
+slot_default = true     # plugged in at start; the others in the slot are not
+
+[[peripheral]]
+kind = "tdeck-keyboard"
+bus = "main_i2c"
+address = 0x55
+slot = "input"
+```
+
+Every device in a slot is built, but only the one plugged in answers its address; the others behave as
+though the chip were absent, so an I²C probe is not acknowledged. The window's **input** button steps
+through "nothing" and each option, the `···` menu lists them, and `headless_tap` has `HEADLESS_MODULE`
+and a `module` command ([chapter 10](10-headless-and-trace.md)). Swapping while the guest runs works
+the way real hardware does: firmware notices only when it next probes. Buttons held and keys typed but
+not yet read are dropped when a module is unplugged.
+
+Devices without a `slot` key are fixed, as before. Only one slot is offered in the window today.
+
+### Models that ship for slots and sensors
+
+| `kind` | What it is | Notes |
+|---|---|---|
+| `gamepad` | An MCP23017 expander wired as eight matrix buttons, one direct button and nine LEDs | I²C, normally 0x20. The window shows the buttons (mouse, or arrows / Z X A S / Space) and lights the lamps the guest drives. Not modelled: the chip's interrupt pin and `IOCON.BANK` addressing |
+| `icm42670` | An ICM-42670-P motion sensor | I²C, normally 0x68. Answers its identity register, keeps written registers, builds data registers from a tilt set in the `···` menu; flat and still by default. Written from the ESP-IDF driver for the chip, not from the datasheet |
+| `tdeck-keyboard` | The T-Deck's keyboard | I²C 0x55; a one-byte read returns the pending key |
+
 ### Unknown keys are reported
 
 Free-form config has one bad failure mode: a typo does nothing at all, and you

@@ -211,6 +211,9 @@ pub struct Session {
     serial_log: Option<std::fs::File>,
     /// The device models and the bus server, alive only while running.
     pub hardware: Option<Hardware>,
+    /// What is plugged into each of the board's module slots, aligned with
+    /// [`hardware::slot_defs`]. `None` means "the board's default".
+    pub modules: Vec<Option<Option<usize>>>,
 }
 
 impl Session {
@@ -229,6 +232,31 @@ impl Session {
             run_dir: PathBuf::from("run"),
             serial_log: None,
             hardware: None,
+            modules: Vec::new(),
+        }
+    }
+
+    /// Plug option `option` into slot `slot` (or leave it empty with `None`).
+    /// Takes effect at the next boot, and straight away while the guest runs.
+    pub fn set_module(&mut self, slot: usize, option: Option<usize>) {
+        if self.modules.len() <= slot {
+            self.modules.resize(slot + 1, None);
+        }
+        self.modules[slot] = Some(option);
+        if let Some(hw) = &self.hardware {
+            hw.select_module(slot, option);
+        }
+    }
+
+    /// What is in slot `slot` now: what the running hardware has, or what the
+    /// next boot will use.
+    pub fn module(&self, slot: usize) -> Option<usize> {
+        if let Some(hw) = &self.hardware {
+            return hw.selected_module(slot);
+        }
+        match self.modules.get(slot) {
+            Some(Some(choice)) => *choice,
+            _ => hardware::slot_defs(&self.board).get(slot).and_then(|d| d.default),
         }
     }
 
@@ -501,7 +529,7 @@ impl Session {
 
         // Devices first: the emulator connects on startup and does not retry,
         // so the server has to be listening before QEMU exists.
-        let hardware = hardware::start(&self.board, self.sd_image.clone())?;
+        let hardware = hardware::start(&self.board, self.sd_image.clone(), &self.modules)?;
 
         let qemu = Qemu::locate(chip)?;
         let mut config = LaunchConfig::new(chip, &flash);

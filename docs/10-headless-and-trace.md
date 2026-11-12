@@ -47,6 +47,9 @@ Set `HEADLESS_CMD=<file>`. The program re-reads the file as it runs and executes
 | `serial TEXT` | Send `TEXT` and a carriage return to the first serial port |
 | `shot NAME` | Write `<out>-NAME.png` |
 | `dump` | Write `<out>-serial.txt`, everything the board has printed so far |
+| `module KIND` | Plug a module into the board's slot while running (`gamepad`, `tdeck-keyboard`, or `none`). The guest sees it the next time it probes |
+| `pad press\|release\|tap NAME` | Hold, let go of, or tap a game-pad button (`up down left right a b x y func`). Prints which LEDs the guest has lit |
+| `tilt X Y Z` | Set the motion sensor's acceleration, in g (flat is `0 0 1`) |
 | `quit` | Stop; the final picture and the serial log are still written |
 
 The program does no waiting between commands. The emulated board is slower than the clock, so the caller paces them: a tap that opens an app needs seconds before the next one.
@@ -59,6 +62,7 @@ The program does no waiting between commands. The emulated board is slower than 
 |---|---|---|
 | `BOARD_TOML` | both (required for `headless_tap`) | The board file |
 | `HEADLESS_CMD` | `headless_tap` | The command file |
+| `HEADLESS_MODULE` | `headless_tap` | What is plugged into the board's slot at boot (`gamepad`, `tdeck-keyboard`, `none`); the board's default if unset |
 | `HEADLESS_TAPS` | `headless_tap` | `second:x:y,second:x:y` taps on a schedule |
 | `HEADLESS_SHOTS` | both | Seconds at which to write `<out>-<second>.png` |
 | `HEADLESS_SERIAL`, `HEADLESS_SERIAL_AT` | both | Lines (`a\nb\n`) sent to serial from that second |

@@ -439,6 +439,7 @@ impl eframe::App for App {
 
         self.update_title(&ctx, running);
         self.app_bar(ui, running);
+        self.pad_panel(ui);
         self.docked_terminal(ui);
         self.stage(ui, running);
         self.mimic_keyboard(&ctx);
@@ -501,6 +502,14 @@ impl App {
                     if metro::bar_button(ui, Icon::Log, "log", true, labels, accent).clicked() {
                         self.log_open = !self.log_open;
                     }
+                    // Only boards with a place to plug a module in get this.
+                    if !crate::hardware::slot_defs(&self.session.board).is_empty()
+                        && metro::bar_button(ui, Icon::Pad, "input", true, labels, accent)
+                            .on_hover_text(self.module_summary())
+                            .clicked()
+                    {
+                        self.cycle_module(0);
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                         if metro::dots_button(ui, accent).clicked() {
                             self.bar_open = !self.bar_open;
@@ -555,6 +564,10 @@ impl App {
         if pick != self.selected_board {
             self.select_board(pick);
         }
+
+        // Modules: what is plugged into each slot, changeable while running.
+        self.module_menu(ui);
+        self.motion_menu(ui);
 
         // How the panel is scaled to the window.
         menu_heading(ui, "screen");
@@ -782,7 +795,14 @@ impl App {
     /// terminal, which has its own input box and would otherwise receive
     /// every keystroke twice.
     fn mimic_keyboard(&mut self, ctx: &egui::Context) {
-        let Some(keys) = self.session.hardware.as_ref().and_then(|h| h.keys.clone())
+        // Only while a keyboard is actually plugged in: typing at an empty
+        // slot must not queue keys for whichever module arrives next.
+        let Some(keys) = self
+            .session
+            .hardware
+            .as_ref()
+            .filter(|h| h.is_active("tdeck-keyboard"))
+            .and_then(|h| h.keys.clone())
         else {
             return;
         };
@@ -810,6 +830,177 @@ impl App {
                 devices::TdeckKeyboard::press(&keys, code as char);
             }
         }
+    }
+
+    /// What the input slot holds, for a tooltip.
+    fn module_summary(&self) -> String {
+        let defs = crate::hardware::slot_defs(&self.session.board);
+        let Some(def) = defs.first() else { return String::new() };
+        let now = match self.session.module(0).and_then(|i| def.options.get(i)) {
+            Some((_, label)) => label.clone(),
+            None => "nothing".into(),
+        };
+        format!("{}: {now}. Click to change.", def.name)
+    }
+
+    /// Step a slot through "nothing" and each of its options, in order.
+    fn cycle_module(&mut self, slot: usize) {
+        let defs = crate::hardware::slot_defs(&self.session.board);
+        let Some(def) = defs.get(slot) else { return };
+        let next = match self.session.module(slot) {
+            None => (!def.options.is_empty()).then_some(0),
+            Some(i) if i + 1 < def.options.len() => Some(i + 1),
+            Some(_) => None,
+        };
+        self.session.set_module(slot, next);
+        let what = match next.and_then(|i| def.options.get(i)) {
+            Some((_, label)) => format!("{} plugged in: {label}", def.name),
+            None => format!("{} emptied", def.name),
+        };
+        self.note(&what);
+    }
+
+    /// The `···` menu's module section.
+    fn module_menu(&mut self, ui: &mut egui::Ui) {
+        let defs = crate::hardware::slot_defs(&self.session.board);
+        for (slot, def) in defs.iter().enumerate() {
+            menu_heading(ui, &def.name);
+            let now = self.session.module(slot);
+            let mut pick = None;
+            if ui.radio(now.is_none(), "nothing").clicked() {
+                pick = Some(None);
+            }
+            for (i, (_, label)) in def.options.iter().enumerate() {
+                if ui.radio(now == Some(i), label).clicked() {
+                    pick = Some(Some(i));
+                }
+            }
+            if let Some(choice) = pick {
+                if choice != now {
+                    self.session.set_module(slot, choice);
+                }
+            }
+        }
+    }
+
+    /// Tilt for the motion sensor, when the board has one.
+    fn motion_menu(&mut self, ui: &mut egui::Ui) {
+        let Some(imu) = self.session.hardware.as_ref().and_then(|h| h.imu.clone()) else {
+            return;
+        };
+        let Ok(mut state) = imu.lock() else { return };
+        menu_heading(ui, "motion sensor");
+        for (axis, name) in ["x", "y", "z"].iter().enumerate() {
+            ui.add(
+                egui::Slider::new(&mut state.accel[axis], -2.0..=2.0)
+                    .text(format!("accel {name} (g)"))
+                    .fixed_decimals(2),
+            );
+        }
+        if menu_row(ui, true, "lay flat").clicked() {
+            *state = devices::ImuState::default();
+        }
+    }
+
+    /// The on-screen game pad: shown while one is plugged in. Mouse and keys
+    /// both hold buttons; the lamps show what the guest has lit.
+    fn pad_panel(&mut self, ui: &mut egui::Ui) {
+        use devices::mcp23017::button;
+        let Some(pad) = self
+            .session
+            .hardware
+            .as_ref()
+            .filter(|h| h.is_active("gamepad"))
+            .and_then(|h| h.pad.clone())
+        else {
+            return;
+        };
+        let accent = self.accent;
+        let typing = ui.ctx().egui_wants_keyboard_input();
+        let key_down = |keys: &[egui::Key]| {
+            !typing && ui.ctx().input(|i| keys.iter().any(|k| i.key_down(*k)))
+        };
+        // Arrows for the d-pad; Z X A S for the face buttons; Space for func.
+        let keyboard = [
+            (button::UP, key_down(&[egui::Key::ArrowUp])),
+            (button::DOWN, key_down(&[egui::Key::ArrowDown])),
+            (button::LEFT, key_down(&[egui::Key::ArrowLeft])),
+            (button::RIGHT, key_down(&[egui::Key::ArrowRight])),
+            (button::A, key_down(&[egui::Key::Z])),
+            (button::B, key_down(&[egui::Key::X])),
+            (button::X, key_down(&[egui::Key::A])),
+            (button::Y, key_down(&[egui::Key::S])),
+            (button::FUNC, key_down(&[egui::Key::Space])),
+        ];
+        let leds = pad.leds();
+        let mut held = 0u16;
+        for (mask, down) in keyboard {
+            if down {
+                held |= mask;
+            }
+        }
+
+        egui::Panel::bottom("pad")
+            .frame(
+                egui::Frame::NONE
+                    .fill(metro::BAR)
+                    .inner_margin(egui::Margin::symmetric(10, 8)),
+            )
+            .show_separator_line(false)
+            .resizable(false)
+            .show(ui, |ui| {
+                // (button, column, row) on a small grid, with the d-pad as a
+                // plus on the left and the four face buttons to its right.
+                let cell = 46.0_f32;
+                let gap = 6.0_f32;
+                let layout: [(u16, f32, f32); 9] = [
+                    (button::UP, 1.0, 0.0),
+                    (button::LEFT, 0.0, 1.0),
+                    (button::RIGHT, 2.0, 1.0),
+                    (button::DOWN, 1.0, 2.0),
+                    (button::A, 4.5, 1.0),
+                    (button::B, 5.5, 1.0),
+                    (button::X, 6.5, 1.0),
+                    (button::Y, 7.5, 1.0),
+                    (button::FUNC, 9.0, 1.0),
+                ];
+                let width = 10.0 * (cell + gap);
+                let height = 3.0 * (cell + gap);
+                let (area, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+                let origin = egui::pos2((ui.max_rect().center().x - width / 2.0).max(area.min.x), area.min.y);
+                for (mask, col, row) in layout {
+                    let rect = egui::Rect::from_min_size(
+                        origin + egui::vec2(col * (cell + gap), row * (cell + gap)),
+                        egui::vec2(cell, cell),
+                    );
+                    let id = ui.id().with(("pad", mask));
+                    let response = ui.interact(rect, id, egui::Sense::click_and_drag());
+                    if response.is_pointer_button_down_on() {
+                        held |= mask;
+                    }
+                    let down = held & mask != 0;
+                    let painter = ui.painter();
+                    let fill = if down { accent } else if response.hovered() { Color32::from_gray(0x3a) } else { metro::TILE };
+                    painter.rect_filled(rect, egui::CornerRadius::ZERO, fill);
+                    let name = button::ALL.iter().find(|(m, _)| *m == mask).map(|(_, n)| *n).unwrap_or("?");
+                    painter.text(
+                        rect.center() + egui::vec2(0.0, 4.0),
+                        egui::Align2::CENTER_CENTER,
+                        name,
+                        egui::FontId::proportional(14.0),
+                        Color32::WHITE,
+                    );
+                    // The lamp: lit when the guest drove its pin low.
+                    let lamp = rect.right_top() + egui::vec2(-9.0, 9.0);
+                    let lit = leds & mask != 0;
+                    painter.circle_filled(
+                        lamp,
+                        4.0,
+                        if lit { Color32::from_rgb(0xff, 0xc1, 0x07) } else { Color32::from_gray(0x55) },
+                    );
+                }
+            });
+        pad.hold(held);
     }
 
     /// The log, in its own window: log, serial, and firmware images.

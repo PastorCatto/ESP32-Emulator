@@ -35,6 +35,10 @@ pub struct Hardware {
     pub touch: Option<TouchHandle>,
     /// The keyboard's pending-key queue, for the UI to type into.
     pub keys: Option<KeyQueue>,
+    /// The game pad's buttons and LEDs, for the window to drive and show.
+    pub pad: Option<devices::PadHandle>,
+    /// The motion sensor's state, for something to tilt.
+    pub imu: Option<devices::ImuHandle>,
     /// UDP ports joining a wired NIC to QEMU's network, as
     /// `(qemu_local, ours)`, when the board has one this build can model.
     pub net: Option<(u16, u16)>,
@@ -50,9 +54,102 @@ pub struct Hardware {
     running: Arc<AtomicBool>,
     /// Bus tracing, read by the server thread before each transaction.
     trace: Arc<Mutex<Option<TraceConfig>>>,
+    /// The device registry, shared with the server thread, so a module can be
+    /// switched on and off while the guest runs.
+    registry: Arc<Mutex<Registry>>,
+    /// What is in each slot now, as an option number.
+    chosen: Mutex<Vec<Option<usize>>>,
+    /// The slots this board has, with the registry index of each option.
+    slots: Vec<SlotLive>,
+}
+
+/// A place on the board where one of several modules can be plugged in, as
+/// the board file describes it: devices that share a `slot` name.
+///
+/// Every option is built and registered, and at most one is switched on. A
+/// switched-off device behaves as though the chip were absent (an I2C probe is
+/// not acknowledged), which is how real hardware looks when a module is not
+/// plugged in; firmware notices only when it next probes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotDef {
+    pub name: String,
+    /// `(kind, label)` for each option, in board order.
+    pub options: Vec<(String, String)>,
+    /// The option that is plugged in at start, if any.
+    pub default: Option<usize>,
+}
+
+#[derive(Debug)]
+struct SlotLive {
+    /// Registry index of each option, aligned with [`SlotDef::options`].
+    indices: Vec<usize>,
+}
+
+/// The slots a board has. Devices with a `slot = "name"` key belong to the
+/// slot of that name; `slot_default = true` plugs one in at start.
+pub fn slot_defs(board: &Board) -> Vec<SlotDef> {
+    let mut slots: Vec<SlotDef> = Vec::new();
+    for spec in board.peripherals.iter().filter(|p| p.enabled) {
+        let name = spec.params.string_or("slot", "").unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let label = spec.label.clone().unwrap_or_else(|| spec.kind.clone());
+        let is_default = spec.params.bool_or("slot_default", false).unwrap_or(false);
+        let at = match slots.iter().position(|s| s.name == name) {
+            Some(at) => at,
+            None => {
+                slots.push(SlotDef { name, options: Vec::new(), default: None });
+                slots.len() - 1
+            }
+        };
+        slots[at].options.push((spec.kind.clone(), label));
+        if is_default && slots[at].default.is_none() {
+            slots[at].default = Some(slots[at].options.len() - 1);
+        }
+    }
+    slots
 }
 
 impl Hardware {
+    /// Plug option `option` into slot `slot`, or empty the slot with `None`,
+    /// while the guest runs. Things the old module left behind (pressed
+    /// buttons, typed keys nobody read) are dropped.
+    pub fn select_module(&self, slot: usize, option: Option<usize>) {
+        let Some(live) = self.slots.get(slot) else { return };
+        if let Ok(mut registry) = self.registry.lock() {
+            for (i, &index) in live.indices.iter().enumerate() {
+                registry.set_enabled(index, Some(i) == option);
+            }
+        }
+        if let Ok(mut chosen) = self.chosen.lock() {
+            if let Some(c) = chosen.get_mut(slot) {
+                *c = option;
+            }
+        }
+        if let Some(pad) = &self.pad {
+            pad.release_all();
+        }
+        if let Some(keys) = &self.keys {
+            if let Ok(mut q) = keys.lock() {
+                q.clear();
+            }
+        }
+    }
+
+    /// What is in slot `slot` now.
+    pub fn selected_module(&self, slot: usize) -> Option<usize> {
+        self.chosen.lock().ok().and_then(|c| c.get(slot).copied().flatten())
+    }
+
+    /// Whether a device of this kind is on the bus and switched on.
+    pub fn is_active(&self, kind: &str) -> bool {
+        let Ok(registry) = self.registry.lock() else { return false };
+        (0..registry.len()).any(|i| {
+            registry.is_enabled(i) && registry.get(i).is_some_and(|d| d.kind() == kind)
+        })
+    }
+
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
     }
@@ -83,12 +180,24 @@ struct Built {
     screen: Option<ScreenHandle>,
     touch: Option<TouchHandle>,
     keys: Option<KeyQueue>,
+    pad: Option<devices::PadHandle>,
+    imu: Option<devices::ImuHandle>,
     net: Option<(u16, u16)>,
 }
 
 impl Built {
     fn new(device: Box<dyn Peripheral>) -> Self {
-        Built { device, screen: None, touch: None, keys: None, net: None }
+        Built { device, screen: None, touch: None, keys: None, pad: None, imu: None, net: None }
+    }
+
+    fn pad(mut self, handle: devices::PadHandle) -> Self {
+        self.pad = Some(handle);
+        self
+    }
+
+    fn imu(mut self, handle: devices::ImuHandle) -> Self {
+        self.imu = Some(handle);
+        self
     }
 
     fn net(mut self, ports: (u16, u16)) -> Self {
@@ -184,6 +293,22 @@ fn build(
             let keys = kb.keys().clone();
             Ok(Some(Built::new(Box::new(kb)).keys(keys)))
         }
+        "gamepad" => {
+            if claims.is_empty() {
+                return Err("gamepad needs a bus and an address".into());
+            }
+            let chip = devices::Mcp23017::new(claims, devices::Wiring::Pad);
+            let pad = chip.pad().clone();
+            Ok(Some(Built::new(Box::new(chip)).pad(pad)))
+        }
+        "icm42670" => {
+            if claims.is_empty() {
+                return Err("icm42670 needs a bus and an address".into());
+            }
+            let chip = devices::Icm42670::new(claims);
+            let imu = chip.state().clone();
+            Ok(Some(Built::new(Box::new(chip)).imu(imu)))
+        }
         "sdcard" => {
             let claim = claim.ok_or("sdcard needs a bus and a chip select")?;
             // A card with no image behind it is an empty slot, which is a
@@ -242,13 +367,25 @@ fn open_link() -> std::io::Result<(devices::w5500::Link, (u16, u16))> {
 ///
 /// Binds port 0 and reports what the OS gave back, so two emulator windows do
 /// not fight over a fixed port.
-pub fn start(board: &Board, sd_image: Option<PathBuf>) -> std::io::Result<Hardware> {
+///
+/// `modules` says what to plug into each slot, aligned with [`slot_defs`]:
+/// `Some(Some(n))` plugs in option `n`, `Some(None)` leaves the slot empty,
+/// and `None` (or a slot beyond the end of the list) takes the board's default.
+pub fn start(
+    board: &Board,
+    sd_image: Option<PathBuf>,
+    modules: &[Option<Option<usize>>],
+) -> std::io::Result<Hardware> {
     let mut registry = Registry::new();
     let mut screen = None;
     let mut touch = None;
     let mut keys = None;
+    let mut pad = None;
+    let mut imu = None;
     let mut net = None;
     let mut attached = Vec::new();
+    let defs = slot_defs(board);
+    let mut slot_indices: Vec<Vec<usize>> = vec![Vec::new(); defs.len()];
     let mut unmodelled = Vec::new();
 
     for spec in board.peripherals.iter().filter(|p| p.enabled) {
@@ -258,9 +395,17 @@ pub fn start(board: &Board, sd_image: Option<PathBuf>) -> std::io::Result<Hardwa
                 screen = built.screen.or(screen);
                 touch = built.touch.or(touch);
                 keys = built.keys.or(keys);
+                pad = built.pad.or(pad);
+                imu = built.imu.or(imu);
                 net = built.net.or(net);
                 match registry.register(built.device) {
-                    Ok(_) => attached.push(spec.kind.clone()),
+                    Ok(index) => {
+                        attached.push(spec.kind.clone());
+                        let slot = spec.params.string_or("slot", "").unwrap_or_default();
+                        if let Some(at) = defs.iter().position(|d| d.name == slot && !slot.is_empty()) {
+                            slot_indices[at].push(index);
+                        }
+                    }
                     // A refused claim means two devices want the same address,
                     // which is a board file bug worth surfacing.
                     Err(e) => unmodelled.push(format!("{}: {e}", spec.kind)),
@@ -273,6 +418,21 @@ pub fn start(board: &Board, sd_image: Option<PathBuf>) -> std::io::Result<Hardwa
 
     // Tracing is off until the UI turns it on; the toggle is per bus.
     registry.set_trace(TraceConfig::default());
+
+    // Plug in what was asked for (or the board's default) and switch the
+    // rest of each slot off.
+    let mut chosen = Vec::with_capacity(defs.len());
+    for (at, def) in defs.iter().enumerate() {
+        let want = match modules.get(at) {
+            Some(Some(choice)) => *choice,
+            _ => def.default,
+        };
+        let want = want.filter(|&w| w < slot_indices[at].len());
+        for (i, &index) in slot_indices[at].iter().enumerate() {
+            registry.set_enabled(index, Some(i) == want);
+        }
+        chosen.push(want);
+    }
 
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
@@ -289,15 +449,18 @@ pub fn start(board: &Board, sd_image: Option<PathBuf>) -> std::io::Result<Hardwa
         trace: trace.clone(),
     });
     let shared = Arc::new(Mutex::new(registry));
+    let served = shared.clone();
     std::thread::Builder::new()
         .name("vpb".into())
-        .spawn(move || serve_until_stopped(&listener, &shared, &tx, &thread))?;
+        .spawn(move || serve_until_stopped(&listener, &served, &tx, &thread))?;
 
     Ok(Hardware {
         port,
         screen,
         touch,
         keys,
+        pad,
+        imu,
         net,
         attached,
         unmodelled,
@@ -305,6 +468,9 @@ pub fn start(board: &Board, sd_image: Option<PathBuf>) -> std::io::Result<Hardwa
         connected,
         running,
         trace,
+        registry: shared,
+        chosen: Mutex::new(chosen),
+        slots: slot_indices.into_iter().map(|indices| SlotLive { indices }).collect(),
     })
 }
 
@@ -385,7 +551,7 @@ mod tests {
 
     #[test]
     fn attaches_the_display_and_reports_what_it_cannot_model() {
-        let hw = start(&board(), None).expect("server should start");
+        let hw = start(&board(), None, &[]).expect("server should start");
 
         assert!(hw.attached.contains(&"st7789".to_string()));
         assert!(hw.screen.is_some(), "the display must expose its frame");
@@ -399,7 +565,7 @@ mod tests {
     fn the_i2c_devices_expose_their_input_handles() {
         // Both are useless without these: the UI has no other way to say a
         // key was pressed or the panel was touched.
-        let hw = start(&board(), None).expect("server should start");
+        let hw = start(&board(), None, &[]).expect("server should start");
         assert!(hw.attached.contains(&"gt911".to_string()));
         assert!(hw.attached.contains(&"tdeck-keyboard".to_string()));
         assert!(hw.touch.is_some());
@@ -408,7 +574,7 @@ mod tests {
 
     #[test]
     fn a_card_with_no_image_is_an_empty_slot_not_an_error() {
-        let hw = start(&board(), None).expect("server should start");
+        let hw = start(&board(), None, &[]).expect("server should start");
         assert!(!hw.attached.contains(&"sdcard".to_string()));
         assert!(hw.unmodelled.contains(&"sdcard".to_string()));
     }
@@ -417,10 +583,133 @@ mod tests {
     fn the_display_is_sized_and_inverted_from_the_board_file() {
         // The T-Deck mounts a 240x320 panel sideways and wires the glass
         // inverted; both come from the file, not from the model's defaults.
-        let hw = start(&board(), None).expect("server should start");
+        let hw = start(&board(), None, &[]).expect("server should start");
         let screen = hw.screen.as_ref().expect("display");
         let s = screen.lock().expect("screen");
         assert_eq!((s.width, s.height), (320, 240));
         assert!(s.panel_inverts);
+    }
+
+    /// A small board with one input slot and a motion sensor outside it.
+    const SLOTTED: &str = r#"
+[board]
+id = "slotted"
+name = "Slotted test board"
+chip = "esp32s3"
+flash_size = "16MB"
+
+[board.psram]
+kind = "octal"
+size = "8MB"
+
+[[bus]]
+id = "i2c"
+kind = "i2c"
+controller = 0
+controllers = [0, 1]
+sda = 17
+scl = 18
+
+[[peripheral]]
+kind = "icm42670"
+bus = "i2c"
+address = 0x68
+
+[[peripheral]]
+kind = "gamepad"
+label = "game pad"
+bus = "i2c"
+address = 0x20
+slot = "input"
+slot_default = true
+
+[[peripheral]]
+kind = "tdeck-keyboard"
+label = "keyboard"
+bus = "i2c"
+address = 0x55
+slot = "input"
+
+[support]
+implemented = []
+planned = []
+"#;
+
+    fn slotted() -> Board {
+        Board::from_toml(SLOTTED).expect("test board should parse")
+    }
+
+    /// What firmware sees when it probes an address: a write with no bytes.
+    fn acknowledges(hw: &Hardware, address: u8) -> bool {
+        let tx = vpb::Transaction::I2cWrite { controller: 0, address, data: vec![], stop: true };
+        let mut events = Vec::new();
+        let reply = hw.registry.lock().unwrap().dispatch(&tx, &mut events);
+        reply != vpb::Response::Nack
+    }
+
+    #[test]
+    fn a_board_lists_its_slots_and_their_options() {
+        let defs = slot_defs(&slotted());
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "input");
+        let kinds: Vec<&str> = defs[0].options.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(kinds, ["gamepad", "tdeck-keyboard"]);
+        assert_eq!(defs[0].default, Some(0));
+    }
+
+    #[test]
+    fn a_board_without_slots_has_none() {
+        assert!(slot_defs(&board()).is_empty());
+    }
+
+    #[test]
+    fn the_default_module_answers_and_the_others_do_not() {
+        let hw = start(&slotted(), None, &[]).unwrap();
+        assert!(acknowledges(&hw, 0x20), "the game pad is plugged in");
+        assert!(!acknowledges(&hw, 0x55), "the keyboard is not");
+        assert!(acknowledges(&hw, 0x68), "the sensor is not in the slot");
+        assert_eq!(hw.selected_module(0), Some(0));
+    }
+
+    #[test]
+    fn the_boot_choice_overrides_the_default() {
+        let hw = start(&slotted(), None, &[Some(Some(1))]).unwrap();
+        assert!(!acknowledges(&hw, 0x20));
+        assert!(acknowledges(&hw, 0x55));
+        let hw = start(&slotted(), None, &[Some(None)]).unwrap();
+        assert!(!acknowledges(&hw, 0x20));
+        assert!(!acknowledges(&hw, 0x55));
+        assert_eq!(hw.selected_module(0), None);
+    }
+
+    #[test]
+    fn swapping_a_module_while_running_changes_what_answers() {
+        let hw = start(&slotted(), None, &[]).unwrap();
+        hw.select_module(0, Some(1));
+        assert!(!acknowledges(&hw, 0x20));
+        assert!(acknowledges(&hw, 0x55));
+        assert!(hw.is_active("tdeck-keyboard"));
+        assert!(!hw.is_active("gamepad"));
+        hw.select_module(0, None);
+        assert!(!acknowledges(&hw, 0x55));
+        hw.select_module(0, Some(0));
+        assert!(acknowledges(&hw, 0x20));
+    }
+
+    #[test]
+    fn unplugging_drops_held_buttons_and_unread_keys() {
+        let hw = start(&slotted(), None, &[]).unwrap();
+        hw.pad.as_ref().unwrap().set(devices::mcp23017::button::A, true);
+        devices::TdeckKeyboard::press(hw.keys.as_ref().unwrap(), 'x');
+        hw.select_module(0, Some(1));
+        assert_eq!(hw.pad.as_ref().unwrap().buttons(), 0);
+        assert!(hw.keys.as_ref().unwrap().lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_choice_past_the_options_leaves_the_slot_empty() {
+        let hw = start(&slotted(), None, &[Some(Some(9))]).unwrap();
+        assert!(!acknowledges(&hw, 0x20));
+        assert!(!acknowledges(&hw, 0x55));
     }
 }

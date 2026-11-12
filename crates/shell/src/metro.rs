@@ -79,6 +79,8 @@ pub enum Icon {
     Follow,
     Clear,
     Copy,
+    /// A plus-shaped direction pad, for the input module.
+    Pad,
 }
 
 impl Icon {
@@ -137,6 +139,19 @@ impl Icon {
                 painter.line_segment(
                     [c + Vec2::new(0.8 * r, -0.8 * r), c + Vec2::new(-0.8 * r, 0.8 * r)],
                     stroke,
+                );
+            }
+            Icon::Pad => {
+                let arm = 0.55 * r;
+                painter.rect_filled(
+                    Rect::from_center_size(c, Vec2::new(2.0 * r, 2.0 * arm)),
+                    CornerRadius::ZERO,
+                    colour,
+                );
+                painter.rect_filled(
+                    Rect::from_center_size(c, Vec2::new(2.0 * arm, 2.0 * r)),
+                    CornerRadius::ZERO,
+                    colour,
                 );
             }
             Icon::Copy => {

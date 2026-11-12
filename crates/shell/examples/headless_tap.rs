@@ -14,7 +14,15 @@
 //!   type TEXT      type on the emulated keyboard (\n is Enter)
 //!   serial TEXT    send TEXT and Enter to serial port 0
 //!   dump           write the serial log so far to <out>-serial.txt
+//!   module KIND    plug a module into the board's slot while running (a device kind such as
+//!                  `gamepad` or `tdeck-keyboard`, or `none`); the guest sees it on its next probe
+//!   pad press|release|tap NAME   hold, let go of, or tap a game-pad button
+//!                  (up down left right a b x y func); prints which LEDs are lit
+//!   tilt X Y Z     set the motion sensor's acceleration in g
 //!   quit           stop (the final screenshot and serial log are written)
+//!
+//! HEADLESS_MODULE=<kind|none> chooses what is plugged into the board's slot at boot, in place of the
+//! board's default.
 //!
 //! A tap is `second:x:y`, x and y in the 320x240 view of the screen (landscape, as the user sees it).
 //! HEADLESS_SERIAL='cmd\ncmd\n' sends lines to serial port 0 from HEADLESS_SERIAL_AT seconds (default 30).
@@ -33,6 +41,16 @@ mod hardware;
 #[path = "../src/session.rs"]
 mod session;
 
+/// A module name from a script, as the choice for slot 0: `Some(None)` for "none".
+fn module_choice(board: &boards::Board, name: &str) -> Option<Option<usize>> {
+    if name.eq_ignore_ascii_case("none") {
+        return Some(None);
+    }
+    let defs = hardware::slot_defs(board);
+    let def = defs.first()?;
+    def.options.iter().position(|(kind, _)| kind == name).map(Some)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let flash = PathBuf::from(args.next().ok_or("usage: headless_tap <flash.bin> [seconds] [out.png]")?);
@@ -43,6 +61,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let board = boards::Board::from_toml(&std::fs::read_to_string(board_path)?)?;
     let mut sess = session::Session::new(board);
 
+    // HEADLESS_MODULE picks the slot's contents before boot.
+    if let Ok(want) = std::env::var("HEADLESS_MODULE") {
+        match module_choice(&sess.board, &want) {
+            Some(choice) => sess.set_module(0, choice),
+            None => eprintln!("HEADLESS_MODULE={want}: this board has no such module, using its default"),
+        }
+    }
+
     let run_dir = std::env::temp_dir().join("esp32-emulator-headless-tap");
     sess.load_firmware(&flash, &run_dir)?;
     sess.boot()?;
@@ -50,6 +76,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("attached: {}", hw.attached.join(", "));
         println!("not modelled: {}", hw.unmodelled.join(", "));
         println!("keyboard queue: {}", if hw.keys.is_some() { "yes" } else { "no" });
+        for (i, def) in hardware::slot_defs(&sess.board).iter().enumerate() {
+            let now = hw.selected_module(i).and_then(|o| def.options.get(o)).map(|(k, _)| k.as_str());
+            println!("slot {}: {} (options: {})", def.name, now.unwrap_or("nothing"),
+                def.options.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", "));
+        }
     }
 
     let mut taps: Vec<(u64, f32, f32)> = std::env::var("HEADLESS_TAPS")
@@ -164,7 +195,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // `\n` is Enter. Says what it did, so a run where typing has no
                         // effect shows whether the keys never left here or the guest
                         // never read them (the i2c trace shows `key 'a'` for a read).
-                        if let Some(keys) = sess.hardware.as_ref().and_then(|h| h.keys.clone()) {
+                        if let Some(keys) = sess
+                            .hardware
+                            .as_ref()
+                            .filter(|h| h.is_active("tdeck-keyboard"))
+                            .and_then(|h| h.keys.clone())
+                        {
                             let mut sent = 0;
                             for ch in rest.replace("\\n", "\r").chars() {
                                 devices::TdeckKeyboard::press(&keys, ch);
@@ -177,7 +213,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let left = keys.lock().map(|q| q.len()).unwrap_or(0);
                             println!("type: {sent} keys at {}s, {left} still unread by the guest", started.elapsed().as_secs());
                         } else {
-                            println!("type: this board has no keyboard device, nothing sent");
+                            println!("type: no keyboard is plugged in, nothing sent");
+                        }
+                    }
+                    "module" => match module_choice(&sess.board, rest.trim()) {
+                        Some(choice) => {
+                            sess.set_module(0, choice);
+                            println!("module: {} at {}s", rest.trim(), started.elapsed().as_secs());
+                        }
+                        None => println!("module: this board has no module called {}", rest.trim()),
+                    },
+                    "pad" => {
+                        use devices::mcp23017::button;
+                        let mut w = rest.split_whitespace();
+                        let (action, name) = (w.next().unwrap_or(""), w.next().unwrap_or(""));
+                        let mask = button::ALL
+                            .iter()
+                            .find(|(_, n)| n.eq_ignore_ascii_case(name))
+                            .map(|(m, _)| *m);
+                        let pad = sess.hardware.as_ref().filter(|h| h.is_active("gamepad")).and_then(|h| h.pad.clone());
+                        match (pad, mask) {
+                            (Some(pad), Some(mask)) => {
+                                match action {
+                                    "press" => pad.set(mask, true),
+                                    "release" => pad.set(mask, false),
+                                    "tap" => {
+                                        pad.set(mask, true);
+                                        for _ in 0..6 {
+                                            sess.pump();
+                                            std::thread::sleep(Duration::from_millis(50));
+                                        }
+                                        pad.set(mask, false);
+                                    }
+                                    _ => println!("pad: press, release or tap"),
+                                }
+                                let lit: Vec<&str> = button::ALL.iter().filter(|(m, _)| pad.leds() & m != 0).map(|(_, n)| *n).collect();
+                                println!("pad {action} {name} at {}s; lit: [{}]", started.elapsed().as_secs(), lit.join(" "));
+                            }
+                            (None, _) => println!("pad: no game pad is plugged in"),
+                            (_, None) => println!("pad: unknown button {name}"),
+                        }
+                    }
+                    "tilt" => {
+                        let n: Vec<f32> = rest.split_whitespace().filter_map(|v| v.parse().ok()).collect();
+                        if let (3, Some(imu)) = (n.len(), sess.hardware.as_ref().and_then(|h| h.imu.clone())) {
+                            if let Ok(mut s) = imu.lock() {
+                                s.accel = [n[0], n[1], n[2]];
+                            }
                         }
                     }
                     "serial" => sess.send_serial(0, &format!("{rest}\r")),

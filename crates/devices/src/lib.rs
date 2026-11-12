@@ -41,6 +41,18 @@ pub mod vminfo;
 #[cfg(feature = "vm-info")]
 pub use vminfo::VmInfo;
 
+#[cfg(feature = "gamepad")]
+pub mod mcp23017;
+
+#[cfg(feature = "gamepad")]
+pub use mcp23017::{Mcp23017, PadHandle, PadState, Wiring};
+
+#[cfg(feature = "icm42670")]
+pub mod icm42670;
+
+#[cfg(feature = "icm42670")]
+pub use icm42670::{Icm42670, ImuHandle, ImuState};
+
 pub mod png;
 
 #[cfg(all(test, feature = "gt911", feature = "tdeck-keyboard"))]
