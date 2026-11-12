@@ -1,0 +1,117 @@
+# Playtime
+#
+# LOCAL FILE, hidden from git by .git/info/exclude (/boards/playtime*). Not part of the repository.
+# Pins come from the board's reference firmware (its hardware header and drivers, read 2026-11-12);
+# the gamepad's pin map is from the owner's schematic. See local/playtime-specs.md.
+#
+# Not confirmed by a primary source, and marked where it matters:
+#   - the CS line index each SPI device lands on (no bus trace of this board yet)
+#   - the display's mounting rotation
+#   - the module connector's pin list (only the main I2C bus is known to reach it)
+#
+# Known limit: the QEMU option that lists which GPIO carries each chip select is keyed by line number
+# across both SPI controllers, so the display (SPI3) and the SD card (SPI2), both on line 0, share one
+# entry. It is only consulted when a driver drives chip select by hand; drivers using the controller's
+# own chip select are unaffected.
+
+[board]
+id = "playtime"
+name = "Playtime"
+chip = "esp32s3"
+# ESP32-S3-WROOM-1-N16R8: 16MB flash, 8MB octal PSRAM.
+flash_size = "16MB"
+
+[board.psram]
+kind = "octal"
+size = "8MB"
+
+# The display has a bus of its own, and so does the SD card: nothing is shared.
+[[bus]]
+id = "lcd"
+kind = "spi"
+controller = 3
+sck = 10
+mosi = 11
+# Write-only: the panel has no MISO line.
+
+[[bus]]
+id = "sdspi"
+kind = "spi"
+controller = 2
+sck = 7
+mosi = 8
+miso = 6
+
+# The maker's library asks for "the first free port" and nothing opens one before it, so that is I2C0
+# in practice; answer on both rather than depend on init order.
+[[bus]]
+id = "main_i2c"
+kind = "i2c"
+controller = 0
+controllers = [0, 1]
+sda = 17
+scl = 18
+
+[[bus]]
+id = "audio_i2s"
+kind = "i2s"
+controller = 0
+bclk = 38
+ws = 47
+dout = 21
+
+[[peripheral]]
+kind = "st7789"
+label = "ST7789V LCD (no touch)"
+bus = "lcd"
+cs = 14
+# Unverified. It is the only device on SPI3, so ESP-IDF should hand it line 0.
+cs_line = 0
+dc = 13
+# Reset is GPIO 12; the emulated panel has no reset line to wire it to.
+width = 320
+height = 240
+# The panel's native frame buffer is 240x320; the reference firmware runs LVGL sideways. 90 is a guess
+# from that, not a measurement.
+rotation = 90
+color_order = "rgb"
+invert = true
+
+[[peripheral]]
+kind = "sdcard"
+label = "microSD"
+bus = "sdspi"
+cs = 9
+# Unverified, as above: the only device on SPI2.
+cs_line = 0
+
+# Built in: the motion sensor, at the ESP-IDF component's default address (AD0 low).
+[[peripheral]]
+kind = "icm42670"
+label = "ICM-42670-P motion sensor"
+bus = "main_i2c"
+address = 0x68
+
+# The input module slot. One of these is plugged in at a time, and it can be swapped while the guest
+# runs (the "input" button in the window). A module that is not plugged in does not answer its address.
+[[peripheral]]
+kind = "gamepad"
+label = "gamepad module"
+bus = "main_i2c"
+address = 0x20
+slot = "input"
+slot_default = true
+
+# Stand-in for the keyboard module (whose real controller is a TCA8418 and is going to change): the
+# T-Deck's keyboard, which answers a one-byte read at 0x55 with the pending key.
+[[peripheral]]
+kind = "tdeck-keyboard"
+label = "T-Deck style keyboard"
+bus = "main_i2c"
+address = 0x55
+slot = "input"
+
+[support]
+implemented = []
+planned = ["st7789", "sdcard", "icm42670", "gamepad", "tdeck-keyboard"]
+stubbed = []

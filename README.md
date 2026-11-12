@@ -74,6 +74,7 @@ sit at which pins. Adding a board is a file, not a patch
 |---|---|---|---|
 | `t-deck-plus-vm.toml` | LilyGO T-Deck Plus, VM flavour | ESP32-S3 | Wired Ethernet (W5500 model) instead of radios. The board PURR OS's VM image runs on |
 | `t-deck-plus.toml` | LilyGO T-Deck Plus | ESP32-S3 | Screen, touch, keyboard, SD. Radio parts are declared but not modelled |
+| `playtime.toml` | Playtime | ESP32-S3 | Display, SD card, motion sensor, and an input slot (game pad or keyboard, swappable while running). The display's chip-select line and rotation are guesses, marked in the file |
 | `cyd-*.toml` (three) | Sunton CYD family | ESP32 | Boot to the serial console. Screens not modelled |
 | `generic-esp32s3.toml` | Fallback | ESP32-S3 | |
 

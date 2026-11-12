@@ -596,6 +596,7 @@ mod tests {
     const CYD: &str = include_str!("../../../boards/cyd-esp32-2432s028r.toml");
     const CYD_S024C: &str = include_str!("../../../boards/cyd-s024c.toml");
     const CYD_S028R: &str = include_str!("../../../boards/cyd-s028r.toml");
+    const PLAYTIME: &str = include_str!("../../../boards/playtime.toml");
 
     #[test]
     fn parses_the_shipped_t_deck_definition() {
@@ -780,10 +781,34 @@ mod tests {
             ("cyd-esp32-2432s028r", CYD),
             ("cyd-s024c", CYD_S024C),
             ("cyd-s028r", CYD_S028R),
+            ("playtime", PLAYTIME),
         ] {
             let b = Board::from_toml(src).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(b.id, name, "board id should match its filename");
         }
+    }
+
+    #[test]
+    fn playtime_keeps_display_and_card_on_separate_controllers() {
+        let b = Board::from_toml(PLAYTIME).unwrap();
+        assert_eq!(b.bus("lcd").unwrap().controller, 3);
+        assert_eq!(b.bus("sdspi").unwrap().controller, 2);
+
+        let claims: HashMap<String, Claim> = b.claims().unwrap().into_iter().collect();
+        assert_eq!(claims["st7789"], Claim::Spi { controller: 3, cs: 0 });
+        assert_eq!(claims["sdcard"], Claim::Spi { controller: 2, cs: 0 });
+    }
+
+    #[test]
+    fn playtime_has_one_input_slot_with_the_game_pad_plugged_in() {
+        let b = Board::from_toml(PLAYTIME).unwrap();
+        let in_slot: Vec<(&str, bool)> = b
+            .peripherals
+            .iter()
+            .filter(|p| p.params.string_or("slot", "").unwrap_or_default() == "input")
+            .map(|p| (p.kind.as_str(), p.params.bool_or("slot_default", false).unwrap()))
+            .collect();
+        assert_eq!(in_slot, [("gamepad", true), ("tdeck-keyboard", false)]);
     }
 
     #[test]

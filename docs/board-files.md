@@ -250,6 +250,7 @@ stubbed = ["sx1262", "gnss"]
 | `cyd-esp32-2432s028r.toml` | CYD 2.8" resistive | ESP32, 4MB, no PSRAM |
 | `cyd-s024c.toml` | CYD 2.4" capacitive | ESP32, 4MB, no PSRAM |
 | `cyd-s028r.toml` | CYD 2.8" flipped panel | ESP32, 4MB, no PSRAM |
+| `playtime.toml` | Playtime | ESP32-S3, 16MB, 8MB octal PSRAM |
 | `generic-esp32s3.toml` | Fallback devkit | ESP32-S3, 4MB |
 
 These are parsed by the test suite, so a broken board file fails CI rather than

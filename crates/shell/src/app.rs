@@ -18,6 +18,7 @@ const BUILTIN_BOARDS: &[(&str, &str)] = &[
     ("cyd-esp32-2432s028r", include_str!("../../../boards/cyd-esp32-2432s028r.toml")),
     ("cyd-s024c", include_str!("../../../boards/cyd-s024c.toml")),
     ("cyd-s028r", include_str!("../../../boards/cyd-s028r.toml")),
+    ("playtime", include_str!("../../../boards/playtime.toml")),
     ("generic-esp32s3", include_str!("../../../boards/generic-esp32s3.toml")),
 ];
 
