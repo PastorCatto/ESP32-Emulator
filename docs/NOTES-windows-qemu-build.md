@@ -62,3 +62,15 @@ The licence strings are what `pacman -Qi` reports, not a legal reading. The GPL 
 ## For the doc page
 
 `docs/16-building-on-windows.md` should say: the package list without libslirp; Smart App Control must be off; `build.sh` does not install the ROMs; and the build completes today.
+
+## Second run: slirp (user-mode networking), 2026-11-11, branch `windows-qemu-slirp`
+
+The first build had slirp off. The VM board's Ethernet (the W5500 on a socket bridge) sits on slirp, so for `purr run` the Windows QEMU needs it.
+
+- **MSYS2's MINGW64 environment has no libslirp package** (`pacman -Ss libslirp` finds only UCRT64, CLANG64 and CLANGARM64). The package list in the first run's commands (and in `docs/16-building-on-windows.md`) was already missing it; that was right to drop.
+- **UCRT64's libslirp ships `libslirp-0.dll`, `libslirp.dll.a` and `libslirp.a`.** The fork's `meson.build` hard-codes `static: true` for slirp, which is what pulled in the second static glib. `apply.sh` now asks for the shared library on Windows (`static: host_os != 'windows'`; macOS keeps its static one). `build.sh` turns slirp on when `pkg-config --exists slirp` succeeds and leaves it off otherwise, so a MINGW64 shell still builds.
+- Commands: `pacman -S --needed mingw-w64-ucrt-x86_64-{gcc,glib2,pixman,ninja,meson,python,pkgconf,zlib,libslirp,libgcrypt}` (the first attempt failed with a DNS timeout on one download; the retry worked), then in a **UCRT64** shell (`MSYSTEM=UCRT64`): `qemu/build.sh --clean`. configure said `Run-time dependency slirp found: YES 4.9.7`, `slirp support: YES`; 1,455 steps; no duplicate-definition errors. Clock stayed 3.7 to 4.1 GHz, no throttling.
+- Result: `qemu-system-xtensa.exe` 63 MB and **17 DLLs** (the 16 from before, now UCRT64 builds, plus `libslirp-0.dll`). `ldd` shows nothing outside `/ucrt64/bin` and Windows.
+- Checked: `-netdev help` lists `user`; `info usernet` on a `-netdev user,...,hostfwd=tcp:127.0.0.1:47811-10.0.2.15:80` shows `TCP[HOST_FORWARD] 127.0.0.1 47811 -> 10.0.2.15 80` and the host port 47811 listens; the ROM boots from an extracted zip with only `C:\Windows` on the PATH; `cargo test -p qemuctl` 33 pass; a PURR image built from source boots to the recovery loader through the SDK (26 s).
+- **Not checked:** a guest that gets an address and reaches `10.0.2.2` (needs a VM-flavour image).
+- One more mistake: I called `info network` over stdio at first and forgot `-L`, so QEMU stopped at "ROM code binary not found"; with `-L ..\share\qemu` it ran. A later `info network` typed through stdio came back garbled by the console echo; the monitor over TCP (`-monitor tcp:127.0.0.1:PORT,server,nowait`) is cleaner for scripts.
