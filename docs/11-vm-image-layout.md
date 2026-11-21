@@ -59,10 +59,10 @@ The map fills the 16 MB exactly. PURR OS's chapter says the flash map is **desig
 `drivers` holds the signed driver modules the kernel no longer carries, so an image without it boots a kernel with no display, keyboard or touch driver. Fill it from `drivers-<board>.bin` (made by PURR OS's `tools/release/make_drivers_partition.py` or the SDK):
 
 - In the window: add the file as an extra image at offset 0xFEC000.
-- From the command line: `cargo run -p flashimg --example place-drivers flash.bin drivers-tdeck_plus.bin out.bin` (finds the partition through the image's table, checks each slot header is blank or `PDRV`, formats a blank `root`).
+- From the command line: `cargo run -p flashimg --example place-drivers flash.bin drivers-tdeck_plus.bin out.bin` (finds the partition through the image's table, checks each slot header, formats a blank `root`).
 - In code: `flashimg::purr::place_drivers(&mut flash, &drivers)`.
 
-Signatures and the per-slot crc are not checked here; the device does that when it loads a driver.
+Each filled slot's 64-byte header is checked in full (magic, version 1, flags 0, length, file name, reserved bytes, zlib crc32 of the .cat). Signatures are not checked here; the device does that when it loads a driver.
 
 ### Writing the image
 

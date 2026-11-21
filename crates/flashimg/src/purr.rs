@@ -33,8 +33,16 @@ pub const DRIVERS_SUBTYPE: u8 = 0x42;
 /// section 4a). Slot n starts at n * `DRIVER_SLOT_SIZE`.
 pub const DRIVER_SLOTS: usize = 10;
 pub const DRIVER_SLOT_SIZE: usize = 0x2000;
-/// First four bytes of a filled slot. A slot whose header is all 0xFF is empty.
+/// First four bytes of a filled slot (u32 0x56524450, little-endian). A slot
+/// whose header starts with 0xFF bytes is empty.
 pub const DRIVER_SLOT_MAGIC: &[u8; 4] = b"PDRV";
+/// Slot header, 64 bytes, little-endian: magic u32 @0, version u16 @4 (1),
+/// flags u16 @6 (0), length u32 @8 (1..=`DRIVER_MAX_LEN`), crc32 u32 @12 (zlib,
+/// of the .cat that starts at +64), file[32] @16 (NUL-terminated, printable
+/// ASCII, no '/' or '\\'), reserved[16] @48 (0xFF).
+pub const DRIVER_HEADER_LEN: usize = 64;
+pub const DRIVER_MAX_LEN: usize = DRIVER_SLOT_SIZE - DRIVER_HEADER_LEN;
+pub const DRIVER_SLOT_VERSION: u16 = 1;
 
 const FLASH_16_MB: u32 = 0x100_0000;
 
@@ -132,9 +140,10 @@ impl fmt::Display for DriversPlaced {
 /// table without one is an error rather than a guess at 0xFEC000.
 ///
 /// The image must be a whole number of 8 KB slots and fit the partition; a
-/// shorter one leaves the rest of the partition erased. The slot headers are
-/// checked for shape only (`PDRV`, or blank). Signatures and the `.cat` crc are
-/// the device's job, as they are for every module.
+/// shorter one leaves the rest of the partition erased. Each filled slot's
+/// header is checked in full (magic, version, flags, length, file name,
+/// reserved bytes, and the crc32 of the .cat); an empty slot is accepted.
+/// Signatures are the device's job, as they are for every module.
 pub fn place_drivers(flash: &mut [u8], drivers: &[u8]) -> Result<DriversPlaced> {
     let layout = |why: String| Error::Layout(why);
     let table_at = PartitionTable::locate(flash)
@@ -171,6 +180,7 @@ pub fn place_drivers(flash: &mut [u8], drivers: &[u8]) -> Result<DriversPlaced> 
     for (n, slot) in drivers.chunks(DRIVER_SLOT_SIZE).enumerate() {
         let head = &slot[..DRIVER_SLOT_MAGIC.len()];
         if head == DRIVER_SLOT_MAGIC {
+            check_slot(slot).map_err(|why| layout(format!("slot {n} of the drivers image: {why}")))?;
             filled += 1;
         } else if !head.iter().all(|&b| b == 0xff) {
             return Err(layout(format!(
@@ -181,6 +191,52 @@ pub fn place_drivers(flash: &mut [u8], drivers: &[u8]) -> Result<DriversPlaced> 
     region.fill(0xff);
     region[..drivers.len()].copy_from_slice(drivers);
     Ok(DriversPlaced { offset: part.offset, filled })
+}
+
+/// zlib's crc32 (reflected, polynomial 0xEDB88320, init and final xor 0xFFFFFFFF).
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
+}
+
+/// Check a filled slot's 64-byte header against its .cat. `slot` is the whole
+/// 8 KB slot.
+fn check_slot(slot: &[u8]) -> std::result::Result<(), String> {
+    let u16_at = |at: usize| u16::from_le_bytes([slot[at], slot[at + 1]]);
+    let u32_at = |at: usize| u32::from_le_bytes([slot[at], slot[at + 1], slot[at + 2], slot[at + 3]]);
+
+    if u16_at(4) != DRIVER_SLOT_VERSION {
+        return Err(format!("version {} (expected {DRIVER_SLOT_VERSION})", u16_at(4)));
+    }
+    if u16_at(6) != 0 {
+        return Err(format!("flags {:#06x} (expected 0)", u16_at(6)));
+    }
+    let len = u32_at(8) as usize;
+    if !(1..=DRIVER_MAX_LEN).contains(&len) {
+        return Err(format!("length {len} is outside 1..={DRIVER_MAX_LEN}"));
+    }
+    let name = &slot[16..48];
+    let end = name.iter().position(|&b| b == 0).ok_or("file name is not NUL-terminated")?;
+    if end == 0 {
+        return Err("file name is empty".into());
+    }
+    if !name[..end].iter().all(|&b| (0x20..0x7f).contains(&b) && b != b'/' && b != b'\\') {
+        return Err("file name has a character that is not printable ASCII, or is '/' or '\\'".into());
+    }
+    if slot[48..64].iter().any(|&b| b != 0xff) {
+        return Err("reserved bytes are not 0xFF".into());
+    }
+    let cat = &slot[DRIVER_HEADER_LEN..DRIVER_HEADER_LEN + len];
+    if crc32(cat) != u32_at(12) {
+        return Err(format!("crc32 of the .cat is {:#010x}, header says {:#010x}", crc32(cat), u32_at(12)));
+    }
+    Ok(())
 }
 
 /// Size a T-Deck Plus image must be. The table does not fit anything smaller.
@@ -203,12 +259,54 @@ mod tests {
         flash
     }
 
+    /// A valid slot: header per SPEC 4a, a 4-byte .cat of `[fill, n, 3, 4]`.
     fn slot(fill: u8, n: usize) -> Vec<u8> {
+        let cat = [fill, n as u8, 3, 4];
         let mut s = vec![0xffu8; DRIVER_SLOT_SIZE];
         s[..4].copy_from_slice(DRIVER_SLOT_MAGIC);
-        s[4] = fill;
-        s[5] = n as u8;
+        s[4..6].copy_from_slice(&1u16.to_le_bytes());
+        s[6..8].copy_from_slice(&0u16.to_le_bytes());
+        s[8..12].copy_from_slice(&(cat.len() as u32).to_le_bytes());
+        s[12..16].copy_from_slice(&crc32(&cat).to_le_bytes());
+        s[16..48].fill(0);
+        s[16..16 + 7].copy_from_slice(b"w5500.c");
+        s[64..68].copy_from_slice(&cat);
         s
+    }
+
+    #[test]
+    fn crc32_is_zlib_s() {
+        // Golden from PURR OS's drvpart tests.
+        assert_eq!(crc32(&[1, 2, 3, 4]), 0xb63c_fbcd);
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+    }
+
+    #[test]
+    fn a_slot_with_a_bad_header_field_is_refused() {
+        let cases: [(&str, fn(&mut [u8])); 7] = [
+            ("version", |s| s[4] = 2),
+            ("flags", |s| s[6] = 1),
+            ("length", |s| s[8..12].copy_from_slice(&8129u32.to_le_bytes())),
+            ("zero length", |s| s[8..12].copy_from_slice(&0u32.to_le_bytes())),
+            ("path separator", |s| s[16] = b'/'),
+            ("reserved", |s| s[50] = 0),
+            ("crc", |s| s[64] ^= 1),
+        ];
+        for (what, damage) in cases {
+            let mut flash = v3_flash();
+            let mut s = slot(1, 0);
+            damage(&mut s);
+            let err = place_drivers(&mut flash, &s).unwrap_err();
+            assert!(err.to_string().contains("slot 0"), "{what}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_unterminated_file_name_is_refused() {
+        let mut flash = v3_flash();
+        let mut s = slot(1, 0);
+        s[16..48].fill(b'a');
+        assert!(place_drivers(&mut flash, &s).is_err());
     }
 
     #[test]
