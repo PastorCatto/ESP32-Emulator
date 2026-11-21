@@ -283,7 +283,8 @@ mod tests {
 
     #[test]
     fn a_slot_with_a_bad_header_field_is_refused() {
-        let cases: [(&str, fn(&mut [u8])); 7] = [
+        type Damage = (&'static str, fn(&mut [u8]));
+        let cases: [Damage; 7] = [
             ("version", |s| s[4] = 2),
             ("flags", |s| s[6] = 1),
             ("length", |s| s[8..12].copy_from_slice(&8129u32.to_le_bytes())),
