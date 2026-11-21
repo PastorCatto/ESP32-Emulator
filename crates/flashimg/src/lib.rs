@@ -13,6 +13,7 @@ pub mod fat;
 pub mod littlefs;
 pub(crate) mod md5;
 pub mod provision;
+pub mod purr;
 pub mod signature;
 pub mod signatures;
 mod error;

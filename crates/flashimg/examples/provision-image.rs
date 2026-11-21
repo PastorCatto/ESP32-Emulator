@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{action}");
     }
 
-    let table = flashimg::PartitionTable::parse(&bytes[flashimg::TABLE_OFFSET as usize..])?;
+    let table = flashimg::PartitionTable::parse(&bytes[flashimg::PartitionTable::locate(&bytes).unwrap_or(flashimg::TABLE_OFFSET) as usize..])?;
     for p in &table.entries {
         println!(
             "  {:12} {:>9} off={:#08x} size={:#08x}",

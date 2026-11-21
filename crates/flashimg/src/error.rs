@@ -19,6 +19,8 @@ pub enum Error {
     /// A patch could not be placed: no such symbol, or it does not land
     /// anywhere the image actually maps.
     Unpatchable(String),
+    /// An image does not have the layout a request assumed.
+    Layout(String),
 }
 
 impl fmt::Display for Error {
@@ -32,6 +34,7 @@ impl fmt::Display for Error {
             }
             Error::UnknownChip(id) => write!(f, "unknown chip id {id:#06x}"),
             Error::Unpatchable(why) => write!(f, "cannot patch: {why}"),
+            Error::Layout(why) => write!(f, "{why}"),
             Error::BadPartitionMagic(m) => {
                 write!(f, "bad partition entry magic {m:#06x}")
             }
